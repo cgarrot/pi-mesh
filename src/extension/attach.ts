@@ -53,6 +53,12 @@ export function buildReconnectDiff(prev: readonly string[], next: readonly strin
   return `[mesh] reconnected${chg} Rooms: ${after.size > 0 ? "online" : "none"} — full status: mesh_status.`;
 }
 
+/** Public, process-local identity bridge for other extensions. */
+export function exposeAlias(pi: ExtensionAPI, alias: string, rooms: readonly string[]): void {
+  (globalThis as Record<symbol, unknown>)[Symbol.for("pi-mesh:alias")] = alias;
+  pi.events?.emit("mesh:alias", { alias, rooms: [...rooms] });
+}
+
 /** session name keeps the first user message after the mesh identity. */
 const SESSION_NAME_MSG_MAX = 80;
 
@@ -271,6 +277,7 @@ export function attachClientListeners(
 
   client.on("ready", (welcome: WelcomeInfo) => {
     if (detached) return; // D41
+    guarded(() => exposeAlias(pi, client.alias, client.rooms));
     guarded(() => updateSessionName(pi, rt));
     getHud()?.setConnecting(false);
     getHud()?.fetchStatus(); // fire-and-forget, never blocks session_start
@@ -358,6 +365,7 @@ export function attachClientListeners(
     });
   });
   client.on("renamed", () => {
+    guarded(() => exposeAlias(pi, client.alias, client.rooms));
     guarded(() => updateSessionName(pi, rt));
     saveIdentity(rt); // disk-only
   });

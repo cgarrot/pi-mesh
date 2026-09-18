@@ -430,3 +430,22 @@ transcript) · `src/cli` · `test/` · `scripts/mesh-smoke.mjs`.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## For other extensions
+
+After connect/reconnect (and rename), mesh publishes the resolved identity:
+
+```typescript
+pi.events.on("mesh:alias", (data) => {
+  const { alias, rooms } = data as { alias: string; rooms: string[] };
+  // Refresh your own status or integration. No model turn is triggered.
+});
+const alias = (globalThis as Record<symbol, unknown>)[Symbol.for("pi-mesh:alias")];
+```
+
+`alias` has no leading `@`. The symbol is a convenience snapshot of the
+latest connected alias in this process, not a cross-process registry;
+subscribe to the event for updates. It is undefined before the first
+connection and is not a connection-health signal. In-process child sessions
+share `globalThis`; consumers needing per-session identity should use their
+session's event lifecycle rather than treating the symbol as session-local.
