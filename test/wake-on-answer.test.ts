@@ -47,9 +47,14 @@ describe("wake-on-answer (LAUNCH missions)", () => {
     const sent = await lead.send({ to: "carol", message: "wake me", awaitReply: true, block: false, timeoutMs: 30_000 });
     assert.equal(sent.status, "delivered");
 
+    let matchedReply = false;
     const injected = await new Promise<MeshFrame>((resolve) => {
-      lead.once("inbound", resolve);
+      lead.once("inbound", (frame: MeshFrame, meta?: { matchedReply?: boolean }) => {
+        matchedReply = meta?.matchedReply === true;
+        resolve(frame);
+      });
     });
+    assert.equal(matchedReply, true, "LAUNCH wake metadata bypasses broadcast deferral");
     assert.equal(injected.type, "reply");
     assert.equal(injected.replyTo, sent.msgId); // correlates the mission
     assert.equal(injected.body, "carol answer");

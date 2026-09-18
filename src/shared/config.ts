@@ -85,6 +85,8 @@ export const DEFAULT_WATCHDOG_MAX_CALLS = 64;
 export const DEFAULT_WATCHDOG_COMPACTION_BYTES = 1_048_576; // 1 MiB
 
 // ---- Inbound context verbosity ----
+export type InboundBroadcastPolicy = "immediate" | "deferred";
+
 export type ContextVerbosity = "compact" | "full";
 
 // ---- Identity defaults ----
@@ -164,6 +166,8 @@ export interface MeshConfig {
   *  frames are HELD; when the busy period ends they are injected as one
   *  batch. */
   inboundBatchMs?: number;
+  /** Unaddressed room broadcasts: wake now (default) or wait for a prompt. */
+  inboundBroadcasts?: InboundBroadcastPolicy;
   /** safety cap — flush even while busy after this long (ms). */
   inboundBatchMaxHoldMs?: number;
   /** client connection-lifecycle debug log (MESH_DEBUG=1) — wire-level
@@ -190,6 +194,7 @@ export const DEFAULT_CONFIG: MeshConfig = {
   watchdogMaxCalls: DEFAULT_WATCHDOG_MAX_CALLS,
   watchdogCompactionBytes: DEFAULT_WATCHDOG_COMPACTION_BYTES,
   contextVerbosity: "compact",
+  inboundBroadcasts: "immediate",
   inboundBatchMs: DEFAULT_INBOUND_BATCH_MS,
   inboundBatchMaxHoldMs: 30_000,
 };
@@ -268,6 +273,7 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
     DEFAULT_CONFIG.watchdogCompactionBytes ?? DEFAULT_WATCHDOG_COMPACTION_BYTES,
   ),
   contextVerbosity: fileCfg.contextVerbosity === "full" ? "full" : "compact",
+    inboundBroadcasts: fileCfg.inboundBroadcasts === "deferred" ? "deferred" : "immediate",
     inboundBatchMs: fileCfg.inboundBatchMs === 0
       ? 0
       : positiveInt(fileCfg.inboundBatchMs ?? DEFAULT_INBOUND_BATCH_MS, DEFAULT_INBOUND_BATCH_MS),
@@ -325,6 +331,9 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
   if (env.MESH_RESERVATION_TTL_MS === "0") cfg.reservationTtlMs = 0;
   if (env.MESH_WATCHDOG === "0" || env.MESH_WATCHDOG === "false") cfg.watchdog = false;
   if (env.MESH_CONTEXT_VERBOSE === "1" || env.MESH_CONTEXT_VERBOSE === "true") cfg.contextVerbosity = "full";
+  if (env.MESH_INBOUND_BROADCASTS === "immediate" || env.MESH_INBOUND_BROADCASTS === "deferred") {
+    cfg.inboundBroadcasts = env.MESH_INBOUND_BROADCASTS;
+  }
   if (env.MESH_INBOUND_BATCH_MS !== undefined) {
     const n = Number(env.MESH_INBOUND_BATCH_MS);
     cfg.inboundBatchMs = Number.isFinite(n) && n >= 0 ? Math.floor(n) : cfg.inboundBatchMs;

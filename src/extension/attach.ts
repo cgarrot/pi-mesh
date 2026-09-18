@@ -5,6 +5,8 @@ import { readFileSync } from "node:fs";
 import type { WelcomeInfo } from "../client/client.js";
 import type { MeshFrame } from "../protocol/envelope.js";
 import { buildBatchMessage, bypassesBatch, batchDetails, InboundBatcher } from "./batcher.js";
+import { DeferredInbox } from "./deferred-inbox.js";
+import { classifyInbound } from "./inbound-policy.js";
 import type { MeshHud } from "./hud.js";
 import { handleInboundSideEffects, injectInbound, type FormatOpts } from "./inbound.js";
 import { ReplyHintTracker } from "./reply-hints.js";
@@ -173,13 +175,30 @@ export function attachClientListeners(
     });
   },
   );
+  const deferredInbox = new DeferredInbox(pi, (frame) =>
+    formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom),
+  (count) => guarded(() => {
+    if (ctx.mode === "tui") ctx.ui.setStatus("mesh-inbox", count > 0 ? `mesh:deferred ${count}` : undefined);
+  }));
+  rt.deferredInbox = deferredInbox;
+  pi.on("input", (_event, inputCtx) => {
+    if (!detached && inputCtx.isIdle?.() !== false) guarded(() => deferredInbox.queueForPrompt());
+  });
+  pi.on("before_agent_start", () => {
+    if (!detached) deferredInbox.promptStarting();
+  });
+  pi.on("agent_start", () => guarded(() => deferredInbox.agentStarting()));
   // rate-limited hold: while the provider rejects turns (429), inbound
   // frames are NOT injected — every injection would burn another failed
   // turn. They are queued and delivered when the hold expires.
-  const heldFrames: MeshFrame[] = [];
-  const deliver = (frame: MeshFrame): void => {
+  const heldFrames: { frame: MeshFrame; matchedReply: boolean }[] = [];
+  const deliver = (frame: MeshFrame, matchedReply: boolean): void => {
     handleInboundSideEffects(frame, deps);
     getHud()?.noteInbound(frame); // preview: transient memory only, never persisted
+    if (classifyInbound(frame, client.alias, client.inboundBroadcasts, matchedReply) === "deferred") {
+      deferredInbox.push(frame);
+      return;
+    }
     const opts: FormatOpts = {
       ...formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom),
     };
@@ -222,16 +241,16 @@ export function attachClientListeners(
   // flush everything queued while rate-limited (called at hold expiry)
   rt.flushHeld = (): void => {
     const frames = heldFrames.splice(0);
-    for (const f of frames) deliver(f);
+    for (const { frame, matchedReply } of frames) deliver(frame, matchedReply);
   };
-  client.on("inbound", (frame: MeshFrame) => {
+  client.on("inbound", (frame: MeshFrame, meta?: { matchedReply?: boolean }) => {
     if (detached) return; // old session's client after reload/switch — D41
     if (rt === null) return; // session shutting down
     if (rt.rateLimitedUntil !== undefined && rt.rateLimitedUntil > Date.now()) {
-      heldFrames.push(frame); // no injection while the provider rejects turns
+      heldFrames.push({ frame, matchedReply: meta?.matchedReply === true }); // no injection while the provider rejects turns
       return;
     }
-    deliver(frame);
+    deliver(frame, meta?.matchedReply === true);
   });
   rt.batcher = batcher;
 
@@ -391,6 +410,7 @@ export function attachClientListeners(
   // Frames still in flight on the old socket are then dropped silently
   // instead of reaching the stale pi/ctx.
   rt.markDetached = () => {
+    deferredInbox.clear();
     detached = true;
   };
 }

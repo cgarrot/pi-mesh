@@ -16,6 +16,7 @@ import {
   TRANSCRIPT_RING_SIZE,
 } from "../shared/config.js";
 import { MESH_VERSION } from "../shared/version.js";
+import type { DeferredInbox } from "./deferred-inbox.js";
 import type { MeshGuards } from "./guards.js";
 import { LOOP_GUARD_WARNING, REPLY_REPEAT_WARNING } from "./guards.js";
 import { identityFromClient, type MeshIdentity } from "./identity.js";
@@ -41,6 +42,8 @@ export interface MeshRuntime {
   pendingHistory?: string[];
   /** inbound batching (flush remaining frames on shutdown). */
   batcher?: { flushNow(): void };
+  /** Unaddressed broadcasts held separately from immediate traffic. */
+  deferredInbox?: DeferredInbox;
   /** Display-only entry outside the LLM context (mesh-verdict colors). */
   appendEntry?: (type: string, data: unknown) => void;
   /** pending auto-release timers per reserved pattern (mesh_reserve
