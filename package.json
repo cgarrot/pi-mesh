@@ -1,6 +1,6 @@
 {
   "name": "pi-mesh-extension",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Live agent-to-agent communication for Pi — local broker, mesh.v1 protocol, honest delivered/read/answered statuses, hash-only ledger. Zero runtime dependencies. Published as pi-mesh-extension on npm (the plain pi-mesh name is taken by another project).",
   "type": "module",
   "license": "MIT",
