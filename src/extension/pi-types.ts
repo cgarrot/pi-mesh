@@ -72,6 +72,7 @@ export interface UiTheme {
 /** Context passed by Pi to tool execute / command handler / session hooks. */
 export interface SessionContext {
   cwd: string;
+  mode?: "tui" | "rpc" | "json" | "print";
   /** Pi session manager (read-only surface) — stable sessionId across reloads. */
   sessionManager?: {
     getSessionId(): string;
@@ -128,7 +129,7 @@ export interface CommandDefinition {
   handler: (args: string, ctx: SessionContext) => void | Promise<void>;
 }
 
-export type DeliverAs = "followUp" | "steer";
+export type DeliverAs = "followUp" | "steer" | "nextTurn";
 
 export interface InboundMessage {
   customType: string;
@@ -143,6 +144,9 @@ export interface SendMessageOptions {
 }
 
 export type SessionEventName =
+  | "input"
+  | "before_agent_start"
+  | "agent_start"
   | "session_start"
   | "session_shutdown"
   | "session_before_fork"
@@ -176,6 +180,8 @@ export type ToolCallHandler = (
 
 /** The subset of the Pi ExtensionAPI used by the mesh extension. */
 export interface ExtensionAPI {
+  /** Shared process-local event bus (optional on older hosts). */
+  events?: { emit(event: string, data: unknown): void };
   on(event: "tool_call", handler: ToolCallHandler): void;
   on(event: SessionEventName, handler: SessionHookHandler): void;
   registerTool(tool: ToolDefinition): void;

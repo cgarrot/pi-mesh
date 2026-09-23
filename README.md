@@ -179,7 +179,8 @@ node dist/src/cli/mesh.js doctor               # socket? lock stale? pid? protoc
 
 ## Configuration
 
-`<cwd>/.mesh/config.json` (all optional):
+`<stateDir>/config.json` (default `<cwd>/.mesh/config.json`, all optional).
+Precedence: defaults < config file < environment.
 
 ```jsonc
 { "alias": "alice", "rooms": ["default"], "transcript": false,
@@ -188,8 +189,37 @@ node dist/src/cli/mesh.js doctor               # socket? lock stale? pid? protoc
   "reservationTtlMs": 21600000,
   "watchdog": true, "watchdogSpikeBytes": 2097152, "watchdogMaxCalls": 64,
   "contextVerbosity": "compact",
+  "inboundBroadcasts": "immediate",
   "inboundBatchMs": 250, "inboundBatchMaxHoldMs": 30000 }
 ```
+
+### Deferring unrelated broadcasts
+
+Set `"inboundBroadcasts": "deferred"` or `MESH_INBOUND_BROADCASTS=deferred`
+to avoid a model turn for every unrelated room update. The default,
+`"immediate"`, preserves existing behavior. Invalid values are ignored
+(invalid file values fall back to the default).
+
+Only broadcasts and orphan `replyAll` replies without a case-insensitive
+mention of your alias (`@alice` or `alice`, whole alias) are deferred.
+Direct messages, mission answers (including LAUNCH wake-on-answer), urgent
+and force priority, reminders, and reservation updates remain immediate.
+Receipt, transcript, ledger, and mailbox behavior is unchanged.
+
+Deferred frames form a separate, timer-free batch; the next user prompt
+queues it with `deliverAs: "nextTurn"` and **no** `triggerTurn`. It begins
+`[mesh deferred — N broadcast(s) not addressed to you]`. In the TUI,
+`mesh:deferred N` remains in the footer until that prompt starts.
+`/mesh inbox` lists sender, time, and a 120-character preview;
+`/mesh inbox flush` delivers the pending batch now as one triggered follow-up.
+An unrelated direct-message turn does not consume the deferred inbox.
+
+The batch is held locally until input, because Pi has no public API to
+cancel an already-enqueued `nextTurn` message (otherwise manual flush would
+deliver it twice). If prompt preflight is cancelled after input, messages
+already handed to Pi remain queued for the next successful prompt, not
+re-sent by flush. Deferred state is session-local and cleared on reset,
+reload, or shutdown; use the existing mesh history for older frames.
 
 v0.6 highlights:
 
@@ -400,3 +430,22 @@ transcript) · `src/cli` · `test/` · `scripts/mesh-smoke.mjs`.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## For other extensions
+
+After connect/reconnect (and rename), mesh publishes the resolved identity:
+
+```typescript
+pi.events.on("mesh:alias", (data) => {
+  const { alias, rooms } = data as { alias: string; rooms: string[] };
+  // Refresh your own status or integration. No model turn is triggered.
+});
+const alias = (globalThis as Record<symbol, unknown>)[Symbol.for("pi-mesh:alias")];
+```
+
+`alias` has no leading `@`. The symbol is a convenience snapshot of the
+latest connected alias in this process, not a cross-process registry;
+subscribe to the event for updates. It is undefined before the first
+connection and is not a connection-health signal. In-process child sessions
+share `globalThis`; consumers needing per-session identity should use their
+session's event lifecycle rather than treating the symbol as session-local.

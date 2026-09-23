@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { updateSessionName } from "../src/extension/attach.js";
+import { exposeAlias, updateSessionName } from "../src/extension/attach.js";
 
 function fakePi(initial?: string): {
   pi: { setSessionName(name: string): void; getSessionName(): string | undefined };
@@ -195,5 +195,27 @@ describe("attachClientListeners (D41): stale ctx after reload must not throw", (
       } as unknown as MeshFrame);
     });
     client.close();
+  });
+});
+
+
+describe("public mesh alias bridge", () => {
+  it("emits resolved alias and a rooms snapshot without triggering a turn", () => {
+    const key = Symbol.for("pi-mesh:alias");
+    const globals = globalThis as Record<symbol, unknown>;
+    const previous = globals[key];
+    const events: unknown[] = [];
+    const rooms = ["default"];
+    try {
+      exposeAlias({ events: { emit: (event: string, data: unknown) => events.push({ event, data }) } } as never, "alice", rooms);
+      rooms.push("another");
+      assert.equal(globals[key], "alice");
+      assert.deepEqual(events, [{ event: "mesh:alias", data: { alias: "alice", rooms: ["default"] } }]);
+      exposeAlias({} as never, "bob", []); // hosts without the event bus
+      assert.equal(globals[key], "bob");
+    } finally {
+      if (previous === undefined) delete globals[key];
+      else globals[key] = previous;
+    }
   });
 });

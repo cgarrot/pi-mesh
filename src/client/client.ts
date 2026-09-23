@@ -553,6 +553,10 @@ export class MeshClient extends EventEmitter {
     return this.config.reservationTtlMs;
   }
 
+  get inboundBroadcasts(): "immediate" | "deferred" {
+    return this.config.inboundBroadcasts ?? "immediate";
+  }
+
   /** inbound batching window (0 = disabled). */
   get inboundBatchMs(): number {
     return this.config.inboundBatchMs ?? 0;
@@ -968,7 +972,7 @@ export class MeshClient extends EventEmitter {
               this.inbox.set(frame.id, frame);
               this.pruneInbox();
             }
-            this.emit("inbound", frame);
+            this.emit("inbound", frame, { matchedReply: true });
           } else {
             this.emit("reply", frame);
           }

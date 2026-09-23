@@ -24,6 +24,7 @@ const HELP_TEXT = [
   "/mesh ping <alias>    — send a one-shot ping message",
   "/mesh stale           — reservations held by peers, with age (TTL insight)",
   "/mesh broker          — socket path, lock pid, session state",
+  "/mesh inbox [flush]   — list deferred broadcasts, or deliver them now",
   "/mesh help",
 ].join("\n");
 
@@ -230,6 +231,7 @@ async function cmdReset(
   // like /new (fresh alias, default rooms, no reservations) but stays in
   // this pi session, like /reload does for identity preservation.
   const oldAlias = rt.client.alias;
+  rt.markDetached?.();
   // 1. leave the mesh cleanly (alias/rooms/reservations purged at the broker)
   await rt.client.close().catch(() => {});
   // 2. factory-reset the persisted identity for this session
@@ -420,6 +422,17 @@ export function registerCommands(
       }
       const [sub, ...rest] = args.trim().split(/\s+/).filter((s) => s.length > 0);
       switch (sub) {
+        case "inbox":
+          if (rest.length === 0) {
+            notify(ctx, rt.deferredInbox?.list() ?? "mesh: deferred inbox empty");
+          } else if (rest.length === 1 && rest[0] === "flush") {
+            const count = rt.deferredInbox?.flush() ?? 0;
+            notify(ctx, `mesh: flushed ${count} deferred broadcast(s)` +
+              ((rt.deferredInbox?.count ?? 0) > 0 ? " (remaining messages already queued for the next prompt)" : ""));
+          } else {
+            notify(ctx, "usage: /mesh inbox [flush]");
+          }
+          break;
         case "status":
           await cmdStatus(rt, ctx, rest[0]);
           break;
