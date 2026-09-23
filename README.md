@@ -221,6 +221,22 @@ already handed to Pi remain queued for the next successful prompt, not
 re-sent by flush. Deferred state is session-local and cleared on reset,
 reload, or shutdown; use the existing mesh history for older frames.
 
+v0.7 highlights:
+
+- **Deferred broadcasts (opt-in)** — `"inboundBroadcasts": "deferred"`
+  (or `MESH_INBOUND_BROADCASTS=deferred`) stops unrelated room broadcasts
+  from burning model turns: only broadcasts and orphan `replyAll` replies
+  without a whole-alias mention are held. Direct messages, mission answers
+  (LAUNCH wake-on-answer included), urgent/force, reminders and
+  reservations stay immediate. Held frames surface as `mesh:deferred N`
+  in the TUI footer and via `/mesh inbox`; `/mesh inbox flush` delivers
+  them now as one triggered follow-up. Receipts, ledger and mailbox
+  behavior are unchanged. Contributed by @avifenesh (#7).
+- **`mesh:alias` event** — after connect/reconnect (and rename), mesh
+  publishes its resolved identity on the shared event bus plus a
+  `Symbol.for("pi-mesh:alias")` snapshot for other extensions. Contributed
+  by @avifenesh (#7).
+
 v0.6 highlights:
 
 - **Wake-on-answer** — every LAUNCH mission answer (`awaitReply: true,
@@ -410,7 +426,7 @@ MESH_BROKER_URL=tcp://<machine-A>:8712 MESH_BROKER_TOKEN=change-me pi
 
 ```bash
 npm run build   # strict tsc (ESM, NodeNext)
-npm test        # build + node --test dist/test/*.test.js (392 tests)
+npm test        # build + node --test dist/test/*.test.js (405 tests)
 npm run smoke   # E2E without Pi: broker + 2 headless clients
 ```
 
@@ -449,3 +465,14 @@ subscribe to the event for updates. It is undefined before the first
 connection and is not a connection-health signal. In-process child sessions
 share `globalThis`; consumers needing per-session identity should use their
 session's event lifecycle rather than treating the symbol as session-local.
+
+## Contributors
+
+Thanks to everyone who has made pi-mesh better:
+
+- [cgarrot](https://github.com/cgarrot) — maintainer
+- [wait4xx](https://github.com/wait4xx) — wake-on-answer & cancellable blocking
+  sends (#6), CJK verdict-width crash fix (#4), mailbox drop-notice fix (#3),
+  verdict renderer regression tests (#1)
+- [avifenesh](https://github.com/avifenesh) — deferred broadcast policy (#7),
+  `mesh:alias` extension bridge (#7)

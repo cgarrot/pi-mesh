@@ -198,7 +198,6 @@ describe("attachClientListeners (D41): stale ctx after reload must not throw", (
   });
 });
 
-
 describe("public mesh alias bridge", () => {
   it("emits resolved alias and a rooms snapshot without triggering a turn", () => {
     const key = Symbol.for("pi-mesh:alias");

@@ -4,6 +4,9 @@ import { batchDetails, buildBatchMessage } from "./batcher.js";
 import { localTime, type FormatOpts } from "./inbound.js";
 import type { ExtensionAPI } from "./pi-types.js";
 
+/** Human-facing preview cap for /mesh inbox lines (documentation, not a protocol bound). */
+const PREVIEW_MAX_CHARS = 120;
+
 export class DeferredInbox {
   private pending: MeshFrame[] = [];
   private queued: MeshFrame[] = [];
@@ -28,7 +31,7 @@ export class DeferredInbox {
     const frames = [...this.queued, ...this.pending];
     if (frames.length === 0) return "mesh: deferred inbox empty";
     return `mesh: deferred ${frames.length}\n` + frames.map((f) =>
-      `@${f.from ?? "?"} ${localTime(f.ts)} ${(f.body ?? "").replace(/\s+/g, " ").slice(0, 120)}`,
+      `@${f.from ?? "?"} ${localTime(f.ts)} ${(f.body ?? "").replace(/\s+/g, " ").slice(0, PREVIEW_MAX_CHARS)}`,
     ).join("\n");
   }
 

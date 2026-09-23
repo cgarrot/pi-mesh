@@ -273,8 +273,8 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
     DEFAULT_CONFIG.watchdogCompactionBytes ?? DEFAULT_WATCHDOG_COMPACTION_BYTES,
   ),
   contextVerbosity: fileCfg.contextVerbosity === "full" ? "full" : "compact",
-    inboundBroadcasts: fileCfg.inboundBroadcasts === "deferred" ? "deferred" : "immediate",
-    inboundBatchMs: fileCfg.inboundBatchMs === 0
+  inboundBroadcasts: fileCfg.inboundBroadcasts === "deferred" ? "deferred" : "immediate",
+  inboundBatchMs: fileCfg.inboundBatchMs === 0
       ? 0
       : positiveInt(fileCfg.inboundBatchMs ?? DEFAULT_INBOUND_BATCH_MS, DEFAULT_INBOUND_BATCH_MS),
     inboundBatchMaxHoldMs: positiveInt(
