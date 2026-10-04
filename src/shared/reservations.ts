@@ -1,7 +1,9 @@
-// extension/reservations.ts — file reservation matching.
+// shared/reservations.ts — file reservation matching.
 // Pure functions, no Pi imports: pattern normalization + conflict lookup
 // against a peer→reservations map. Mirrors the old pi-mesh semantics: a
 // trailing "/" reserves a whole directory subtree, anything else is exact.
+// Lives in shared/ (not extension/) so the CLI dry-run conflict check uses
+// the EXACT same matching semantics as the edit/write guards (V4 kept).
 import type { FileReservation } from "../protocol/envelope.js";
 
 /** Normalize a path/pattern for comparison: forward slashes, no "./", and

@@ -14,7 +14,7 @@ import {
   identityPath,
   MeshIdentity,
   RESERVATION_TTL_MS,
-} from "../src/extension/identity.js";
+} from "../src/shared/identity-store.js";
 import { makeTempDirs, startTestBroker, waitFor, type TempDirs } from "./helpers.js";
 
 function tmpStateDir(): { dir: string; cleanup: () => void } {

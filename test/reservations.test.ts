@@ -5,7 +5,7 @@ import {
   findConflict,
   normalizePath,
   pathMatchesReservation,
-} from "../src/extension/reservations.js";
+} from "../src/shared/reservations.js";
 import type { FileReservation } from "../src/protocol/envelope.js";
 
 describe("reservations: path matching", () => {

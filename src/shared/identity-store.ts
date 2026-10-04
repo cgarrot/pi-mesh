@@ -1,4 +1,4 @@
-// extension/identity.ts — mesh identity persistence.
+// shared/identity-store.ts — mesh identity persistence.
 //
 // Problem: /reload (and pi extension reloads in general) fire
 // session_shutdown + session_start: the old MeshClient is closed (the broker
@@ -17,7 +17,7 @@
 //
 // Migration: a legacy single-file <stateDir>/identity.json (v0.1.3-v0.1.7)
 // is read once and moved to the per-session file when its sessionId matches.
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { nowIso } from "../protocol/frames.js";
 import { isValidReservations, type FileReservation } from "../protocol/envelope.js";
@@ -228,6 +228,41 @@ export class MeshIdentity {
   // best effort
     }
   }
+
+  /** List every persisted identity in this stateDir (sessions command /
+   *  adoption targets). Corrupt or unusable files are SKIPPED and REPORTED
+   *  in `skipped` — a store layer does not print; the caller decides how to
+   *  surface the loss. READ-ONLY: nothing is written, moved or deleted. */
+  list(): { identities: ListedIdentity[]; skipped: string[] } {
+    const identities: ListedIdentity[] = [];
+    const skipped: string[] = [];
+    let names: string[];
+    try {
+      names = readdirSync(this.stateDir);
+    } catch {
+      return { identities, skipped }; // no stateDir — no identities
+    }
+    for (const name of names) {
+      if (!name.startsWith(IDENTITY_PREFIX) || !name.endsWith(".json")) continue;
+      const sessionId = name.slice(IDENTITY_PREFIX.length, -".json".length);
+      if (sessionId === "" || sessionId === "pending") continue; // legacy single file / handoff staging
+      try {
+        const id = this.parse(readFileSync(path.join(this.stateDir, name), "utf8"), sessionId);
+        if (id !== null) {
+          identities.push({ ...id, sessionId });
+        } else {
+          skipped.push(name); // unreadable/corrupt/foreign-version
+        }
+      } catch {
+        skipped.push(name);
+      }
+    }
+    return { identities, skipped };
+  }
+}
+
+export interface ListedIdentity extends PersistedIdentity {
+  sessionId: string;
 }
 
 /** Path of the per-session identity file (exported for tests). */

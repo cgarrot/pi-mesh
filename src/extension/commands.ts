@@ -7,7 +7,7 @@ import { brokerLockPath, brokerSocketPath } from "../shared/paths.js";
 import { MESH_VERSION } from "../shared/version.js";
 import { attachClientListeners, updateSessionName } from "./attach.js";
 import type { MeshHud } from "./hud.js";
-import { identityFromClient } from "./identity.js";
+import { identityFromClient } from "../shared/identity-store.js";
 import type { ExtensionAPI, SessionContext } from "./pi-types.js";
 import type { GetRuntime, MeshRuntime } from "./tools.js";
 

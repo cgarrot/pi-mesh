@@ -19,7 +19,7 @@ import { MESH_VERSION } from "../shared/version.js";
 import type { DeferredInbox } from "./deferred-inbox.js";
 import type { MeshGuards } from "./guards.js";
 import { LOOP_GUARD_WARNING, REPLY_REPEAT_WARNING } from "./guards.js";
-import { identityFromClient, type MeshIdentity } from "./identity.js";
+import { identityFromClient, type MeshIdentity } from "../shared/identity-store.js";
 import type { MeshLedger } from "./ledger.js";
 import type { ExtensionAPI, SessionContext, ToolResult } from "./pi-types.js";
 import { textResult } from "./pi-types.js";
