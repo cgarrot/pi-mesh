@@ -37,6 +37,9 @@
     ],
     "image": "https://raw.githubusercontent.com/cgarrot/pi-mesh/main/assets/preview.jpg"
   },
+  "bin": {
+    "pimesh": "dist/src/cli/mesh.js"
+  },
   "files": [
     "src",
     "dist",
@@ -49,7 +52,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/sync-version.mjs && tsc -p tsconfig.json",
     "test": "npm run build && node scripts/run-tests.mjs",
     "smoke": "node scripts/mesh-smoke.mjs",
     "ci": "npm run build && node scripts/run-tests.mjs && npm run smoke",

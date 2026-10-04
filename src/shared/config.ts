@@ -60,6 +60,38 @@ export const ENSURE_BROKER_POLL_MS = 50;
 export const ENSURE_BROKER_MAX_POLLS = 60; // 3 s
 export const LOCK_RETRY_MAX = 3;
 
+// ---- CLI ----
+/** last N ledger lines printed by `mesh tail` (no -f yet — Phase 3). */
+export const CLI_TAIL_LINES = 20;
+/** default `mesh send --await` timeout: a one-shot CLI script must not hang
+ * for the 30-min mission default — long awaits belong to a live session. */
+export const CLI_SEND_TIMEOUT_MS = 30_000;
+/** how long `mesh reserve` keeps its claim alive before closing: long enough
+ * for peers to receive the reservation broadcast, short enough that the
+ * debug one-shot never lingers (the claim dies with the connection anyway). */
+export const CLI_RESERVE_GRACE_MS = 1_500;
+/** `mesh ping` await budget: short by design — liveness probing must not hang
+ * for the send default; peer turns often take longer, expired ≠ down. */
+export const CLI_PING_TIMEOUT_MS = 5_000;
+/** `mesh wait` default budget (same 5 min as the extension's mesh_wait_all). */
+export const CLI_WAIT_TIMEOUT_MS = 300_000;
+/** max records `mesh ledger`/`mesh tail --limit` may print (bound, V5). */
+export const CLI_LEDGER_MAX_LIMIT = 200;
+/** default record count for `mesh ledger`. */
+export const CLI_LEDGER_DEFAULT_LIMIT = 20;
+/** Countdown line interval while `reserve --hold` runs. */
+export const CLI_HOLD_TICK_MS = 30_000;
+/** Settle before the reserve dry-run conflict check: the welcome snapshot
+ * already seeds peer claims — this only covers broadcasts in flight. */
+export const CLI_RESERVE_SETTLE_MS = 250;
+/** Mailbox flush above this count prints a read-receipt noise warning at
+ * attach (each flushed message renders = one read frame to its sender). */
+export const ATTACH_BULK_READ_THRESHOLD = 20;
+/** Prefix for fresh standalone aliases (`mesh attach` without --alias). */
+export const STANDALONE_ALIAS_PREFIX = "standalone";
+/** max backlog lines `mesh tail -f` replays at startup. */
+export const CLI_TAIL_BACKLOG_MAX_LINES = 1_000;
+
 // ---- Inbound batching ----
 export const DEFAULT_INBOUND_BATCH_MS = 250;
 /** One bounded retry when session injection throws (transient host state
@@ -75,6 +107,9 @@ export const DEFAULT_ACTIVITY_STUCK_MS = 900_000; // 15 min idle WITH reservatio
  *  margin, while stale claims left behind by a finished agent (measured:
  *  5 h+ held while idle) stop blocking peers. 0 = unlimited (opt-out). */
 export const DEFAULT_RESERVATION_TTL_MS = 21_600_000; // 6 h
+/** Hard cap for `mesh reserve --hold`: at/above the system TTL a hold would
+ * silently expire mid-hold and the countdown would misrepresent it. */
+export const CLI_HOLD_MAX_MS = DEFAULT_RESERVATION_TTL_MS;
 
 // ---- Context watchdog ----
 /** notify when ONE turn grows the session file by this much (bytes). */

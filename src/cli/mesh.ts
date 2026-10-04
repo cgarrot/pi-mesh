@@ -1,307 +1,593 @@
-// cli/mesh.ts — debug/admin CLI. Ephemeral clients: alias cli-<rand6>.
-import { existsSync, readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { MeshClient, type SendResult } from "../client/client.js";
-import { connectProbe, connectProbeTcp } from "../client/reconnect.js";
-import { ALIAS_RAND_CHARS, STATUS_REQ_TIMEOUT_MS } from "../shared/config.js";
-import { loadConfig, parseEndpoint, type MeshConfig } from "../shared/config.js";
-import {
-  brokerLockPath,
-  brokerSocketPath,
-  configPath,
-  ledgerPath,
-  runtimeDir,
-  stateDir,
-} from "../shared/paths.js";
-import { randomBytes } from "node:crypto";
+#!/usr/bin/env node
+// cli/mesh.ts — debug/admin CLI entrypoint (exposed as the `pimesh` bin by
+// package.json — npm sets the executable bit at install). Pure dispatcher:
+// every command lives in cmd/ and talks to the mesh through MeshClient
+// (never the broker internals). Ephemeral clients: alias cli-<rand6>.
+import { parseArgs, type ArgSpec } from "./args.js";
+import { sayErr } from "./out.js";
+import { setColorOverride } from "./out.js";
+import { EXIT_USAGE } from "./codes.js";
+import { CLI_LEDGER_DEFAULT_LIMIT, CLI_LEDGER_MAX_LIMIT } from "../shared/config.js";
+import { validateAlias, validateRoom } from "./validate.js";
+import { cmdBroker } from "./cmd/broker.js";
+import { cmdPeers } from "./cmd/peers.js";
+import { cmdSend, parseSendArgs, readStdinBody, SEND_USAGE, type SendArgs } from "./cmd/send.js";
+import { cmdReply, REPLY_USAGE } from "./cmd/reply.js";
+import { cmdPing, PING_USAGE } from "./cmd/ping.js";
+import { cmdWait, WAIT_USAGE } from "./cmd/wait.js";
+import { cmdLedger, LEDGER_USAGE } from "./cmd/ledger.js";
+import { cmdTailFollow, TAILF_USAGE } from "./cmd/tailf.js";
+import { cmdStatus, STATUS_USAGE } from "./cmd/status.js";
+import { cmdConfigShow, CONFIG_USAGE } from "./cmd/configshow.js";
+import { cmdRoom } from "./cmd/rooms.js";
+import { cmdReserve, cmdRelease, RESERVE_USAGE, RELEASE_USAGE } from "./cmd/reserve.js";
+import { cmdWatch, WATCH_USAGE } from "./cmd/watch.js";
+import { cmdSessions, SESSIONS_USAGE } from "./cmd/sessions.js";
+import { cmdAttach, ATTACH_USAGE } from "./cmd/attach.js";
+import { cmdTail } from "./cmd/ledger.js";
+import { cmdDoctor } from "./cmd/doctor.js";
+import { GENERAL_USAGE, printCommandHelp, printGeneralUsage } from "./cmd/help.js";
 
-const TAIL_LINES = 20;
-const CLI_SEND_TIMEOUT_MS = 30_000;
+const SEND_SPECS: ArgSpec[] = [
+  { name: "room", kind: "value", short: "R", meta: "ROOM" },
+  { name: "priority", kind: "value", meta: "P", help: "normal|urgent|force" },
+  { name: "reason", kind: "value", meta: "R", help: "required for force" },
+  { name: "refs", kind: "value", meta: "A,B", help: "repo-relative refs (max 8)" },
+  { name: "reply-to", kind: "value", meta: "A,B", help: "who receives the reply (max 8)" },
+  { name: "broadcast", kind: "flag", help: "fan out to the whole room (no alias)" },
+  { name: "await", kind: "flag", help: "wait for an explicit reply" },
+  { name: "launch", kind: "flag", help: "awaitReply without blocking (dies at exit)" },
+  { name: "timeout", kind: "value", meta: "MS" },
+  { name: "alias", kind: "value", meta: "A", help: "strict alias for this invocation" },
+  { name: "require-online", kind: "flag", help: "queued_offline exits 1 instead of 4" },
+];
 
-function cliAlias(): string {
-  return `cli-${randomBytes(ALIAS_RAND_CHARS / 2).toString("hex").slice(0, ALIAS_RAND_CHARS)}`;
-}
+const PEERS_SPECS: ArgSpec[] = [{ name: "room", kind: "value", short: "R", meta: "ROOM" }];
 
-/** Client config from <cwd>/.mesh/config.json + env (MESH_BROKER_URL,
- *  MESH_BROKER_TOKEN…) — lets the CLI reach remote tcp/tls brokers exactly
- *  like extension clients do. */
-function cliConfig(): Partial<MeshConfig> {
-  return loadConfig(stateDir());
-}
+const JOIN_SPECS: ArgSpec[] = [{ name: "observer", kind: "flag" }];
 
-function argValue(args: string[], flag: string): string | undefined {
-  const idx = args.indexOf(flag);
-  return idx !== -1 && idx + 1 < args.length ? args[idx + 1] : undefined;
-}
+// leave takes NO options (observer is join-only) — a --observer on leave
+// is an unknown-option usage error, never silently ignored.
+const LEAVE_SPECS: ArgSpec[] = [];
 
-function hasFlag(args: string[], flag: string): boolean {
-  return args.includes(flag);
-}
+const RESERVE_SPECS: ArgSpec[] = [
+  { name: "reason", kind: "value", meta: "R", help: "why (visible to peers)" },
+  { name: "hold", kind: "value", meta: "MS", help: "keep the claim alive (Ctrl-C releases)" },
+];
 
-function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
+const RELEASE_SPECS: ArgSpec[] = [{ name: "all", kind: "flag", help: "release everything this process holds" }];
 
-function printResult(r: SendResult): void {
-  switch (r.status) {
-    case "delivered":
-      process.stdout.write(`delivered ${r.msgId}\n`);
-      break;
-    case "queued_offline":
-      process.stdout.write(`queued_offline ${r.msgId}\n`);
-      break;
-    case "reply":
-      process.stdout.write(`reply ${r.msgId}: ${r.response}\n`);
-      break;
-    case "expired":
-      process.stdout.write(`expired ${r.msgId ?? ""}\n`);
-      break;
-    case "blocked":
-      process.stdout.write(`blocked: ${r.reason}\n`);
-      break;
-    case "error":
-      process.stdout.write(`error: ${r.reason}\n`);
-      break;
-  }
-}
+const WATCH_SPECS: ArgSpec[] = [
+  { name: "alias", kind: "value", meta: "A", help: "strict alias (collision = exit 1)" },
+  { name: "json", kind: "flag", help: "NDJSON frames (bodies redacted)" },
+];
 
-async function cmdBroker(sub: string | undefined): Promise<number> {
-  const dir = runtimeDir();
-  const sock = brokerSocketPath(dir);
-  switch (sub) {
-    case "start": {
-      const { spawn } = await import("node:child_process");
-      const { brokerEntryPath } = await import("../client/reconnect.js");
-      const child = spawn(process.execPath, [brokerEntryPath()], {
-        detached: true,
-        stdio: "ignore",
-        env: { ...process.env, MESH_RUNTIME_DIR: dir },
-      });
-      child.unref();
-      process.stdout.write(`broker spawned pid=${child.pid ?? "?"} sock=${sock}\n`);
-      return 0;
-    }
-    case "stop": {
-      try {
-        const pid = Number(readFileSync(brokerLockPath(dir), "utf8").trim());
-        if (Number.isFinite(pid) && pidAlive(pid)) {
-          process.kill(pid, "SIGTERM");
-          process.stdout.write(`SIGTERM sent to broker pid=${pid}\n`);
-          return 0;
-        }
-      } catch {
-  // no lock
-      }
-      process.stdout.write("no live broker lock found\n");
-      return 1;
-    }
-    case "status": {
-      const alive = await connectProbe(sock, STATUS_REQ_TIMEOUT_MS);
-      let pid = "?";
-      try {
-        pid = readFileSync(brokerLockPath(dir), "utf8").trim();
-      } catch {
-  // no lock
-      }
-      process.stdout.write(`socket=${sock} reachable=${alive} lockPid=${pid}\n`);
-      return alive ? 0 : 1;
-    }
-    default:
-      process.stderr.write("usage: mesh broker start|stop|status\n");
-      return 2;
-  }
-}
+const SESSIONS_SPECS: ArgSpec[] = [{ name: "json", kind: "flag", help: "NDJSON identities" }];
 
-async function cmdPeers(args: string[]): Promise<number> {
-  const room = argValue(args, "--room");
-  const client = new MeshClient({ alias: cliAlias(), noReconnect: true, config: cliConfig() });
-  try {
-    await client.connect();
-  } catch {
-    process.stdout.write("blocked: broker_unavailable\n");
-    return 1;
-  }
-  const snap = await client.status(room);
-  // M1/M2: per-peer extension version + broker counters in the CLI too
-  for (const p of snap.peers) {
-    const v = p.clientVersion !== undefined && p.clientVersion !== "" ? `v${p.clientVersion}` : "v?";
-    process.stdout.write(`${p.alias}\trooms=${p.rooms.join(",")}\tv=${v}\tsince=${p.since ?? "?"}\n`);
-  }
-  if (snap.stats !== undefined) {
-    const s = snap.stats;
-    process.stdout.write(`broker: relayed=${s.relayed} refused=${s.refused} mailboxDelivered=${s.mailboxDelivered} mailboxDropped=${s.mailboxDropped}\n`);
-  }
-  await client.close();
-  return 0;
-}
+const ATTACH_SPECS: ArgSpec[] = [
+  { name: "session", kind: "value", meta: "ID", help: "adopt a persisted session identity" },
+  { name: "room", kind: "value", short: "R", meta: "ROOM", help: "join this room first" },
+  { name: "json", kind: "flag", help: "script mode: NDJSON stdin commands / stdout events" },
+  { name: "no-read", kind: "flag", help: "never emit read receipts" },
+];
 
-async function cmdSend(args: string[]): Promise<number> {
-  const [to, ...rest] = args.filter((a) => !a.startsWith("--"));
-  const text = rest.join(" ");
-  if (!to || text === "") {
-    process.stderr.write("usage: mesh send <alias> <texte> [--room R] [--await] [--timeout MS]\n");
-    return 2;
-  }
-  const client = new MeshClient({ alias: cliAlias(), noReconnect: true, config: cliConfig() });
-  const result = await client.send({
-    to,
-    message: text,
-    room: argValue(args, "--room"),
-    awaitReply: hasFlag(args, "--await"),
-    timeoutMs: Number(argValue(args, "--timeout") ?? CLI_SEND_TIMEOUT_MS),
-  });
-  printResult(result);
-  await client.close();
-  return result.status === "error" || result.status === "blocked" ? 1 : 0;
-}
+const REPLY_SPECS: ArgSpec[] = [
+  { name: "to", kind: "value", meta: "A", help: "target member (one-shot has no inbox)" },
+  { name: "room", kind: "value", short: "R", meta: "ROOM", help: "required (with --to or --reply-all)" },
+  { name: "reply-all", kind: "flag", help: "fan the answer out to the whole room" },
+  { name: "refs", kind: "value", meta: "A,B", help: "repo-relative refs (max 8)" },
+];
 
-async function cmdRoom(args: string[], sub: string): Promise<number> {
-  const room = args[0];
-  if (room === undefined) {
-    process.stderr.write(`usage: mesh ${sub} <room>
-`);
-    return 2;
-  }
-  const client = new MeshClient({ alias: cliAlias(), noReconnect: true, config: cliConfig() });
-  try {
-    await client.connect();
-    if (sub === "join") {
-      await client.join(room, args.includes("observer") ? "observer" : "member");
-      process.stdout.write(`joined ${room}
-`);
-    } else if (sub === "leave") {
-      await client.leave(room);
-      process.stdout.write(`left ${room}
-`);
-    } else if (sub === "status") {
-      const snap = await client.status(room);
-      for (const p of snap.peers) {
-        process.stdout.write(`${p.alias}	rooms=${p.rooms.join(",")}	since=${p.since ?? "?"}
-`);
-      }
-    }
-  } catch (err) {
-    process.stderr.write(`${sub} failed: ${err instanceof Error ? err.message : String(err)}
-`);
-    await client.close();
-    return 1;
-  }
-  await client.close();
-  return 0;
-}
+const PING_SPECS: ArgSpec[] = [{ name: "timeout", kind: "value", meta: "MS" }];
 
-async function cmdReserve(args: string[]): Promise<number> {
-  const paths = args.filter((a) => !a.startsWith("--") && !a.startsWith("reason"));
-  const reasonIdx = args.indexOf("--reason");
-  const reason = reasonIdx !== -1 ? args[reasonIdx + 1] : undefined;
-  if (paths.length === 0) {
-    process.stderr.write("usage: mesh reserve <path> [--reason R]\n");
-    return 2;
-  }
-  const client = new MeshClient({ alias: cliAlias(), noReconnect: true, config: cliConfig() });
-  try {
-    await client.connect();
-    const res = await client.reserve(paths, reason);
-    if (res.status === "delivered") {
-      process.stdout.write(`reserved ${paths.join(", ")}
-`);
-      await new Promise((r) => setTimeout(r, 1500)); // keep the claim alive a moment
-    } else {
-      process.stderr.write(`reserve failed: ${"reason" in res ? res.reason : res.status}
-`);
-    }
-    await client.close();
-    return res.status === "delivered" ? 0 : 1;
-  } catch (err) {
-    process.stderr.write(`reserve failed: ${err instanceof Error ? err.message : String(err)}
-`);
-    await client.close();
-    return 1;
-  }
-}
+const WAIT_SPECS: ArgSpec[] = [{ name: "timeout", kind: "value", meta: "MS" }];
 
-async function cmdTail(): Promise<number> {
-  const path = ledgerPath(stateDir());
-  if (!existsSync(path)) {
-    process.stdout.write("(no ledger)\n");
-    return 0;
-  }
-  const content = await readFile(path, "utf8");
-  const lines = content.split("\n").filter((l) => l.trim() !== "");
-  for (const line of lines.slice(-TAIL_LINES)) process.stdout.write(line + "\n");
-  return 0;
-}
+const PEERS_SPECS_STATUS: ArgSpec[] = [
+  { name: "all", kind: "flag", help: "every peer of the mesh (all rooms)" },
+  { name: "reservations", kind: "flag", help: "list reservations held by peers" },
+  { name: "json", kind: "flag", help: "one NDJSON object" },
+];
 
-async function cmdDoctor(): Promise<number> {
-  const dir = runtimeDir();
-  const sock = brokerSocketPath(dir);
-  const lock = brokerLockPath(dir);
-  const cfg = loadConfig(stateDir());
-  const url = cfg.brokerUrl;
-  const listen = cfg.listen;
-  const endpoint = url !== undefined ? parseEndpoint(url) : null;
-  const reachable = endpoint === null
-    ? await connectProbe(sock, STATUS_REQ_TIMEOUT_MS)
-    : endpoint.kind === "unix"
-      ? await connectProbe(endpoint.path, STATUS_REQ_TIMEOUT_MS)
-      : await connectProbeTcp(endpoint.host, endpoint.port, STATUS_REQ_TIMEOUT_MS);
-  let lockInfo = "absent";
-  let stale = false;
-  if (existsSync(lock)) {
-    const pid = Number(readFileSync(lock, "utf8").trim());
-    if (Number.isFinite(pid)) {
-      const alive = pidAlive(pid);
-      lockInfo = `pid=${pid} alive=${alive}`;
-      stale = !alive;
-    } else {
-      lockInfo = "present (no pid)";
-    }
-  }
-  let cfgInfo = "absent (defaults)";
-  if (existsSync(configPath(stateDir()))) cfgInfo = configPath(stateDir());
-  process.stdout.write(
-    [
-      `runtimeDir: ${dir}`,
-      url !== undefined
-        ? `endpoint: ${url} reachable=${reachable}`
-        : `socket: ${sock} reachable=${reachable}`,
-      `brokerUrl: ${url ?? "(local unix socket)"}`,
-      `listen: ${listen ?? "(unix socket)"}`,
-      `lock: ${lockInfo}${stale ? " STALE" : ""}`,
-      `config: ${cfgInfo}`,
-      `protocol: mesh.v1`,
-    ].join("\n") + "\n",
-  );
-  return reachable ? 0 : 1;
-}
+const LEDGER_SPECS: ArgSpec[] = [
+  { name: "limit", kind: "value", meta: "N", help: "max records (1..200)" },
+  { name: "from", kind: "value", meta: "A", help: "sender filter" },
+  { name: "to", kind: "value", meta: "A", help: "recipient filter" },
+  { name: "room", kind: "value", short: "R", meta: "ROOM", help: "room filter" },
+  { name: "event", kind: "value", meta: "E", help: "event filter (sent|delivered|reply|…)" },
+  { name: "json", kind: "flag", help: "NDJSON output" },
+];
+
+const TAIL_SPECS: ArgSpec[] = [
+  { name: "follow", kind: "flag", short: "f", help: "stream new records until Ctrl-C" },
+  { name: "limit", kind: "value", meta: "N", help: "backlog lines first" },
+];
 
 export async function main(argv: string[]): Promise<number> {
-  const [cmd, ...args] = argv;
+  // --no-color is global: strip it once, before any command parsing, and
+  // force colors off for the whole run (pipes/NO_COLOR already do).
+  const stripped: string[] = [];
+  for (const a of argv) {
+    if (a === "--no-color") setColorOverride(false);
+    else stripped.push(a);
+  }
+  const [cmd, ...rest] = stripped;
+  if (cmd === undefined || cmd === "--help" || cmd === "-h") {
+    if (cmd === undefined) sayErr(GENERAL_USAGE);
+    else printGeneralUsage();
+    return cmd === undefined ? EXIT_USAGE : 0;
+  }
+  if (cmd === "help") {
+    const topic = rest[0];
+    if (topic === undefined) {
+      printGeneralUsage();
+      return 0;
+    }
+    if (!printCommandHelp(topic)) {
+      sayErr(`unknown command: ${topic}`);
+      sayErr(GENERAL_USAGE);
+      return EXIT_USAGE;
+    }
+    return 0;
+  }
+
   switch (cmd) {
-    case "broker":
-      return cmdBroker(args[0]);
-    case "peers":
-      return cmdPeers(args);
-    case "send":
-      return cmdSend(args);
-    case "tail":
-      return cmdTail();
-    case "doctor":
-      return cmdDoctor();
-    default:
-      process.stderr.write(
-        "usage: mesh broker start|stop|status | peers [--room R] | send <alias> <texte> [--room R] [--await] [--timeout MS] | tail | doctor\n",
+    case "sessions": {
+      const r = parseArgs(rest, SESSIONS_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(SESSIONS_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("sessions");
+        return 0;
+      }
+      if (r.parsed.positionals.length > 0) {
+        sayErr(`unexpected argument: ${r.parsed.positionals[0]}`);
+        return EXIT_USAGE;
+      }
+      return cmdSessions(r.parsed.flags.has("json"));
+    }
+    case "attach": {
+      const r = parseArgs(rest, ATTACH_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(ATTACH_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("attach");
+        return 0;
+      }
+      if (r.parsed.positionals.length > 1) {
+        sayErr(`unexpected argument: ${r.parsed.positionals[1]}`);
+        return EXIT_USAGE;
+      }
+      const alias = r.parsed.positionals[0];
+      if (alias !== undefined) {
+        const v = validateAlias(alias.replace(/^@/, "").toLowerCase());
+        if (!v.ok) {
+          sayErr(v.error);
+          return EXIT_USAGE;
+        }
+      }
+      const room = r.parsed.values.get("room");
+      if (room !== undefined) {
+        const v = validateRoom(room);
+        if (!v.ok) {
+          sayErr(v.error);
+          return EXIT_USAGE;
+        }
+      }
+      const session = r.parsed.values.get("session");
+      if (session !== undefined && alias !== undefined) {
+        sayErr("--session and a positional alias are mutually exclusive");
+        return EXIT_USAGE;
+      }
+      return cmdAttach({
+        alias: alias?.replace(/^@/, "").toLowerCase(),
+        sessionId: session,
+        room,
+        asJson: r.parsed.flags.has("json"),
+        noRead: r.parsed.flags.has("no-read"),
+      });
+    }
+    case "broker": {
+      if (rest[0] === "--help" || rest[0] === "-h") {
+        printCommandHelp("broker");
+        return 0;
+      }
+      return cmdBroker(rest[0]);
+    }
+    case "peers": {
+      const r = parseArgs(rest, PEERS_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("peers");
+        return 0;
+      }
+      // Phase 1 validation table: refuse loudly BEFORE any network touch.
+      const room = r.parsed.values.get("room");
+      if (room !== undefined) {
+        const v = validateRoom(room);
+        if (!v.ok) {
+          sayErr(v.error);
+          return EXIT_USAGE;
+        }
+      }
+      return cmdPeers(room);
+    }
+    case "status":
+    case "stale": {
+      const r = parseArgs(rest, PEERS_SPECS_STATUS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(STATUS_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("status");
+        return 0;
+      }
+      if (r.parsed.positionals.length > 1) {
+        sayErr(`unexpected argument: ${r.parsed.positionals[1]}`);
+        return EXIT_USAGE;
+      }
+      const room = r.parsed.positionals[0] ?? r.parsed.values.get("room");
+      if (room !== undefined) {
+        const v = validateRoom(room);
+        if (!v.ok) {
+          sayErr(v.error);
+          return EXIT_USAGE;
+        }
+      }
+      // `stale` is sugar for `status --reservations` (fusion, plan §2.2)
+      return cmdStatus({
+        room,
+        all: r.parsed.flags.has("all"),
+        reservations: cmd === "stale" || r.parsed.flags.has("reservations"),
+        json: r.parsed.flags.has("json"),
+      });
+    }
+    case "config": {
+      if (rest[0] === "show" || rest.length === 0) {
+        if (rest[0] === "--help" || rest[0] === "-h") {
+          printCommandHelp("config");
+          return 0;
+        }
+        if (rest.length > 1) {
+          sayErr(`unexpected argument: ${rest[1]}`);
+          return EXIT_USAGE;
+        }
+        return cmdConfigShow();
+      }
+      sayErr(`unknown config subcommand: ${rest[0]}`);
+      sayErr(CONFIG_USAGE);
+      return EXIT_USAGE;
+    }
+    case "ledger": {
+      const r = parseArgs(rest, LEDGER_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(LEDGER_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("ledger");
+        return 0;
+      }
+      if (r.parsed.positionals.length > 0) {
+        sayErr(`unexpected argument: ${r.parsed.positionals[0]}`);
+        return EXIT_USAGE;
+      }
+      const room = r.parsed.values.get("room");
+      if (room !== undefined) {
+        const v = validateRoom(room);
+        if (!v.ok) {
+          sayErr(v.error);
+          return EXIT_USAGE;
+        }
+      }
+      const limitRaw = r.parsed.values.get("limit");
+      let limit = CLI_LEDGER_DEFAULT_LIMIT;
+      if (limitRaw !== undefined) {
+        const n = Number(limitRaw);
+        if (!Number.isInteger(n) || n < 1 || n > CLI_LEDGER_MAX_LIMIT) {
+          sayErr(`invalid --limit "${limitRaw}" (1..${CLI_LEDGER_MAX_LIMIT})`);
+          return EXIT_USAGE;
+        }
+        limit = n;
+      }
+      const norm = (a: string | undefined): string | undefined =>
+        a !== undefined ? a.trim().replace(/^@/, "").toLowerCase() : undefined;
+      return cmdLedger(
+        { limit, from: norm(r.parsed.values.get("from")), to: norm(r.parsed.values.get("to")), room, event: r.parsed.values.get("event") },
+        r.parsed.flags.has("json"),
       );
-      return 2;
+    }
+    case "send": {
+      const r = parseArgs(rest, SEND_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(SEND_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("send");
+        return 0;
+      }
+      // `-` as the LAST positional = the message body comes from stdin
+      let positionals = r.parsed.positionals;
+      if (positionals.length > 0 && positionals[positionals.length - 1] === "-") {
+        const stdinBody = await readStdinBody();
+        positionals = [...positionals.slice(0, -1), stdinBody.trim()];
+      }
+      const parsed: { ok: true; args: SendArgs } | { ok: false; error: string } = parseSendArgs(positionals, {
+        room: r.parsed.values.get("room"),
+        priority: r.parsed.values.get("priority"),
+        reason: r.parsed.values.get("reason"),
+        refsCsv: r.parsed.values.get("refs"),
+        replyToCsv: r.parsed.values.get("reply-to"),
+        broadcast: r.parsed.flags.has("broadcast"),
+        awaitReply: r.parsed.flags.has("await"),
+        launch: r.parsed.flags.has("launch"),
+        timeoutMs: r.parsed.values.get("timeout"),
+        alias: r.parsed.values.get("alias"),
+        requireOnline: r.parsed.flags.has("require-online"),
+      });
+      if (!parsed.ok) {
+        sayErr(parsed.error);
+        return EXIT_USAGE;
+      }
+      // Phase 1 validation table: room refused BEFORE connecting (alias,
+      // priority, refs… are validated inside cmdSend — same contract).
+      if (parsed.args.room !== undefined) {
+        const roomV = validateRoom(parsed.args.room);
+        if (!roomV.ok) {
+          sayErr(roomV.error);
+          return EXIT_USAGE;
+        }
+      }
+      return cmdSend(parsed.args);
+    }
+    case "join": {
+      const r = parseArgs(rest, JOIN_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("join");
+        return 0;
+      }
+      const room = r.parsed.positionals[0];
+      // strictness: exactly <room> [observer] — extra positionals are typos
+      const extra = r.parsed.positionals.slice(1).filter((p) => p !== "observer");
+      if (extra.length > 0) {
+        sayErr(`unexpected argument: ${extra[0]}`);
+        return EXIT_USAGE;
+      }
+      if (room !== undefined) {
+        const v = validateRoom(room);
+        if (!v.ok) {
+          sayErr(v.error);
+          return EXIT_USAGE;
+        }
+      }
+      const observer = r.parsed.flags.has("observer") || r.parsed.positionals.includes("observer");
+      return cmdRoom(room, "join", observer);
+    }
+    case "leave": {
+      const r = parseArgs(rest, LEAVE_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("leave");
+        return 0;
+      }
+      const room = r.parsed.positionals[0];
+      if (r.parsed.positionals.length > 1) {
+        sayErr(`unexpected argument: ${r.parsed.positionals[1]}`);
+        return EXIT_USAGE;
+      }
+      if (room !== undefined) {
+        const v = validateRoom(room);
+        if (!v.ok) {
+          sayErr(v.error);
+          return EXIT_USAGE;
+        }
+      }
+      return cmdRoom(room, "leave", false);
+    }
+    case "reply": {
+      const r = parseArgs(rest, REPLY_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(REPLY_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("reply");
+        return 0;
+      }
+      const [msgId, ...textParts] = r.parsed.positionals;
+      const text = textParts.join(" ");
+      if (msgId === undefined || text === "") {
+        sayErr(REPLY_USAGE);
+        return EXIT_USAGE;
+      }
+      // mirror of the send path: room refused BEFORE any network touch
+      const replyRoom = r.parsed.values.get("room");
+      if (replyRoom !== undefined) {
+        const v = validateRoom(replyRoom);
+        if (!v.ok) {
+          sayErr(v.error);
+          return EXIT_USAGE;
+        }
+      }
+      return cmdReply({
+        msgId,
+        text,
+        to: r.parsed.values.get("to"),
+        room: replyRoom,
+        refsCsv: r.parsed.values.get("refs"),
+        replyAll: r.parsed.flags.has("reply-all"),
+      });
+    }
+    case "ping": {
+      const r = parseArgs(rest, PING_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(PING_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("ping");
+        return 0;
+      }
+      const alias = r.parsed.positionals[0];
+      if (alias === undefined || r.parsed.positionals.length > 1) {
+        sayErr(PING_USAGE);
+        return EXIT_USAGE;
+      }
+      return cmdPing(alias, r.parsed.values.get("timeout"));
+    }
+    case "wait": {
+      const r = parseArgs(rest, WAIT_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(WAIT_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("wait");
+        return 0;
+      }
+      if (r.parsed.positionals.length > 0) {
+        sayErr(`unexpected argument: ${r.parsed.positionals[0]}`);
+        return EXIT_USAGE;
+      }
+      return cmdWait(r.parsed.values.get("timeout"));
+    }
+    case "reserve": {
+      const r = parseArgs(rest, RESERVE_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(RESERVE_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("reserve");
+        return 0;
+      }
+      const holdRaw = r.parsed.values.get("hold");
+      let holdMs: number | undefined;
+      if (holdRaw !== undefined) {
+        const n = Number(holdRaw);
+        holdMs = Number.isFinite(n) ? Math.round(n) : Number.NaN;
+      }
+      return cmdReserve({ paths: r.parsed.positionals, reason: r.parsed.values.get("reason"), holdMs });
+    }
+    case "release": {
+      const r = parseArgs(rest, RELEASE_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(RELEASE_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("release");
+        return 0;
+      }
+      return cmdRelease(r.parsed.positionals, r.parsed.flags.has("all"));
+    }
+    case "watch": {
+      const r = parseArgs(rest, WATCH_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(WATCH_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("watch");
+        return 0;
+      }
+      if (r.parsed.positionals.length > 1) {
+        sayErr(`unexpected argument: ${r.parsed.positionals[1]}`);
+        return EXIT_USAGE;
+      }
+      const room = r.parsed.positionals[0];
+      if (room !== undefined) {
+        const v = validateRoom(room);
+        if (!v.ok) {
+          sayErr(v.error);
+          return EXIT_USAGE;
+        }
+      }
+      const alias = r.parsed.values.get("alias");
+      if (alias !== undefined) {
+        const v = validateAlias(alias.replace(/^@/, "").toLowerCase());
+        if (!v.ok) {
+          sayErr(v.error);
+          return EXIT_USAGE;
+        }
+      }
+      return cmdWatch({ room, alias: alias?.replace(/^@/, "").toLowerCase(), asJson: r.parsed.flags.has("json") });
+    }
+    case "tail": {
+      const r = parseArgs(rest, TAIL_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        sayErr(TAILF_USAGE);
+        return EXIT_USAGE;
+      }
+      if (r.help) {
+        printCommandHelp("tail");
+        return 0;
+      }
+      if (r.parsed.positionals.length > 0) {
+        sayErr(`unexpected argument: ${r.parsed.positionals[0]}`);
+        return EXIT_USAGE;
+      }
+      if (r.parsed.flags.has("follow")) {
+        return cmdTailFollow(r.parsed.values.get("limit"));
+      }
+      return cmdTail(r.parsed.values.get("limit"));
+    }
+    case "doctor": {
+      // no options: --help helps, anything else is a usage error (never a
+      // silently-ignored argument).
+      if (rest[0] === "--help" || rest[0] === "-h") {
+        printCommandHelp("doctor");
+        return 0;
+      }
+      if (rest.length > 0) {
+        sayErr(`unexpected argument: ${rest[0]} (mesh doctor takes no options)`);
+        return EXIT_USAGE;
+      }
+      return cmdDoctor();
+    }
+    default:
+      sayErr(`unknown command: ${cmd}`);
+      sayErr(GENERAL_USAGE);
+      return EXIT_USAGE;
   }
 }
 
-main(process.argv.slice(2))
+/** One-shot processes must not die on unref'd client timers (reconnect/
+ * retry sleeps are unref'd by design for long-lived sessions): keep the
+ * event loop alive until the command completes, then let process.exit run. */
+function withKeepAlive<T>(p: Promise<T>): Promise<T> {
+  const iv = setInterval(() => {}, 1_000);
+  return p.finally(() => clearInterval(iv));
+}
+
+withKeepAlive(main(process.argv.slice(2)))
   .then((code) => process.exit(code))
   .catch((err: unknown) => {
     process.stderr.write(`mesh cli fatal: ${String(err)}\n`);
