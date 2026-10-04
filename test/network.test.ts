@@ -7,6 +7,7 @@ import { MeshClient } from "../src/client/client.js";
 import { createBroker } from "../src/broker/broker.js";
 import { DEFAULT_POLICY } from "../src/broker/policy.js";
 import { DEFAULT_CONFIG, parseEndpoint } from "../src/shared/config.js";
+import { socketPathForDir } from "../src/shared/paths.js";
 import { makeTempDirs, type TempDirs } from "./helpers.js";
 
 async function tcpBroker(token: string): Promise<{
@@ -104,7 +105,9 @@ async function dualBroker(token: string): Promise<{
   dirs: TempDirs;
 }> {
   const dirs = makeTempDirs("mesh-dual-");
-  const socketPath = path.join(dirs.runtimeDir, "broker.sock");
+  // socketPathForDir: named pipe on Windows (AF_UNIX is unavailable there —
+  // a raw broker.sock path fails with EACCES), broker.sock on POSIX.
+  const socketPath = socketPathForDir(dirs.runtimeDir);
   const broker = await createBroker({
     config: { ...DEFAULT_CONFIG, brokerToken: token },
     policy: DEFAULT_POLICY,
@@ -124,7 +127,10 @@ describe("dual listen: unix (tokenless) + tcp (token) — D38", () => {
     const remote = netClient("remote-agent", port, "lan-token");
     try {
       assert.ok(port > 0, "tcp port assigned");
-      assert.match(broker.socketPath, /broker\.sock/, "both endpoints reported");
+      assert.ok(
+        broker.socketPath.includes(socketPathForDir(dirs.runtimeDir)),
+        `both endpoints reported: ${broker.socketPath}`,
+      );
       await local.connect(); // unix — NO token configured, must pass
       await remote.connect(); // tcp — token, must pass
       const got = new Promise<{ body?: string }>((resolve) => {
