@@ -2,6 +2,7 @@ name: CI
 
 # Runs the full suite (build + tests + smoke) on every push to main and on
 # pull requests — same as the other pi packages (pi-voice-stt, …).
+# Matrix: ubuntu + windows (Windows is first-class — named pipes broker).
 on:
   push:
     branches: [main]
@@ -9,7 +10,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -18,3 +23,24 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run ci
+
+  # Packaging gate: the `pimesh` bin must survive npm pack + a clean install
+  # (a broken bin/files glob would only surface at publish time otherwise).
+  cli-pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run build
+      - name: pack + install + bin smoke
+        run: |
+          npm pack
+          INSTALL=$(mktemp -d)
+          cd "$INSTALL"
+          npm init -y > /dev/null
+          npm install "$GITHUB_WORKSPACE"/*.tgz
+          ./node_modules/.bin/pimesh --help
+          ./node_modules/.bin/pimesh doctor || true

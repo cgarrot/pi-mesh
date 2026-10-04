@@ -165,17 +165,77 @@ Reminders arrive with an explicit "reply due for msgId" instruction.
 **Read receipts** — when a message is injected into a session, the client
 sends a `read` frame back to the sender; `mesh_status` shows
 `reads: m_xxx → @agent-2 at 10:22`. This completes the honest-status
-promise: `delivered ≠ read ≠ answered`.
+promise: `delivered ≠ read ≠ answered`. Since the standalone CLI peer
+(`pimesh attach`), `read` also covers the terminal: an interactive TTY render
+is the same "reached the recipient's attention surface" as a session
+injection — pipes/`--json` never read. Read frames are online-only and
+silent (never acked, never mailboxed): a read toward an offline sender is
+lost without error.
 
-## CLI (debug/admin)
+## CLI (`pimesh`)
 
-```bash
-node dist/src/cli/mesh.js broker start|stop|status
-node dist/src/cli/mesh.js peers [--room R]     # with per-peer versions
-node dist/src/cli/mesh.js send <alias> "text" [--room R] [--await] [--timeout MS]
-node dist/src/cli/mesh.js tail                 # follows the local hash-only ledger
-node dist/src/cli/mesh.js doctor               # socket? lock stale? pid? protocol?
+Installed as the `pimesh` bin with the package (`npm i -g pi-mesh-extension`),
+runnable without a global install via `npx pi-mesh-extension …` (single bin).
+When the package is installed through `pi install`, use `npx` or the
+`node dist/src/cli/mesh.js` path from the package directory (pi installs do
+not put npm bins on PATH). The CLI honors `.mesh/config.json` + env
+(`MESH_BROKER_URL`/`MESH_BROKER_TOKEN`…) exactly like extension clients —
+remote machines can debug with `pimesh doctor`.
+
 ```
+pimesh broker start|stop|status          # local broker lifecycle (detached, lockfile)
+pimesh peers [--room R]                  # compact snapshot (legacy format)
+pimesh status [room] [--all] [--reservations] [--json]
+                                         # ●/○/✕/⛔ activity, via= origins, versions,
+                                         # reservations + TTL state (stale = alias)
+pimesh send [alias] <text…>              # full SendOpts: --priority --reason --refs
+                                         #   --reply-to --broadcast --await --launch
+                                         #   --timeout --alias --require-online
+                                         #   trailing `-` reads the body from stdin
+pimesh reply <msgId> <text…> (--to A | --reply-all) --room R [--refs A,B]
+pimesh ping <alias> [--timeout MS]       # expired (exit 3) ≠ peer down
+pimesh wait [--timeout MS]               # honest one-shot limit: missions live in
+                                         #   the launching process
+pimesh join <room> [observer]            # debug-only: membership dies with the process
+pimesh leave <room>
+pimesh reserve <path>… [--reason R] [--hold MS]
+                                         # dry-run conflicts by default (exit 4);
+                                         #   --hold keeps the claim alive (Ctrl-C releases)
+pimesh release [<pattern>…] [--all]      # honest no-op one-shot (claims are
+                                         #   connection-scoped)
+pimesh ledger [--limit N] [--from --to --room --event] [--json]
+                                         # local hash-only ledger + rotations
+pimesh tail [-f] [--limit N]             # last N lines, or follow (rotation-safe)
+pimesh sessions [--json]                 # persisted identities (adoption targets,
+                                         #   current stateDir scope only)
+pimesh attach [alias] [--session ID] [--room R] [--json] [--no-read]
+                                         # STANDALONE PEER: a full mesh member with
+                                         #   no session — REPL or NDJSON script pipe
+pimesh config show                       # resolved config (token masked)
+pimesh doctor                            # endpoint/lock/config/version diagnostics
+```
+
+**Exit codes** — `0` success · `1` mesh failure (`blocked`/`error`) · `2`
+usage · `3` `expired`/timeout (a late reply is still delivered) · `4` honest
+partial (`queued_offline`, broadcast `N/M`, conflicts, wait timeout with
+answers).
+
+**Standalone peer (`attach`)** — use or create a mesh without a Pi session:
+receive messages WITH bodies (you are the recipient), send/reply/reserve
+from a REPL (`/help` inside) or a scriptable NDJSON pipe (`--json`: stdout
+events / stdin commands with correlated `ref`). `attach <alias>` **adopts a
+dead session's identity** — rooms, fresh reservations (since refreshed) and
+its queued mailbox; if the original session returns it gets a fresh alias
+(a documented steal). Read receipts are emitted ONLY in interactive TTY
+mode at render time (`--no-read` opts out; `--json`/pipes never read).
+No activity announcements: peers see the idle heuristic.
+
+**Observer (`watch`)** — `pimesh watch [room]` joins as an observer and
+streams frames live; bodies are NEVER shown, only `bodyHash` (text and
+`--json` alike — safe to `| tee`).
+
+The one-shot CLI is not a session: apart from interactive `attach`, it
+never emits read receipts.
 
 ## Configuration
 

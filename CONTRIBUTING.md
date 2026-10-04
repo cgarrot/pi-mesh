@@ -26,6 +26,24 @@ README first, then these guidelines.
 - **Never persist message bodies** outside the opt-in transcript. The
   ledger stays hash-only; the forbidden-key scan is fail-closed.
 
+## CLI rules (`pimesh`)
+
+- **Zero runtime dependencies** — the CLI ships the same homemade arg
+  parser and ANSI helpers as the rest of the package (no commander/chalk).
+- **Honest exit codes** (README): 0/1/2/3/4 — never inflate a status.
+- **Never print a body you were not addressed**: `watch` shows `bodyHash`
+  only; `attach` (a recipient) may show bodies; `send --json` never echoes
+  the body it sent.
+- **No read receipts from one-shot commands** — only interactive `attach`
+  on a TTY reads, at render time.
+- **The CLI never writes identity files** (`sessions` is read-only;
+  adoption only READS a dead session's identity).
+- **Token never in argv** (env/config only; `config show` masks it).
+- **An explicit `--alias` is strict** — a collision exits 1
+  (`blocked:alias_taken`), never a silent fallback identity.
+- **Every bound is a named constant** — CLI_* constants live in
+  `src/shared/config.ts` like every other bound.
+
 ## Development loop
 
 ```bash
@@ -42,9 +60,20 @@ npm run smoke       # E2E without Pi (broker + 2 headless clients)
 
 ## Releasing
 
-Maintainers only: `npm version patch && git push && git push --tags`.
+Maintainers only:
+
+```
+npm version patch          # bumps package.json + creates the v* commit
+npm run build              # REGENERATES src/shared/version.ts (generated file)
+git add src/shared/version.ts && git commit --amend --no-edit
+git push && git push --tags
+```
+
 The `Release` GitHub Action runs the full suite and publishes
 `pi-mesh-extension` to npm (requires the `NPM_TOKEN` secret).
+The build step is NOT optional: `npm version` alone would leave the
+committed (generated) `version.ts` one version behind, and the tagged tree
+would fail `version-sync.test.ts`.
 
 ## Reporting issues
 
