@@ -74,6 +74,13 @@ export interface MeshFrame {
   reads?: string;
   /** shared auth token hash (hello only) — required on tcp/tls brokers. */
   token?: string;
+  /** msg: sender demands the recipient's running tool be interrupted
+  *  (abort the stuck turn) so the message lands with priority. Requires
+  *  priority=force + reason at SEND time (reason travels hashed only). */
+  interrupt?: boolean;
+  /** reply: machine receipt (e.g. interrupt outcome) — rendered INFO ONLY,
+  *  followUp without triggerTurn: it must never wake or cascade. */
+  receipt?: boolean;
   /** M1: extension version of the sender (hello) — shown in status snapshots
   *  so stale sessions are visible at a glance. */
   clientVersion?: string;
@@ -237,6 +244,8 @@ export interface BuildFrameOpts {
   totalCount?: number;
   reads?: string;
   token?: string;
+  interrupt?: boolean;
+  receipt?: boolean;
   /** M1: extension version (hello). */
   clientVersion?: string;
   /** M2: broker counters (status_res). */
@@ -279,6 +288,8 @@ export function buildFrame(opts: BuildFrameOpts): MeshFrame {
   if (opts.totalCount !== undefined) frame.totalCount = opts.totalCount;
   if (opts.reads !== undefined) frame.reads = opts.reads;
   if (opts.token !== undefined) frame.token = opts.token;
+  if (opts.interrupt !== undefined) frame.interrupt = opts.interrupt;
+  if (opts.receipt !== undefined) frame.receipt = opts.receipt;
   if (opts.clientVersion !== undefined) frame.clientVersion = opts.clientVersion;
   if (opts.stats !== undefined) frame.stats = { ...opts.stats };
   return frame;
@@ -372,6 +383,13 @@ export function validateFrame(value: unknown, opts: ValidateOpts = {}): Validati
     if (typeof value.reasonHash !== "string" || !SHA256_HEX_REGEX.test(value.reasonHash)) {
       return { ok: false, code: "force_requires_reason", detail: "force without reasonHash" };
     }
+  }
+
+  // interrupt is a force MODIFIER, never a standalone escalation: an
+  // interrupt frame without force would bypass the force policy/reason
+  // guarantees (downgraded frames are stripped by the broker anyway).
+  if (value.interrupt === true && value.priority !== "force") {
+    return { ok: false, code: "invalid_frame", detail: "interrupt requires priority=force" };
   } else if (value.reasonHash !== undefined) {
     if (typeof value.reasonHash !== "string" || !SHA256_HEX_REGEX.test(value.reasonHash)) {
       return { ok: false, code: "invalid_frame", detail: "bad reasonHash" };

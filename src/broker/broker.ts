@@ -446,7 +446,11 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
       return;
     }
     if (decision.action === "downgrade") {
-      routedFrame = { ...frame, priority: "urgent" };
+      // D6: a downgraded force becomes urgent — keeping the interrupt flag
+      // would either lie (dropped after ack at the recipient's validation)
+      // or bypass the escalation policy (urgent+interrupt honored). Strip it;
+      // the force_downgraded ack already tells the sender the truth.
+      routedFrame = { ...frame, priority: "urgent", interrupt: undefined };
       interruptStatus = "force_downgraded";
     } else if (priority === "force") {
       interruptStatus = "force_accepted";

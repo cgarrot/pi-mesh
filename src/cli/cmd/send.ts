@@ -22,6 +22,7 @@ export interface SendArgs {
   room?: string;
   priority: string | undefined;
   reason: string | undefined;
+  interrupt: boolean;
   refsCsv: string | undefined;
   replyToCsv: string | undefined;
   broadcast: boolean;
@@ -126,6 +127,9 @@ export async function cmdSend(args: SendArgs): Promise<number> {
   if (args.priority === "force" && (args.reason === undefined || args.reason === "")) {
     return fail({ ok: false, error: "--priority force requires --reason (hashed, never persisted)" });
   }
+  if (args.interrupt && (args.priority !== "force" || args.reason === undefined || args.reason === "")) {
+    return fail({ ok: false, error: "--interrupt requires --priority force and --reason (last-resort unblocking lever)" });
+  }
   if (args.refsCsv !== undefined) {
     const v = validateRefsCsv(args.refsCsv);
     if (!v.ok) return fail(v);
@@ -172,6 +176,7 @@ export async function cmdSend(args: SendArgs): Promise<number> {
     room: args.room,
     priority: args.priority as MeshPriority | undefined,
     reason: args.reason,
+    interrupt: args.interrupt || undefined,
     refs: args.refsCsv !== undefined ? csvParts(args.refsCsv) : undefined,
     replyTo: args.replyToCsv !== undefined ? csvParts(args.replyToCsv) : undefined,
     broadcast: args.broadcast || undefined,

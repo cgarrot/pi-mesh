@@ -3,7 +3,7 @@
 // remind frames re-inject as reminder text. presence frames NEVER inject a turn
 // (they are handled via pi.appendEntry in index.ts).
 import type { MeshFrame, MeshPriority } from "../protocol/envelope.js";
-import { INJECTION_RETRY_MS } from "../shared/config.js";
+import { INJECTION_RETRY_MS, INTERRUPT_IDLE_MAX_MS, INTERRUPT_REABORT_AFTER_MS, INTERRUPT_REABORT_MAX } from "../shared/config.js";
 import type {
   DeliverAs,
   ExtensionAPI,
@@ -15,6 +15,24 @@ export interface InjectedInbound {
   message: InboundMessage;
   deliverAs: DeliverAs;
   aborted: boolean;
+}
+
+/** Honest outcome of an interrupt handling — feeds the receipt wording.
+ *  NEVER claims a killed process (not observable from the extension). */
+export type InterruptOutcome = "aborted" | "already_idle" | "still_busy" | "abort_unavailable";
+
+export interface InterruptReport {
+  outcome: InterruptOutcome;
+  aborts: number;
+  settledMs: number;
+}
+
+export interface InjectOpts extends FormatOpts {
+  replyChain?: boolean;
+  /** Called once the interrupt handling concludes (delivery done). */
+  onInterruptReport?: (report: InterruptReport) => void;
+  /** Timing overrides (tests) — defaults come from the named constants. */
+  interruptTimings?: { pollMs?: number; maxMs?: number; reabortAfterMs?: number; reabortMax?: number };
 }
 
 /** Options for the inbound content format.
@@ -221,21 +239,38 @@ export function deliverWhenIdle(
  * Inject one inbound msg/mailbox/remind frame into the Pi session.
  * force: controlled abort ONLY when the host exposes abort AND reports busy
  * (ctx.isIdle === false), then deliver once idle. Never throws.
+ * force+interrupt: the dedicated repeater path (deliverInterrupted).
  */
 export function injectInbound(
   pi: Pick<ExtensionAPI, "sendMessage">,
   ctx: SessionContext | null,
   frame: MeshFrame,
-  opts: FormatOpts = {},
+  opts: InjectOpts = {},
 ): InjectedInbound {
   const priority: MeshPriority = frame.priority ?? "normal";
+  if (
+    frame.type === "msg" &&
+    frame.interrupt === true &&
+    priority === "force"
+  ) {
+    return deliverInterrupted(pi, ctx, frame, opts);
+  }
   // a reply-à-reply is INFO ONLY — followUp (no interruption) and the
   // labelled content lets the LLM decide whether to react.
-  const deliverAs = frame.type === "reply" && opts.replyChain === true
+  // a machine receipt (interrupt outcome) is META: followUp WITHOUT a
+  // triggered turn — it informs, it never wakes the sender nor cascades.
+  const isReceipt = frame.type === "reply" && frame.receipt === true;
+  const deliverAs = isReceipt
     ? "followUp"
-    : frame.type === "remind"
+    : frame.type === "reply" && opts.replyChain === true
       ? "followUp"
-      : mapReplyDelivery(frame);
+      : frame.type === "remind"
+        ? "followUp"
+        : mapReplyDelivery(frame);
+  if (isReceipt) {
+    pi.sendMessage(buildInboundMessage(frame, opts), { triggerTurn: false, deliverAs: "followUp" });
+    return { message: buildInboundMessage(frame, opts), deliverAs, aborted: false };
+  }
   let aborted = false;
   if (
     priority === "force" &&
@@ -362,4 +397,106 @@ export function handleInboundFrame(
       deps.counters.ledgerFailures += 1;
     }
   }
+}
+
+/**
+ * force+interrupt delivery (plan INTERRUPT-PLAN D2): abort the recipient's
+ * blocked turn — the host abort kills the running tool's process tree —
+ * with BOUNDED retries (an abort can be swallowed by an end-of-turn race),
+ * then inject the message as a prioritized steer. The report is honest:
+ * "aborted" | "already_idle" | "still_busy" | "abort_unavailable" — never
+ * a claim about killed processes (not observable here).
+ */
+function deliverInterrupted(
+  pi: Pick<ExtensionAPI, "sendMessage">,
+  ctx: SessionContext | null,
+  frame: MeshFrame,
+  opts: InjectOpts,
+): InjectedInbound {
+  const message = buildInboundMessage(frame, opts);
+  const report = (outcome: InterruptOutcome, aborts: number, settledMs: number): void => {
+    try {
+      opts.onInterruptReport?.({ outcome, aborts, settledMs });
+    } catch {
+      // reporting is best-effort — delivery already happened
+    }
+  };
+  const deliver = (): void => {
+    pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+  };
+
+  // "Never throws" holds for the ASYNC path too: aborts and deliveries run
+  // inside timer callbacks the caller's guarded() can never catch — a host
+  // tearing down mid-poll must degrade to the next tick, not crash pi.
+  const safeAbort = (): boolean => {
+    try {
+      c.abort();
+      return true;
+    } catch {
+      return false; // stale host — keep polling, the deadline bounds us
+    }
+  };
+  const safeDeliver = (): void => {
+    try {
+      deliver();
+    } catch {
+      // stale ctx — nothing more we can do; the report still fires
+    }
+  };
+  const canAbort = ctx !== null && typeof ctx.abort === "function" && typeof ctx.isIdle === "function";
+  if (!canAbort) {
+    // No abort surface on this host (mode-dependent): the message still
+    // goes out as a steer, queued behind whatever is running — said as is.
+    safeDeliver();
+    report("abort_unavailable", 0, 0);
+    return { message, deliverAs: "steer", aborted: false };
+  }
+  const c = ctx as SessionContext & { abort(): void; isIdle(): boolean };
+
+  // first abort — guarded by a fresh !isIdle check (tiny settle race)
+  let aborts = 0;
+  if (c.isIdle()) {
+    safeDeliver();
+    report("already_idle", 0, 0);
+    return { message, deliverAs: "steer", aborted: false };
+  }
+  if (safeAbort()) aborts += 1;
+
+  // bounded re-aborts (swallowed aborts happen at end-of-turn races)
+  const timings = opts.interruptTimings ?? {};
+  const pollMs = timings.pollMs ?? FORCE_IDLE_POLL_MS;
+  const maxMs = timings.maxMs ?? INTERRUPT_IDLE_MAX_MS;
+  const reabortAfterMs = timings.reabortAfterMs ?? INTERRUPT_REABORT_AFTER_MS;
+  const reabortMax = timings.reabortMax ?? INTERRUPT_REABORT_MAX;
+  const reabortTimers: NodeJS.Timeout[] = [];
+  for (let i = 1; i <= reabortMax; i += 1) {
+    const t = setTimeout(() => {
+      if (!c.isIdle()) {
+        if (safeAbort()) aborts += 1;
+      }
+    }, reabortAfterMs * i);
+    t.unref();
+    reabortTimers.push(t);
+  }
+
+  const start = Date.now();
+  let finished = false;
+  const finish = (): void => {
+    if (finished) return;
+    finished = true;
+    clearInterval(poll);
+    clearTimeout(cap);
+    for (const t of reabortTimers) clearTimeout(t);
+    safeDeliver();
+    report(c.isIdle() ? "aborted" : "still_busy", aborts, Date.now() - start);
+  };
+  const poll = setInterval(() => {
+    if (c.isIdle() || Date.now() - start >= maxMs) finish();
+  }, pollMs);
+  poll.unref();
+  // safety cap: never run past the deadline even if isIdle keeps flipping
+  const cap = setTimeout(finish, maxMs + pollMs);
+  cap.unref();
+
+  return { message, deliverAs: "steer", aborted: true };
 }

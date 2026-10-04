@@ -87,6 +87,15 @@ export const CLI_RESERVE_SETTLE_MS = 250;
 /** Mailbox flush above this count prints a read-receipt noise warning at
  * attach (each flushed message renders = one read frame to its sender). */
 export const ATTACH_BULK_READ_THRESHOLD = 20;
+/** interrupt (force modifier): how long to wait for the aborted run to
+ * settle before falling back to a queued steer — a process-tree SIGKILL is
+ * fast, the HOST settle is what can lag. */
+export const INTERRUPT_IDLE_MAX_MS = 10_000;
+/** interrupt: re-abort when still busy after this long (an abort can be
+ * swallowed by an end-of-turn race) — bounded retries, never a storm. */
+export const INTERRUPT_REABORT_AFTER_MS = 1_500;
+/** interrupt: max ADDITIONAL aborts after the first one. */
+export const INTERRUPT_REABORT_MAX = 2;
 /** Prefix for fresh standalone aliases (`mesh attach` without --alias). */
 export const STANDALONE_ALIAS_PREFIX = "standalone";
 /** max backlog lines `mesh tail -f` replays at startup. */
@@ -179,6 +188,9 @@ export interface MeshConfig {
   watchdog?: boolean;
   watchdogSpikeBytes?: number;
   watchdogMaxCalls?: number;
+  /** interrupt receipts: answer force+interrupt senders with the honest
+  *  outcome (aborted / still busy). Default true; opt-out for quiet meshes. */
+  interruptReceipts?: boolean;
   watchdogCompactionBytes?: number;
   /** "compact" (default): minimal inbound prefix + reply hints on first
   *  sight only. "full": legacy verbose format (rollback switch). */
@@ -228,6 +240,7 @@ export const DEFAULT_CONFIG: MeshConfig = {
   watchdogSpikeBytes: DEFAULT_WATCHDOG_SPIKE_BYTES,
   watchdogMaxCalls: DEFAULT_WATCHDOG_MAX_CALLS,
   watchdogCompactionBytes: DEFAULT_WATCHDOG_COMPACTION_BYTES,
+  interruptReceipts: true,
   contextVerbosity: "compact",
   inboundBroadcasts: "immediate",
   inboundBatchMs: DEFAULT_INBOUND_BATCH_MS,
@@ -365,6 +378,7 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
   // MESH_RESERVATION_TTL_MS=0 = explicit opt-out (unlimited)
   if (env.MESH_RESERVATION_TTL_MS === "0") cfg.reservationTtlMs = 0;
   if (env.MESH_WATCHDOG === "0" || env.MESH_WATCHDOG === "false") cfg.watchdog = false;
+  if (env.MESH_INTERRUPT_RECEIPTS === "0" || env.MESH_INTERRUPT_RECEIPTS === "false") cfg.interruptReceipts = false;
   if (env.MESH_CONTEXT_VERBOSE === "1" || env.MESH_CONTEXT_VERBOSE === "true") cfg.contextVerbosity = "full";
   if (env.MESH_INBOUND_BROADCASTS === "immediate" || env.MESH_INBOUND_BROADCASTS === "deferred") {
     cfg.inboundBroadcasts = env.MESH_INBOUND_BROADCASTS;

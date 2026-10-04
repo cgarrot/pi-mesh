@@ -89,6 +89,7 @@ const HELP: Record<string, CommandHelp> = {
       { name: "room", kind: "value", short: "R", meta: "ROOM", help: "target room" },
       { name: "priority", kind: "value", meta: "P", help: "normal|urgent|force" },
       { name: "reason", kind: "value", meta: "R", help: "required for force (hashed, never persisted)" },
+      { name: "interrupt", kind: "flag", help: "with force: abort the recipient's blocked turn (last resort)" },
       { name: "refs", kind: "value", meta: "A,B", help: "repo-relative refs (max 8)" },
       { name: "reply-to", kind: "value", meta: "A,B", help: "who receives the reply instead of you" },
       { name: "broadcast", kind: "flag", help: "fan out to the whole room (no alias)" },

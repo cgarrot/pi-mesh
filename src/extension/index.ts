@@ -139,6 +139,8 @@ export default function meshExtension(pi: ExtensionAPI): void {
       transcriptFailures: 0,
       injectionFailures: 0,
       appendEntry: (type, data) => pi.appendEntry(type, data),
+      interruptReceipts: config.interruptReceipts !== false,
+      interruptCount: 0,
     };
     const rt = runtime;
 

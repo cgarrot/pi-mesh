@@ -61,6 +61,12 @@ export interface MeshRuntime {
   /** Called by the context watchdog when a compaction is detected —
   *  lets attach.ts resync the mesh context block (conventions lost). */
   onCompactionDetected?: () => void;
+  /** interrupt receipts on/off (config interruptReceipts). */
+  interruptReceipts?: boolean;
+  /** MEMORY-ONLY interrupt stats for mesh_status (never persisted). */
+  interruptCount?: number;
+  lastInterruptAt?: string;
+  lastInterruptOutcome?: string;
   startedAt: number;
   /** inbound-path disk/injection failure counters (see index.ts). */
   ledgerFailures: number;
@@ -203,6 +209,14 @@ const MESH_SEND_PARAMETERS: Record<string, unknown> = {
       enum: ["normal", "urgent", "force"],
       description: "normal→followUp, urgent→steer, force→abort+steer (requires reason).",
     },
+    interrupt: {
+      type: "boolean",
+      description:
+        "With priority=force: abort the recipient's BLOCKED turn (kills its running " +
+        "tool) so this message lands with priority. LAST RESORT for a stuck " +
+        "agent — requires force + reason; the recipient answers with an honest " +
+        "receipt (aborted / still busy) and is notified locally.",
+    },
     reason: {
       type: "string",
       description: "Required when priority=force. Hashed (reasonHash), never persisted.",
@@ -274,6 +288,7 @@ async function execMeshSend(
     (rt.client.rooms.includes(DEFAULT_ROOM) ? DEFAULT_ROOM : rt.client.rooms[0] ?? DEFAULT_ROOM);
   const priority = (str(params.priority) ?? "normal") as MeshPriority;
   const reason = str(params.reason);
+  const interrupt = params.interrupt === true;
   const awaitReply = params.awaitReply === true;
   const block = params.block === false ? false : true;
   const launch = awaitReply && !block; // track + return immediately
@@ -351,7 +366,7 @@ async function execMeshSend(
 
   const res = await rt.client.send({
     to: broadcast ? undefined : to,
-    message, room, priority, reason, awaitReply, block, timeoutMs, refs, broadcast, replyTo,
+    message, room, priority, reason, interrupt, awaitReply, block, timeoutMs, refs, broadcast, replyTo,
     signal: !launch && signal !== undefined ? signal : undefined,
   });
 
@@ -604,6 +619,12 @@ async function execMeshStatus(
   if (summary.total > 0) {
     lines.push(
       `summary: ${summary.working} working · ${summary.idle} idle · ${summary.stuck} stuck · ${summary.rateLimited} rate-limited · ${summary.blocked} blocked · ${summary.likelyDone} likely done`,
+    );
+  }
+  // interrupts handled by THIS session (memory only — never persisted)
+  if ((rt.interruptCount ?? 0) > 0) {
+    lines.push(
+      `interrupts handled: ${rt.interruptCount ?? 0}${rt.lastInterruptOutcome !== undefined ? ` · last: ${rt.lastInterruptOutcome} at ${rt.lastInterruptAt ?? "?"}` : ""}`,
     );
   }
   // M2: broker counters — relayed/refused/mailbox at a glance

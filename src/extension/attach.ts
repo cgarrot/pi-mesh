@@ -8,7 +8,7 @@ import { buildBatchMessage, bypassesBatch, batchDetails, InboundBatcher } from "
 import { DeferredInbox } from "./deferred-inbox.js";
 import { classifyInbound } from "./inbound-policy.js";
 import type { MeshHud } from "./hud.js";
-import { handleInboundSideEffects, injectInbound, type FormatOpts } from "./inbound.js";
+import { handleInboundSideEffects, injectInbound, type FormatOpts, type InjectOpts } from "./inbound.js";
 import { ReplyHintTracker } from "./reply-hints.js";
 import type { ExtensionAPI, InboundMessage, SessionContext } from "./pi-types.js";
 import type { MeshRuntime } from "./tools.js";
@@ -210,11 +210,37 @@ export function attachClientListeners(
     };
     if (bypassesBatch(frame) || client.inboundBatchMs <= 0) {
       batcher.flushNow(); // deliver any pending batch first (ordering)
+      const injectOpts: InjectOpts = {
+        ...opts,
+        replyChain: (frame as unknown as { __replyChain?: boolean }).__replyChain === true,
+      };
+      // force+interrupt: wire the honest report (receipt + local notify +
+      // memory-only counters) before injection runs its repeater path
+      if (frame.interrupt === true) {
+        injectOpts.onInterruptReport = (report) => {
+          rt.interruptCount = (rt.interruptCount ?? 0) + 1;
+          rt.lastInterruptAt = new Date().toISOString();
+          rt.lastInterruptOutcome = report.outcome;
+          guarded(() => {
+            ctx.ui.notify(`⚠ turn interrupted by force from @${frame.from ?? "?"}`);
+          });
+          if (rt.interruptReceipts !== false && frame.id !== undefined) {
+            const wording =
+              report.outcome === "aborted"
+                ? `⚠ ${frame.id} interrupted: turn aborted, message delivered`
+                : report.outcome === "already_idle"
+                  ? `⚠ ${frame.id} interrupt: already idle, message delivered`
+                  : report.outcome === "abort_unavailable"
+                    ? `⚠ ${frame.id} interrupt: abort unavailable on this host, message queued`
+                    : `⚠ ${frame.id} interrupt: still busy after ${report.aborts} aborts, message queued`;
+            void client.reply(frame.id, wording, { receipt: true }).catch(() => {
+              // best effort — the delivery itself already happened
+            });
+          }
+        };
+      }
       guarded(() => {
-        injectInbound(pi, rt.ctx, frame, {
-          ...opts,
-          replyChain: (frame as unknown as { __replyChain?: boolean }).__replyChain === true,
-        });
+        injectInbound(pi, rt.ctx, frame, injectOpts);
       });
       return;
     }

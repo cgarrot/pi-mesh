@@ -78,6 +78,11 @@ export interface SendOpts {
   *  mesh_reply without an explicit `to` goes to ALL of them. Include
   *  yourself if you also want the answer (e.g. with awaitReply). */
   replyTo?: string | string[];
+  /** Abort a BLOCKED recipient turn (kills its running tool via the host
+  *  abort) so this message lands with priority. Requires priority=force
+  *  and a reason — a last-resort unblocking lever, rate-limited and
+  *  policy-gated exactly like force. */
+  interrupt?: boolean;
   /** Abort a BLOCKING awaitReply send (ESC): cancels the pending, cleans
    *  the mission, and returns {status:"error", reason:"cancelled"} — a
    *  late reply still arrives via the orphan-inject path. Ignored for
@@ -91,6 +96,9 @@ export interface ReplyOpts {
   to?: string;
   /** fan the answer out to the whole room of the original message. */
   replyAll?: boolean;
+  /** machine receipt (interrupt outcome): rendered INFO ONLY, followUp
+  *  without triggerTurn — it must never wake the sender or cascade. */
+  receipt?: boolean;
   /** Explicit room for one-shot callers whose inbox never saw the original
   *  frame (CLI): with `to` + `room` a reply is routable without inbox
   *  knowledge — anything less stays reply_without_target (honest). */
@@ -961,6 +969,17 @@ export class MeshClient extends EventEmitter {
       case "reply": {
         const replyTo = frame.replyTo;
         const body = frame.body ?? "";
+        // machine receipts (interrupt outcome) are META: they must never
+        // settle a pending mission — the real answer still comes later.
+        // They fall through to the orphan-inject path (followUp, no turn).
+        if (frame.receipt === true) {
+          if (frame.id) {
+            this.inbox.set(frame.id, frame);
+            this.pruneInbox();
+          }
+          this.emit("inbound", frame, { matchedReply: false });
+          break;
+        }
   // wake-on-answer: consult the launch flag BEFORE handleReply consumes it
         const wake = replyTo !== undefined && this.pending.isLaunch(replyTo) && this.waitAllInFlight === 0;
         const matched = replyTo !== undefined ? this.pending.handleReply(frame) : false;
@@ -1180,6 +1199,11 @@ export class MeshClient extends EventEmitter {
     if (priority === "force" && (opts.reason === undefined || opts.reason.trim() === "")) {
       return { status: "error", reason: "force_requires_reason" };
     }
+    // interrupt is a force modifier: the friction (force + reason + explicit
+    // flag) IS the safety — a standalone interrupt would bypass the policy.
+    if (opts.interrupt === true && (priority !== "force" || opts.reason === undefined || opts.reason.trim() === "")) {
+      return { status: "error", reason: "interrupt_requires_force_reason" };
+    }
   // block:false is ONLY meaningful with awaitReply — a fire-and-forget
   // send has nothing for wait_all to track.
     const launch = opts.awaitReply === true && opts.block === false;
@@ -1211,6 +1235,7 @@ export class MeshClient extends EventEmitter {
       broadcast: broadcast ? true : undefined,
       replyTargets,
       reasonHash: priority === "force" ? sha256(opts.reason ?? "") : undefined,
+      interrupt: opts.interrupt === true ? true : undefined,
       expiresAt,
     });
 
@@ -1405,6 +1430,7 @@ export class MeshClient extends EventEmitter {
         replyTargets: [...designated],
         body,
         refs,
+        receipt: opts.receipt === true ? true : undefined,
       });
       const ackPromise = this.waitAck(frame.id);
       this.writeOrQueue(frame);
@@ -1444,6 +1470,7 @@ export class MeshClient extends EventEmitter {
       body,
       refs,
       replyAll: replyAll === true ? true : undefined,
+      receipt: opts.receipt === true ? true : undefined,
     });
     const ackPromise = this.waitAck(frame.id);
     this.writeOrQueue(frame);
