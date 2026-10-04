@@ -91,6 +91,10 @@ export interface ReplyOpts {
   to?: string;
   /** fan the answer out to the whole room of the original message. */
   replyAll?: boolean;
+  /** Explicit room for one-shot callers whose inbox never saw the original
+  *  frame (CLI): with `to` + `room` a reply is routable without inbox
+  *  knowledge — anything less stays reply_without_target (honest). */
+  room?: string;
 }
 
 export type SendResult =
@@ -150,6 +154,10 @@ export interface MeshClientOpts {
   onFrame?: (f: MeshFrame) => void;
   /** Disable auto-reconnect (ephemeral CLI clients). */
   noReconnect?: boolean;
+  /** With an explicit alias: a collision is a hard error (no retry, no
+  *  random-alias fallback). For one-shot callers (CLI --alias) a surprise
+  *  identity would be dishonest — they want THAT alias or a failure. */
+  strictAlias?: boolean;
 }
 
 interface AckWaiter {
@@ -210,6 +218,7 @@ export class MeshClient extends EventEmitter {
   private readonly runtimeDir: string;
   private readonly config: MeshConfig;
   private readonly noReconnect: boolean;
+  private readonly strictAlias: boolean;
 
   private socket: Socket | null = null;
   private online = false;
@@ -293,6 +302,7 @@ export class MeshClient extends EventEmitter {
     this.runtimeDir = opts.runtimeDir ?? runtimeDir();
     this.config = { ...DEFAULT_CONFIG, ...opts.config, rooms: this.initialRooms };
     this.noReconnect = opts.noReconnect === true;
+    this.strictAlias = opts.strictAlias === true;
     if (opts.initialReservations !== undefined) {
       this.ownReservations = opts.initialReservations.map((r) => ({ ...r }));
     }
@@ -699,7 +709,11 @@ export class MeshClient extends EventEmitter {
           await sleepMs(ALIAS_RETRY_DELAY_MS * 2 ** attempt);
           continue;
         }
-        if (this.aliasFallbackDone) throw err;
+        // strictAlias: keep the transient RETRIES (a mid-close race must not
+        // fail the caller) but skip the random-alias FALLBACK — a one-shot
+        // caller (CLI --alias) wants THIS alias or an honest failure, never
+        // a surprise identity.
+        if (this.strictAlias || this.aliasFallbackDone) throw err;
         this.aliasFallbackDone = true;
         const previous = this.aliasInternal;
         this.aliasInternal = defaultAlias();
@@ -1337,10 +1351,16 @@ export class MeshClient extends EventEmitter {
 
   async reply(msgId: string, body: string, opts: ReplyOpts = {}): Promise<SendResult> {
     const original = this.inbox.get(msgId);
-    if (!original || original.from === undefined) {
+    const { refs, to, replyAll, room: explicitRoom } = opts;
+    // One-shot callers (CLI) never saw the original frame: with an explicit
+    // room plus either a target or replyAll, the reply is still routable;
+    // anything less stays reply_without_target — never a guess.
+    const oneShot =
+      explicitRoom !== undefined && original === undefined && (to !== undefined || replyAll === true);
+    if ((!original || original.from === undefined) && !oneShot) {
       return { status: "error", msgId, reason: "reply_without_target" };
     }
-    const { refs, to, replyAll } = opts;
+    const originalRoom = original?.room ?? explicitRoom;
     if (replyAll === true && to !== undefined) {
       return { status: "error", msgId, reason: "reply_all_with_to" };
     }
@@ -1363,7 +1383,7 @@ export class MeshClient extends EventEmitter {
   //  - replyAll: fan out to the whole room of the original message
   //  - the original msg may carry replyTargets (sender-designated): the
   //    default reply then fans out to ALL of them instead of the sender.
-    const designated = original.replyTargets;
+    const designated = original?.replyTargets;
     const target =
       replyAll === true
         ? undefined
@@ -1371,7 +1391,7 @@ export class MeshClient extends EventEmitter {
           ? normalizeAlias(to)
           : designated !== undefined && designated.length > 0
             ? undefined
-            : original.from;
+            : original?.from;
     if (replyAll !== true && to === undefined && designated !== undefined && designated.length > 0) {
   // fan-out to the sender-designated targets (bounded, validated at send)
       if (designated.length > MAX_REPLY_TARGETS) {
@@ -1380,7 +1400,7 @@ export class MeshClient extends EventEmitter {
       const frame = buildFrame({
         type: "reply",
         from: this.alias,
-        room: original.room,
+        room: originalRoom,
         replyTo: msgId,
         replyTargets: [...designated],
         body,
@@ -1419,7 +1439,7 @@ export class MeshClient extends EventEmitter {
       type: "reply",
       from: this.alias,
       to: target,
-      room: original.room,
+      room: originalRoom,
       replyTo: msgId,
       body,
       refs,
