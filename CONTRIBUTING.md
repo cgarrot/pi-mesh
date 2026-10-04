@@ -25,6 +25,9 @@ README first, then these guidelines.
   explain invariants in plain language.
 - **Never persist message bodies** outside the opt-in transcript. The
   ledger stays hash-only; the forbidden-key scan is fail-closed.
+- **Interrupt wording is honest by construction**: the extension reports
+  `turn aborted` / `still busy` — never "process killed" (not observable
+  from inside), and receipts never settle an awaited mission.
 
 ## CLI rules (`pimesh`)
 

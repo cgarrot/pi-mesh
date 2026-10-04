@@ -237,6 +237,47 @@ streams frames live; bodies are NEVER shown, only `bodyHash` (text and
 The one-shot CLI is not a session: apart from interactive `attach`, it
 never emits read receipts.
 
+## Unblocking a stuck agent (force + interrupt)
+
+An agent can get stuck inside a long or hung command (`sleep 600`, an
+interactive prompt, a process that ignores everything). `mesh_send` has a
+last-resort lever for exactly that:
+
+```jsonc
+mesh_send {
+  "to": "stuck-agent", "message": "stop the render, deploy first",
+  "priority": "force", "reason": "stuck 20 min on a dead command",
+  "interrupt": true }
+```
+
+`interrupt` **aborts the recipient's blocked turn** — the host abort kills
+the running tool's process tree (the same thing ESC does for a human) —
+then delivers the message as a prioritized steer. Aborts are **retried a
+bounded number of times** (an abort can be swallowed by an end-of-turn
+race) within a 10 s window; after that the message is queued anyway.
+
+**Precautions (by design)**: `interrupt` requires `priority: force` AND a
+`reason`; it is rate-limited like force (1/min) and **gated by the same
+policy**. Force is denied by default — the recipient's mesh must opt in:
+
+```jsonc
+// .mesh/policy.json on the RECIPIENT's machine
+{ "allow": [{ "from": "*", "to": "*", "room": "*" }],
+  "forceAllowedFrom": ["lead", "operator-*"] }
+```
+
+**Honest receipts**: the recipient answers with a machine receipt —
+`turn aborted, message delivered`, `already idle`, `still busy after N
+aborts` or `abort unavailable on this host` — rendered INFO ONLY (it
+never wakes the sender, never settles an awaited mission, never
+cascades). The recipient also sees a local notification. Receipts can be
+disabled with `"interruptReceipts": false` / `MESH_INTERRUPT_RECEIPTS=0`.
+
+Limits: an interrupt never claims a killed process (not observable), and
+it does not bypass a provider rate-limit hold (⛔ peers stay held — an
+abort cannot heal a dead provider). CLI: `pimesh send <alias> <text…>
+--interrupt --priority force --reason "…"`.
+
 ## Configuration
 
 `<stateDir>/config.json` (default `<cwd>/.mesh/config.json`, all optional).
@@ -250,6 +291,7 @@ Precedence: defaults < config file < environment.
   "watchdog": true, "watchdogSpikeBytes": 2097152, "watchdogMaxCalls": 64,
   "contextVerbosity": "compact",
   "inboundBroadcasts": "immediate",
+  "interruptReceipts": true,
   "inboundBatchMs": 250, "inboundBatchMaxHoldMs": 30000 }
 ```
 
@@ -348,6 +390,7 @@ Env overrides: `MESH_ALIAS`, `MESH_ROOMS`, `MESH_RUNTIME_DIR`,
 `MESH_MAILBOX_CAP`, `MESH_MAILBOX_TTL_MS`, `MESH_TRANSCRIPT=1`,
 `MESH_ACTIVITY_IDLE_MS`, `MESH_ACTIVITY_STUCK_MS`,
 `MESH_RESERVATION_TTL_MS`, `MESH_INBOUND_BATCH_MS`,
+`MESH_INTERRUPT_RECEIPTS=0`,
 `MESH_INBOUND_BATCH_MAX_HOLD_MS`, `MESH_POLICY`, `MESH_WATCHDOG=0`,
 `MESH_CONTEXT_VERBOSE=1`.
 

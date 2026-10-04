@@ -132,3 +132,24 @@ duplicates, loops and confusion.
 
 `delivered` = written on the recipient's socket (≠ read ≠ answered).
 `reads:` in `mesh_status` shows who has taken knowledge of your messages.
+
+## Unblocking a stuck agent (escalation ladder)
+
+A peer stuck inside a long/hung command (`✕stuck`, or not answering while a
+tool runs) is unblocked through the ESCALATION LADDER — never jump to the
+top:
+
+1. `mesh_send` (normal) — maybe they are just busy.
+2. `urgent` — steer: interrupts the current reflection, not a running tool.
+3. `force` (+ `reason`) — aborts the recipient's turn.
+4. `force` + `reason` + `interrupt: true` — **last resort**: aborts the
+   blocked turn (kills its running tool's process tree) so the message
+   lands with priority. Requires the recipient's policy
+   (`forceAllowedFrom`); the recipient answers with an honest machine
+   receipt (`turn aborted` / `still busy after N aborts`) that is INFO
+   ONLY — it never settles your awaited mission; the real answer still
+   comes.
+
+`interrupt` is a destructive lever: always with a reason, never as
+spam (rate-limited 1/min), never toward a `⛔ rate-limited` peer (an abort
+cannot heal a dead provider).
