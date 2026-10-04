@@ -98,27 +98,33 @@ test("reserve dry-run reports peer conflicts and exits 4 (honest partial)", asyn
   }
 });
 
-test("reserve --hold keeps the claim; SIGINT releases it cleanly (exit 0)", async () => {
+// On Windows, cross-process kill("SIGINT") cannot be intercepted (no signal
+// delivery — TerminateProcess): the SIGINT-handler path is only testable on
+// POSIX. The ELAPSED path exercises the same release+close code and is
+// cross-platform, so it carries the functional assertions.
+const IS_WIN = process.platform === "win32";
+
+test("reserve --hold keeps the claim, then releases it cleanly when the hold elapses", async () => {
   const dirs = makeTempDirs("cli-hold2-");
   const broker = await startTestBroker(dirs.runtimeDir);
   const observer = new MeshClient({ alias: "observer", runtimeDir: dirs.runtimeDir });
   await observer.connect();
   try {
     const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };
-    const proc = spawnCli(["reserve", "src/held.ts", "--reason", "holding", "--hold", "60000"], env);
+    const proc = spawnCli(["reserve", "src/held.ts", "--reason", "holding", "--hold", "3000"], env);
 
     // the claim becomes visible to peers…
     await until(async () => {
       const snap = await observer.status();
       return snap.peers.some((p) => (p.reservations ?? []).some((r) => r.pattern === "src/held.ts"));
     });
-    assert.match(proc.out, /holding for 60s/);
+    assert.match(proc.out, /holding for 3s/);
 
-    // Ctrl-C → release + clean exit 0
-    proc.child.kill("SIGINT");
+    // hold elapses → explicit release + clean exit 0 (same release+close
+    // path the SIGINT handler uses)
     const code = await proc.done;
     assert.equal(code, 0, `out: ${proc.out}\nerr: ${proc.err}`);
-    assert.match(proc.out, /releasing/);
+    assert.match(proc.out, /hold elapsed — released/);
 
     // …and the claim is gone
     await until(async () => {
@@ -127,6 +133,23 @@ test("reserve --hold keeps the claim; SIGINT releases it cleanly (exit 0)", asyn
     });
   } finally {
     await observer.close();
+    await broker.close();
+    dirs.cleanup();
+  }
+});
+
+test("reserve --hold: SIGINT handler releases cleanly (POSIX only — Windows cannot deliver signals cross-process)", { skip: IS_WIN }, async () => {
+  const dirs = makeTempDirs("cli-hold2b-");
+  const broker = await startTestBroker(dirs.runtimeDir);
+  try {
+    const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };
+    const proc = spawnCli(["reserve", "src/held2.ts", "--reason", "holding", "--hold", "60000"], env);
+    await until(() => proc.out.includes("holding for 60s"));
+    proc.child.kill("SIGINT");
+    const code = await proc.done;
+    assert.equal(code, 0, `out: ${proc.out}\nerr: ${proc.err}`);
+    assert.match(proc.out, /releasing/);
+  } finally {
     await broker.close();
     dirs.cleanup();
   }

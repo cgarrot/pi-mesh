@@ -149,7 +149,9 @@ test("attach adoption: dead session identity re-declared with refreshed since + 
 
     proc.child.kill("SIGINT");
     const code = await proc.done;
-    assert.equal(code, 0);
+    // POSIX: graceful exit 0. Windows: hard termination (no signals) —
+    // the adoption/mailbox content above is the cross-platform contract.
+    if (process.platform !== "win32") assert.equal(code, 0);
   } finally {
     await observer.close();
     await broker.close();

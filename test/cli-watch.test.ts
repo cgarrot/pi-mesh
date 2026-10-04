@@ -55,7 +55,9 @@ test("watch --json streams frames and NEVER prints bodies (D8 redaction)", async
 
     child.kill("SIGINT");
     const code = await done;
-    assert.equal(code, 0, `err: ${err}`);
+    // POSIX: handler exits 0. Windows: no signal delivery (hard kill) —
+    // the redaction content is the cross-platform contract.
+    if (process.platform !== "win32") assert.equal(code, 0, `err: ${err}`);
     assert.match(out, /"type":"watch-start"/);
     assert.match(out, /"role":"observer"/);
 
@@ -102,7 +104,7 @@ test("watch text mode shows events, hides bodies, SIGINT exits 0", async () => {
 
     child.kill("SIGINT");
     const code = await done;
-    assert.equal(code, 0);
+    if (process.platform !== "win32") assert.equal(code, 0);
     assert.match(out, /watching room "default"/);
     assert.match(out, /presence/);
     assert.match(out, /msg/);

@@ -114,7 +114,9 @@ test("mesh tail -f: backlog then streams appended records", async () => {
     appendFileSync(ledger, JSON.stringify({ event: "blocked", from: "carol", ts: "2026-01-01T00:00:02Z" }) + "\n");
     killAfter(child, 1200);
     const code = await new Promise<number>((resolve) => child.on("close", (c) => resolve(c ?? -1)));
-    assert.equal(code, 0, "SIGINT exits 0 (agreed outcome)");
+    // SIGINT is only interceptable on POSIX — on Windows the hard kill
+    // terminates without handlers; the CONTENT is what we assert there.
+    if (process.platform !== "win32") assert.equal(code, 0, "SIGINT exits 0 (agreed outcome)");
     assert.match(out, /"event":"sent"/); // backlog
     assert.match(out, /"event":"reply"/); // streamed
     assert.match(out, /"event":"blocked"/); // streamed
