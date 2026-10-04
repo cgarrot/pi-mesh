@@ -2,4 +2,4 @@
 // package.json at build time (never edit by hand). /mesh broker and status
 // snapshots report this value; a stale hand-maintained copy made the peer
 // version-skew detection lie after releases.
-export const MESH_VERSION = "0.7.1";
+export const MESH_VERSION = "0.7.2";
