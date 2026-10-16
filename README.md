@@ -387,6 +387,8 @@ v0.5 highlights:
 Env overrides: `MESH_ALIAS`, `MESH_ROOMS`, `MESH_RUNTIME_DIR`,
 `MESH_STATE_DIR`, `MESH_BROKER_URL`, `MESH_BROKER_TOKEN`, `MESH_LISTEN`,
 `MESH_TLS_CERT/KEY/CA`, `MESH_TLS_INSECURE`, `MESH_MAX_FRAME_BYTES`,
+`MESH_BROKER_ENTRY`, `MESH_BROKER_EXEC_PATH` (see
+[Compiled hosts](#compiled-hosts-omp-sea-bun)),
 `MESH_MAILBOX_CAP`, `MESH_MAILBOX_TTL_MS`, `MESH_TRANSCRIPT=1`,
 `MESH_ACTIVITY_IDLE_MS`, `MESH_ACTIVITY_STUCK_MS`,
 `MESH_RESERVATION_TTL_MS`, `MESH_INBOUND_BATCH_MS`,
@@ -515,6 +517,43 @@ MESH_BROKER_URL=tcp://<machine-A>:8712 MESH_BROKER_TOKEN=change-me pi
   `EACCES`), so the broker endpoint falls back to a **named pipe**
   (`\\.\pipe\mesh-<hash>-broker`). Everything else is unchanged; the full
   test suite + smoke pass on Windows.
+
+## Compiled hosts (omp, SEA, bun…)
+
+Compiled hosts — `omp`, Node SEA bundles, bun-compiled apps — embed the
+JS runtime *inside the host binary*: `process.execPath` points at the
+**host application**, not at `node`. Auto-spawning the broker with the
+default executable re-runs the host (you get the agent CLI instead of a
+broker) and the spawn times out with `blocked: broker_unavailable` (#8).
+
+Pin a real JS runtime with `MESH_BROKER_EXEC_PATH`:
+
+```sh
+# once, before starting the host (node OR bun both work)
+export MESH_BROKER_EXEC_PATH="$(command -v node)"
+# or for a bun-only machine:
+# export MESH_BROKER_EXEC_PATH="$(command -v bun)"
+```
+
+The override applies everywhere the broker is launched: client
+auto-spawn, `pimesh broker start`, and the standalone watchdog. When set,
+the broker is spawned with `spawn(exec, [entry])` — the host's own launch
+flags (`--inspect`…) are never inherited. Without the override, behavior
+is unchanged (`process.execPath`, i.e. plain `node` for normal installs).
+
+Related overrides:
+
+- `MESH_BROKER_ENTRY` — pin the broker **script** path (default: the
+  compiled `dist/src/broker/broker.js` next to the client module).
+- `MESH_BROKER_EXEC_PATH` — pin the broker **runtime** executable.
+
+`pimesh doctor` prints the resolved `brokerExec:` line so compiled-host
+setups are one glance to diagnose. Manual cold start (no host needed):
+
+```sh
+MESH_CLI="$HOME/.omp/plugins/node_modules/pi-mesh-extension/dist/src/cli/mesh.js"
+"$MESH_BROKER_EXEC_PATH" "$MESH_CLI" broker start
+```
 
 ## OpenCode
 

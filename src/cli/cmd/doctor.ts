@@ -9,6 +9,7 @@ import { loadConfig, parseEndpoint, STATUS_REQ_TIMEOUT_MS } from "../../shared/c
 import { brokerLockPath, brokerSocketPath, configPath, policyPath, runtimeDir, stateDir } from "../../shared/paths.js";
 import { loadPolicy } from "../../broker/policy.js";
 import { connectProbe, connectProbeTcp } from "../../client/reconnect.js";
+import { brokerExecPath } from "../../shared/exec.js";
 import { MESH_VERSION } from "../../shared/version.js";
 
 function pidAlive(pid: number): boolean {
@@ -67,6 +68,7 @@ export async function cmdDoctor(): Promise<number> {
 
   for (const line of [
     `runtimeDir: ${dir}`,
+    `brokerExec: ${brokerExecPath()}`,
     url !== undefined ? `endpoint: ${url} reachable=${reachable}` : `socket: ${sock} reachable=${reachable}`,
     `brokerUrl: ${url ?? "(local unix socket)"}`,
     `listen: ${listen ?? "(unix socket)"}`,

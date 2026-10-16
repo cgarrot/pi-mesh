@@ -47,6 +47,9 @@ const { parseEndpoint } = await import(
 const HOME = os.homedir();
 const STATE_DIR = path.join(HOME, ".mesh");
 const BROKER_ENTRY = path.join(ROOT, "dist", "src", "broker", "broker.js");
+// $MESH_BROKER_EXEC_PATH override or the runtime that launched the
+// watchdog — never assume process.execPath is node (compiled hosts, #8).
+const BROKER_EXEC = (process.env.MESH_BROKER_EXEC_PATH || "").trim() || process.execPath;
 const BROKER_LOG = path.join(STATE_DIR, "broker-standalone.log");
 const WATCHDOG_LOG = path.join(STATE_DIR, "broker-watchdog.log");
 
@@ -160,7 +163,7 @@ function clearStaleFiles(dir) {
 
 function spawnBroker(dir) {
   const brokerLogFd = openSync(BROKER_LOG, "a");
-  const child = spawn(process.execPath, [BROKER_ENTRY], {
+  const child = spawn(BROKER_EXEC, [BROKER_ENTRY], {
     detached: true,
     stdio: ["ignore", brokerLogFd, brokerLogFd],
     cwd: HOME, // stateDir = ~/.mesh → config.json listen + brokerToken

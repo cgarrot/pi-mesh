@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { brokerEntryPath } from "../src/client/reconnect.js";
+import { brokerExecPath } from "../src/shared/exec.js";
 
 let roots: string[] = [];
 
@@ -88,6 +89,31 @@ describe("brokerEntryPath", () => {
         );
         return true;
       },
+    );
+  });
+});
+
+describe("brokerExecPath (#8 compiled hosts)", () => {
+  it("default: process.execPath when no override (Node behavior preserved)", () => {
+    assert.equal(brokerExecPath({}), process.execPath);
+  });
+
+  it("override: $MESH_BROKER_EXEC_PATH wins", () => {
+    assert.equal(
+      brokerExecPath({ MESH_BROKER_EXEC_PATH: "/opt/bun/bin/bun" }),
+      "/opt/bun/bin/bun",
+    );
+  });
+
+  it("blank override (empty / whitespace) falls back to process.execPath", () => {
+    assert.equal(brokerExecPath({ MESH_BROKER_EXEC_PATH: "" }), process.execPath);
+    assert.equal(brokerExecPath({ MESH_BROKER_EXEC_PATH: "   " }), process.execPath);
+  });
+
+  it("override is trimmed (quoted shell values)", () => {
+    assert.equal(
+      brokerExecPath({ MESH_BROKER_EXEC_PATH: "  /usr/bin/node  " }),
+      "/usr/bin/node",
     );
   });
 });

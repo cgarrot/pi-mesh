@@ -5,6 +5,7 @@ import { EXIT_OK, EXIT_MESH_FAILURE, EXIT_USAGE } from "../codes.js";
 import { STATUS_REQ_TIMEOUT_MS } from "../../shared/config.js";
 import { brokerLockPath, brokerSocketPath, runtimeDir } from "../../shared/paths.js";
 import { connectProbe } from "../../client/reconnect.js";
+import { brokerExecPath } from "../../shared/exec.js";
 
 function pidAlive(pid: number): boolean {
   try {
@@ -22,7 +23,9 @@ export async function cmdBroker(sub: string | undefined): Promise<number> {
     case "start": {
       const { spawn } = await import("node:child_process");
       const { brokerEntryPath } = await import("../../client/reconnect.js");
-      const child = spawn(process.execPath, [brokerEntryPath()], {
+      // brokerExecPath: $MESH_BROKER_EXEC_PATH override or process.execPath —
+      // compiled hosts must be able to pin a real JS runtime (#8).
+      const child = spawn(brokerExecPath(), [brokerEntryPath()], {
         detached: true,
         stdio: "ignore",
         env: { ...process.env, MESH_RUNTIME_DIR: dir },

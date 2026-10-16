@@ -1,5 +1,5 @@
 // client/reconnect.ts — ensureBroker auto-spawn, connect probe, backoff.
-import { fork } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -11,6 +11,7 @@ import {
   RECONNECT_BASE_MS,
   RECONNECT_MAX_MS,
 } from "../shared/config.js";
+import { brokerExecPath } from "../shared/exec.js";
 import { brokerLockPath, brokerSocketPath } from "../shared/paths.js";
 
 const BROKER_ENTRY_REL = "../broker/broker.js";
@@ -110,7 +111,13 @@ function pidAlive(pid: number): boolean {
 }
 
 function spawnBroker(runtimeDir: string, lockPath: string, entry: string): void {
-  const child = fork(entry, [], {
+  // spawn (not fork): no IPC channel is ever used (stdio ignore + unref),
+  // and a compiled host's process.execPath must not be re-executed as if it
+  // were node (#8). Plain spawn also never inherits the host's execArgv —
+  // a pinned foreign runtime (bun, …) cannot receive node-specific launch
+  // flags like --inspect.
+  const exec = brokerExecPath();
+  const child = spawn(exec, [entry], {
     detached: true,
     stdio: "ignore",
     env: { ...process.env, MESH_RUNTIME_DIR: runtimeDir },
@@ -160,7 +167,8 @@ export async function ensureBroker(runtimeDir: string): Promise<string> {
         }
         const detail = err instanceof Error ? ` (${err.message})` : "";
         throw new Error(
-          `broker_unavailable: fork failed${entry === undefined ? "" : ` (entry: ${entry})`}${detail}`,
+          `broker_unavailable: spawn failed${entry === undefined ? "" : ` (exec: ${brokerExecPath()}, entry: ${entry})`}${detail}` +
+            ` — on a compiled host (omp, SEA, …) set MESH_BROKER_EXEC_PATH to a JS runtime (README "Compiled hosts")`,
         );
       }
     } else {
@@ -206,7 +214,9 @@ export async function ensureBroker(runtimeDir: string): Promise<string> {
       }
     }
   }
-  throw new Error("broker_unavailable");
+  throw new Error(
+    "broker_unavailable: broker did not come up — run `pimesh doctor`; on a compiled host set MESH_BROKER_EXEC_PATH (README \"Compiled hosts\")",
+  );
 }
 
 /** Reconnect backoff: 250 ms × 2^n, capped at 5 s. */
