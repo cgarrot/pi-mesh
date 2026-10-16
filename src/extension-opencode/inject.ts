@@ -1,4 +1,4 @@
-// inject.ts — how an inbound mesh frame reaches an OpenCode session.
+// inject.ts — how inbound mesh frames reach an OpenCode session.
 //
 // The heavy lifting (formatting, priority→delivery mapping, batching
 // strategy) is shared with the Pi adapter and reused here:
@@ -21,20 +21,36 @@ export async function injectBatch(
   runtime: MeshSessionRuntime,
   frames: readonly MeshFrame[],
 ): Promise<void> {
-  const batch = buildBatchMessage(frames as MeshFrame[]);
+  const batch = buildBatchMessage(frames as MeshFrame[], (frame) => runtime.formatFor(frame));
   await runtime.submit(batch.content, toDelivery(batch.deliverAs));
 }
 
 /**
- * Inject ONE inbound frame (not batched) into the session.
- * Exposed for tests / callers that already hold a single frame.
+ * Inject ONE inbound frame (bypassing the batcher — force/remind frames
+ * and single messages). `interrupt: true` aborts the session's running
+ * turn first (force delivery), like Pi's abort path.
  */
 export async function injectFrame(
   runtime: MeshSessionRuntime,
-  frame: Parameters<typeof formatInboundContent>[0],
+  frame: MeshFrame,
+  options: { interrupt?: boolean } = {},
 ): Promise<void> {
-  const text = formatInboundContent(frame);
-  await runtime.submit(text, "queue");
+  if (options.interrupt === true) {
+    runtime.interrupt?.();
+  }
+  const text = formatInboundContent(frame, {
+    ...runtime.formatFor(frame),
+    replyChain: (frame as unknown as { __replyChain?: boolean }).__replyChain === true,
+  });
+  await runtime.submit(text, toDelivery(frameDelivery(frame)));
+}
+
+/** The frame's own delivery wish, before the batcher's aggregation.
+ *  (force keeps its abort path via `options.interrupt`; delivery is steer.) */
+function frameDelivery(frame: MeshFrame): DeliverAs {
+  if (frame.priority === "force" || frame.priority === "urgent") return "steer";
+  if (frame.type === "reply") return "steer";
+  return "followUp";
 }
 
 /** Map the shared delivery mode onto OpenCode's two delivery modes. */

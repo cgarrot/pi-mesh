@@ -4,6 +4,13 @@
   "description": "Live agent-to-agent communication for Pi — local broker, mesh.v1 protocol, honest delivered/read/answered statuses, hash-only ledger. Zero runtime dependencies. Published as pi-mesh-extension on npm (the plain pi-mesh name is taken by another project).",
   "type": "module",
   "license": "MIT",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./dist/server.js",
+    "./package.json": "./package.json",
+    "./*": "./*"
+  },
   "author": "Clément Garrot <clement.garrot.dev@gmail.com> (https://github.com/cgarrot)",
   "keywords": [
     "pi",
@@ -45,6 +52,10 @@
     "dist",
     "!dist/test",
     "index.ts",
+    "index.js",
+    "server.ts",
+    "server.js",
+    "tui.tsx",
     "README.md",
     "LICENSE"
   ],

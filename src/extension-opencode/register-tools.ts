@@ -6,10 +6,20 @@
 //  - V1 (`Hooks.tool`): zod `args` shape, the execute callback receives
 //    typed args (the V1 ToolDefinition is zod-based).
 // Both paths share `runTool` so behaviour cannot drift.
-import { z } from "zod";
+//
+// zod is loaded LAZILY (dynamic import in applyMeshToolsV1): the V2 path —
+// every current OpenCode — never touches it, so the published package keeps
+// its zero-runtime-dependency contract. A legacy V1 host without zod
+// installed simply gets no mesh tool map (the observation hooks still run).
 import type { ToolContext } from "@opencode-ai/plugin";
 import type { ToolDefinition as V1ToolDefinition } from "@opencode-ai/plugin";
 import type { MeshSessionRuntime } from "./client-runtime.js";
+import { buildFrame, normalizeAlias, type MeshFrame } from "../protocol/envelope.js";
+import { sha256 } from "../protocol/frames.js";
+import { DEFAULT_AWAIT_REPLY_TIMEOUT_MS } from "../shared/config.js";
+import { busyTargetWarning, checkSendTarget } from "../extension/tools.js";
+import { REPLY_REPEAT_WARNING } from "../extension/guards.js";
+import type { MeshLedger } from "../extension/ledger.js";
 import type {
   V2ToolDefinition,
   V2ToolEditor,
@@ -55,7 +65,46 @@ async function ensureRuntime(
   ensure: EnsureRuntime,
   sessionID: string,
 ): Promise<MeshSessionRuntime> {
-  return ensure(sessionID);
+  const runtime = await ensure(sessionID);
+  // First-call race: a freshly attached runtime's initial connect() may
+  // still be in flight — drive/await it (memoized inside the client, so a
+  // concurrent connect shares the same promise) before the tool answers.
+  // Without this, the FIRST mesh tool call of a session occasionally
+  // returned broker_unavailable (observed live). Pi retries connect the
+  // same way before giving up.
+  if (!runtime.client.isOnline()) {
+    try {
+      await runtime.client.connect();
+    } catch {
+      // still offline → each tool answers blocked: broker_unavailable
+    }
+  }
+  return runtime;
+}
+
+/** Best-effort ledger append — a ledger failure never breaks a tool call. */
+function safeLedger(
+  runtime: MeshSessionRuntime,
+  input: Parameters<MeshLedger["append"]>[0],
+): void {
+  try {
+    runtime.ledger.append(input);
+  } catch {
+    runtime.ledgerFailures += 1;
+  }
+}
+
+/** Best-effort transcript record (opt-in) — same contract. */
+function safeTranscript(
+  runtime: MeshSessionRuntime,
+  direction: "out",
+  frame: MeshFrame,
+): void {
+  try {
+    runtime.transcript.record(direction, frame);
+  } catch {
+    runtime.transcriptFailures += 1;
+  }
 }
 
 async function execMeshSend(
@@ -65,20 +114,25 @@ async function execMeshSend(
   signal: Signal,
 ): Promise<ToolOutcome> {
   const runtime = await ensureRuntime(ensure, sessionID);
-  const toRaw = str(params.to);
   const message = str(params.message);
   if (message === undefined) {
     return textResult("error: invalid_frame (message is required)");
   }
   const broadcast = params.broadcast === true;
-  const to = broadcast ? undefined : toRaw;
-  if (!broadcast && to === undefined) {
+  const toRaw = str(params.to);
+  if (!broadcast && toRaw === undefined) {
     return textResult("error: invalid_frame (to is required unless broadcast: true)");
   }
   if (broadcast && toRaw !== undefined) {
     return textResult("error: broadcast_with_to (omit 'to' when broadcasting)");
   }
-  const room = str(params.room);
+  // '*' = broadcast target (mirrors the Pi tool); normalized for guards.
+  const to = toRaw !== undefined ? normalizeAlias(toRaw) : "*";
+  // Room resolution mirrors the client: explicit room wins; otherwise
+  // "default" when still joined, else the FIRST joined room.
+  const targetRoom =
+    str(params.room) ??
+    (runtime.client.rooms.includes("default") ? "default" : runtime.client.rooms[0] ?? "default");
   const priority = (str(params.priority) ?? "normal") as
     | "normal"
     | "urgent"
@@ -87,38 +141,95 @@ async function execMeshSend(
   const interrupt = params.interrupt === true;
   const awaitReply = params.awaitReply === true;
   const block = params.block === false ? false : true;
+  const launch = awaitReply && !block; // track + return immediately
   const timeoutMs = num(params.timeoutMs);
   const refs = strArr(params.refs);
   const replyTo = parseReplyTo(params.replyTo);
+  const bodyHash = sha256(message);
+  const reasonHash = priority === "force" && reason !== undefined ? sha256(reason) : undefined;
 
-  // M1 send guards — BEFORE any broker round-trip.
-  const targetRoom =
-    room ?? (runtime.client.rooms.includes("default") ? "default" : runtime.client.rooms[0] ?? "default");
+  // M1 target validation + M2 busy-target warning — BEFORE any round-trip
+  // (same helpers as the Pi tool: to:"*" and room-broadcast pseudo-targets
+  // are doomed; a busy-for-longer-than-timeout target is a near-certain
+  // expiry). Soft warnings never block a send.
+  const warnings: string[] = [];
+  if (!broadcast) {
+    const check = checkSendTarget(
+      to,
+      (alias) => runtime.client.knowsPeer(alias),
+      runtime.client.knownPeerList.length,
+    );
+    if (check.error !== undefined) {
+      safeLedger(runtime, {
+        event: "blocked", from: runtime.client.alias, to, room: targetRoom,
+        priority, bodyHash, reasonHash, refs, code: check.error,
+      });
+      return textResult(`blocked: ${check.error} — ${check.hint ?? ""}`, { reason: check.error });
+    }
+    if (check.warning !== undefined) warnings.push(check.warning);
+    if (awaitReply) {
+      const busyWarn = busyTargetWarning(
+        to,
+        runtime.client.busyForMs(to),
+        timeoutMs ?? DEFAULT_AWAIT_REPLY_TIMEOUT_MS,
+      );
+      if (busyWarn !== undefined) warnings.push(busyWarn);
+    }
+  }
+
+  // Send guards (self-send, duplicate window, caps, loop) — BEFORE any
+  // broker round-trip. Pi parity: guard failures are ledgered.
   const guard = runtime.guards.checkSend({
     from: runtime.client.alias,
-    to: to ?? "*",
+    to,
     room: targetRoom,
     body: message,
     priority,
   });
   if (!guard.ok) {
+    safeLedger(runtime, {
+      event: "blocked", from: runtime.client.alias, to, room: targetRoom,
+      priority, bodyHash, reasonHash, refs, code: guard.reason,
+    });
     return textResult(`blocked: ${guard.reason}`, { reason: guard.reason });
   }
-  const warnings = [...guard.warnings];
-  if (awaitReply) {
-    const busyMs = runtime.client.busyForMs(to ?? "*");
-    if (busyMs !== undefined && busyMs > 60_000) {
-      warnings.push("still busy (measured on an earlier awaitReply)");
+  warnings.push(...guard.warnings);
+
+  if (!runtime.client.isOnline()) {
+    // broker absent → retry the (memoized) connect once, then answer honestly.
+    try {
+      await runtime.client.connect();
+    } catch {
+      safeLedger(runtime, {
+        event: "blocked", from: runtime.client.alias, to, room: targetRoom,
+        priority, bodyHash, refs, code: "broker_unavailable",
+      });
+      return textResult("blocked: broker_unavailable", { reason: "broker_unavailable" });
     }
   }
 
-  if (!runtime.client.isOnline()) {
-    return textResult("blocked: broker_unavailable", { reason: "broker_unavailable" });
+  // Transcript: outbound frame WITH body (redacted at record time) — opt-in.
+  if (runtime.transcript.isEnabled()) {
+    safeTranscript(
+      runtime,
+      "out",
+      buildFrame({
+        type: "msg", from: runtime.client.alias, to, room: targetRoom, priority,
+        body: message, refs, broadcast: broadcast ? true : undefined,
+      }),
+    );
   }
+  // Causal anchoring: 'sent' is ledgered BEFORE the network call (Pi parity).
+  safeLedger(runtime, {
+    event: "sent", from: runtime.client.alias, to, room: targetRoom,
+    priority, bodyHash, reasonHash, refs,
+    code: broadcast ? "broadcast" : undefined,
+  });
+
   const res = await runtime.client.send({
-    to,
+    to: broadcast ? undefined : to,
     message,
-    room,
+    room: targetRoom,
     priority,
     reason,
     awaitReply,
@@ -128,16 +239,39 @@ async function execMeshSend(
     broadcast,
     replyTo,
     interrupt,
-    signal,
+    // a launch-mode mission survives the calling turn's end
+    signal: !launch && signal !== undefined ? signal : undefined,
   });
 
-  if (runtime.transcript.isEnabled()) {
-    // Reuse the transcript facade; building a MeshFrame here would duplicate
-    // the Pi-side buildFrame logic, so this adapter does not record.
-    void runtime;
+  // `delivered` is ledgered ONLY here — after the broker ack (client.send
+  // resolves delivered exclusively post-ack). Full status set = Pi parity.
+  const msgId = "msgId" in res ? res.msgId : undefined;
+  const cast =
+    broadcast && "deliveredCount" in res
+      ? `broadcast:${res.deliveredCount ?? 0}/${"totalCount" in res ? res.totalCount ?? 0 : 0}`
+      : undefined;
+  switch (res.status) {
+    case "delivered":
+      safeLedger(runtime, { event: "delivered", id: msgId, from: runtime.client.alias, to, room: targetRoom, priority, bodyHash, reasonHash, refs, code: cast });
+      break;
+    case "queued_offline":
+      safeLedger(runtime, { event: "queued_offline", id: msgId, from: runtime.client.alias, to, room: targetRoom, priority, bodyHash, reasonHash, refs, code: cast });
+      break;
+    case "reply":
+      safeLedger(runtime, { event: "reply", id: msgId, from: runtime.client.alias, to, room: targetRoom, priority, bodyHash, refs, code: "outputHash" in res ? res.outputHash : undefined });
+      break;
+    case "expired":
+      safeLedger(runtime, { event: "expired", id: msgId, from: runtime.client.alias, to, room: targetRoom, priority, bodyHash, refs, code: "expired" });
+      break;
+    case "blocked":
+      safeLedger(runtime, { event: "blocked", id: msgId, from: runtime.client.alias, to, room: targetRoom, priority, bodyHash, refs, code: res.reason });
+      break;
+    default:
+      safeLedger(runtime, { event: "error", id: msgId, from: runtime.client.alias, to, room: targetRoom, priority, bodyHash, refs, code: "reason" in res ? res.reason : "error" });
+      break;
   }
   return describeOutcome(res, warnings, {
-    msgId: "msgId" in res ? res.msgId : undefined,
+    msgId,
     to,
     room: targetRoom,
     priority,
@@ -204,25 +338,93 @@ async function execMeshReply(
   if (replyAll && toRaw !== undefined) {
     return textResult("error: reply_all_with_to (replyAll and to are mutually exclusive)");
   }
+  const bodyHash = sha256(message);
+
   if (!runtime.client.isOnline()) {
-    return textResult("blocked: broker_unavailable");
+    // broker absent → retry the (memoized) connect once, then answer honestly.
+    try {
+      await runtime.client.connect();
+    } catch {
+      return textResult("blocked: broker_unavailable");
+    }
   }
+
+  // Peek the original BEFORE reply — read-only, and safe against any
+  // future inbox eviction during the round-trip. An unknown msgId is
+  // refused BEFORE the network call, so no 'sent' record is ever ledgered
+  // for a blocked reply (Pi parity).
   const orig = runtime.client.peekInbox(msgId);
-  if (orig === undefined) {
+  if (orig === undefined || orig.from === undefined) {
+    safeLedger(runtime, {
+      event: "blocked", id: msgId, from: runtime.client.alias,
+      bodyHash, refs, code: "reply_without_target",
+    });
     return textResult("blocked: reply_without_target (use the exact msgId from an inbound message)");
   }
+  // causal anchoring: 'sent' is ledgered BEFORE the network call,
+  // enriched with to/room/priority from the peeked original.
+  safeLedger(runtime, {
+    event: "sent", from: runtime.client.alias, to: toRaw ?? orig.from,
+    room: orig.room, priority: orig.priority, bodyHash, refs,
+    code: replyAll ? "reply_all" : toRaw !== undefined ? "reply_to" : undefined,
+  });
+  // flag re-replies to the same msgId (warning only — never blocks)
+  const replyGuard = runtime.guards.checkReply(msgId);
   const res = await runtime.client.reply(msgId, message, {
     refs,
     to: toRaw,
     replyAll,
   });
-  return describeOutcome(res, [], {
-    replyTo: msgId,
+  if (res.status === "error" && res.reason === "reply_without_target") {
+    // defense in depth: inbox eviction between peek and reply.
+    safeLedger(runtime, {
+      event: "blocked", id: msgId, from: runtime.client.alias,
+      bodyHash, refs, code: "reply_without_target",
+    });
+    return textResult("blocked: reply_without_target (use the exact msgId from an inbound message)");
+  }
+  if (runtime.transcript.isEnabled()) {
+    safeTranscript(
+      runtime,
+      "out",
+      buildFrame({
+        type: "reply", from: runtime.client.alias, to: toRaw, room: orig.room,
+        replyTo: msgId, body: message, refs, replyAll: replyAll ? true : undefined,
+      }),
+    );
+  }
+  safeLedger(runtime, {
+    event: res.status === "delivered" ? "delivered" : "error",
+    id: "msgId" in res ? res.msgId : msgId,
+    from: runtime.client.alias,
     to: toRaw ?? orig.from,
     room: orig.room,
     priority: orig.priority,
-    replyAll: replyAll || undefined,
+    bodyHash,
+    refs,
+    code:
+      res.status !== "delivered"
+        ? "reason" in res
+          ? res.reason
+          : "error"
+        : replyAll && "deliveredCount" in res
+          ? `reply_all:${res.deliveredCount ?? 0}/${"totalCount" in res ? res.totalCount ?? 0 : 0}`
+          : toRaw !== undefined
+            ? "reply_to"
+            : undefined
   });
+  const repeatWarn = replyGuard.warnings.includes(REPLY_REPEAT_WARNING);
+  return describeOutcome(
+    res,
+    repeatWarn ? ["already replied to this msgId recently (check before re-answering)"] : [],
+    {
+      replyTo: msgId,
+      to: toRaw ?? orig.from,
+      room: orig.room,
+      priority: orig.priority,
+      replyAll: replyAll || undefined,
+    },
+  );
 }
 
 async function execMeshStatus(
@@ -235,18 +437,22 @@ async function execMeshStatus(
     return textResult("blocked: broker_unavailable");
   }
   const room = str(params.room);
+  const all = params.all === true;
   const snap = await runtime.client.status(room);
   const mine = new Set<string>(
     room !== undefined ? [room] : [...runtime.client.rooms],
   );
-  const peers = snap.peers.filter(
-    (p) =>
-      p.alias === runtime.client.alias ||
-      mine.size === 0 ||
-      p.rooms.some((r) => mine.has(r)),
-  );
+  // `all` shows the whole broker; the default view stays room-scoped.
+  const peers = all
+    ? snap.peers
+    : snap.peers.filter(
+        (p) =>
+          p.alias === runtime.client.alias ||
+          mine.size === 0 ||
+          p.rooms.some((r) => mine.has(r)),
+      );
   const lines = [
-    `mesh status — alias @${runtime.client.alias}${room !== undefined ? ` room=${room}` : ""}`,
+    `mesh status — alias @${runtime.client.alias}${room !== undefined ? ` room=${room}` : ""}${all ? " all" : ""}`,
     `peers (${peers.length}):`,
     ...peers.map((p) => {
       const state = p.activity?.state;
@@ -417,8 +623,8 @@ interface MeshToolSpec {
     required: readonly string[];
     additionalProperties: false;
   };
-  /** Zod raw shape describing the tool args (V1 registration). */
-  v1Args: z.ZodRawShape;
+  /** Zod raw shape builder for the V1 registration (zod loaded lazily). */
+  v1Shape: (z: typeof import("zod").z) => Record<string, unknown>;
   /** Executed with (params, signal, context) — the context carries the
    *  invoking sessionID, which decides which mesh runtime is used. */
   execute: (
@@ -549,7 +755,7 @@ function buildSpecs(ensure: EnsureRuntime): MeshToolSpec[] {
         },
         ["message"],
       ),
-      v1Args: {
+      v1Shape: (z) => ({
         to: z.string().optional(),
         message: z.string(),
         room: z.string().optional(),
@@ -562,7 +768,7 @@ function buildSpecs(ensure: EnsureRuntime): MeshToolSpec[] {
         timeoutMs: z.number().optional(),
         refs: z.array(z.string()).max(8).optional(),
         replyTo: z.array(z.string()).max(8).optional(),
-      },
+      }),
       execute: (params, signal, context) =>
         execMeshSend(ensure, context.sessionID, params, signal),
     },
@@ -579,13 +785,13 @@ function buildSpecs(ensure: EnsureRuntime): MeshToolSpec[] {
         },
         ["msgId", "message"],
       ),
-      v1Args: {
+      v1Shape: (z) => ({
         msgId: z.string(),
         message: z.string(),
         to: z.string().optional(),
         replyAll: z.boolean().optional(),
         refs: z.array(z.string()).optional(),
-      },
+      }),
       execute: (params, signal, context) =>
         execMeshReply(ensure, context.sessionID, params, signal),
     },
@@ -599,10 +805,10 @@ function buildSpecs(ensure: EnsureRuntime): MeshToolSpec[] {
         },
         [],
       ),
-      v1Args: {
+      v1Shape: (z) => ({
         room: z.string().optional(),
         all: z.boolean().optional(),
-      },
+      }),
       execute: (params, _signal, context) =>
         execMeshStatus(ensure, context.sessionID, params),
     },
@@ -616,10 +822,10 @@ function buildSpecs(ensure: EnsureRuntime): MeshToolSpec[] {
         },
         [],
       ),
-      v1Args: {
+      v1Shape: (z) => ({
         limit: z.number().optional(),
         withBodies: z.boolean().optional(),
-      },
+      }),
       execute: (params, _signal, context) =>
         execMeshHistory(ensure, context.sessionID, params),
     },
@@ -632,9 +838,9 @@ function buildSpecs(ensure: EnsureRuntime): MeshToolSpec[] {
         },
         [],
       ),
-      v1Args: {
+      v1Shape: (z) => ({
         timeoutMs: z.number().optional(),
-      },
+      }),
       execute: (params, signal, context) =>
         execMeshWaitAll(ensure, context.sessionID, params, signal),
     },
@@ -651,13 +857,13 @@ function buildSpecs(ensure: EnsureRuntime): MeshToolSpec[] {
         },
         [],
       ),
-      v1Args: {
+      v1Shape: (z) => ({
         limit: z.number().optional(),
         from: z.string().optional(),
         to: z.string().optional(),
         room: z.string().optional(),
         event: z.string().optional(),
-      },
+      }),
       execute: (params, _signal, context) =>
         execMeshLedger(ensure, context.sessionID, params),
     },
@@ -679,11 +885,11 @@ function buildSpecs(ensure: EnsureRuntime): MeshToolSpec[] {
         },
         ["paths"],
       ),
-      v1Args: {
+      v1Shape: (z) => ({
         paths: z.array(z.string()).min(1),
         reason: z.string().optional(),
         autoReleaseMs: z.number().optional(),
-      },
+      }),
       execute: (params, _signal, context) =>
         execMeshReserve(ensure, context.sessionID, params),
     },
@@ -700,9 +906,9 @@ function buildSpecs(ensure: EnsureRuntime): MeshToolSpec[] {
         },
         [],
       ),
-      v1Args: {
+      v1Shape: (z) => ({
         paths: z.array(z.string()).optional(),
-      },
+      }),
       execute: (params, _signal, context) =>
         execMeshRelease(ensure, context.sessionID, params),
     },
@@ -729,16 +935,28 @@ export function applyMeshTools(
   }
 }
 
-/** Register the mesh tools with the legacy V1 Hooks object. */
-export function applyMeshToolsV1(
+/** Register the mesh tools with the legacy V1 Hooks object.
+ *
+ * zod is loaded HERE, lazily: the V2 path (every current OpenCode) never
+ * imports it, keeping the published package free of runtime dependencies.
+ * A legacy host without zod gets no mesh tool map — the observation hooks
+ * keep working; the promise resolves regardless so `server()` never throws.
+ */
+export async function applyMeshToolsV1(
   hooks: { tool?: Record<string, V1ToolDefinition> },
   ensure: EnsureRuntime,
-): void {
+): Promise<void> {
+  let z: typeof import("zod").z;
+  try {
+    z = (await import("zod")).z;
+  } catch {
+    return; // zod unavailable — V1 tool map silently unavailable
+  }
   const map: Record<string, V1ToolDefinition> = {};
   for (const spec of buildSpecs(ensure)) {
     map[spec.name] = {
       description: spec.description,
-      args: spec.v1Args,
+      args: spec.v1Shape(z) as V1ToolDefinition["args"],
       execute: async (args, context: ToolContext) => {
         const outcome = await runSpec(
           spec,

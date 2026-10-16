@@ -16,6 +16,14 @@ export interface V2PluginContext {
   tool: V2ToolHooks;
   /** Submit prompts and interrupt running turns. */
   session: V2SessionHooks;
+  /** Server event stream (session lifecycle → eager mesh attach). */
+  event?: V2EventHooks;
+  /** Plugin options from the configuration object form. */
+  options?: unknown;
+}
+
+export interface V2EventHooks {
+  subscribe(options?: { signal?: AbortSignal }): AsyncIterable<unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -32,9 +40,15 @@ export interface V2CommandEditor {
 export interface V2CommandDefinition {
   name: string;
   description?: string;
-  /** Slash-command argument (e.g. "mesh send <room>"). */
-  argument?: string;
-  handler: (input: { sessionID: string }) => Promise<void> | void;
+  /** The executor the V2 runtime calls (the documented key is `execute`;
+   *  a `handler` key is ignored and the command silently does nothing).
+   *  The invocation carries the session, the prompt being submitted and
+   *  the requested delivery mode. */
+  execute: (input: {
+    sessionID: string;
+    prompt?: { text?: string };
+    delivery?: "steer" | "queue";
+  }) => Promise<void> | void;
 }
 
 export interface V2CommandHooks {
@@ -76,6 +90,9 @@ export interface V2ToolEditor {
 export interface V2ToolHooks {
   /** Register (or replace) tools. */
   transform(callback: (editor: V2ToolEditor) => Promise<void> | void): void;
+  /** Intercept tool execution ("execute.before" / "execute.after"); a
+   *  throw from the callback aborts the tool call. */
+  hook?(name: string, callback: (event: unknown) => void | Promise<void>): unknown;
 }
 
 export interface V2ToolExecutionContext {

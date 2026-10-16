@@ -6,16 +6,25 @@
 // are shared with the Pi adapter — this file only wires them to an
 // OpenCode session. Only the host-specific parts (how an inbound message
 // reaches a session) live here and in inject.ts.
+import { appendFileSync, mkdirSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { loadConfig, type MeshConfig } from "../shared/config.js";
 import { runtimeDir, stateDir } from "../shared/paths.js";
-import { MeshIdentity } from "../shared/identity-store.js";
-import { InboundBatcher } from "../extension/batcher.js";
+import { identityFromClient, MeshIdentity, type PersistedIdentity } from "../shared/identity-store.js";
+import { InboundBatcher, bypassesBatch } from "../extension/batcher.js";
+import { DeferredInbox } from "../extension/deferred-inbox.js";
+import { classifyInbound } from "../extension/inbound-policy.js";
+import type { FormatOpts } from "../extension/inbound.js";
+import { ReplyHintTracker } from "../extension/reply-hints.js";
+import type { ExtensionAPI } from "../extension/pi-types.js";
 import { MeshGuards } from "../extension/guards.js";
 import { MeshLedger } from "../extension/ledger.js";
 import { MeshTranscript } from "../extension/transcript.js";
-import { MeshClient, type MeshClientOpts } from "../client/client.js";
-import type { MeshFrame } from "../protocol/envelope.js";
+import { computePeerStatus, MeshClient, type MeshClientOpts } from "../client/client.js";
+import type { MeshFrame, MeshPeerInfo } from "../protocol/envelope.js";
 import type { V2SessionHooks } from "./v2-surface.js";
+import { injectFrame } from "./inject.js";
 
 /** The turn states the broker understands (mirrored from client.ts). */
 export type ActivityState = "busy" | "idle" | "rate_limited" | "blocked";
@@ -65,6 +74,28 @@ export interface MeshSessionRuntime {
    * running turn, "queue" delivers at the next user prompt).
    */
   submit(text: string, delivery: MeshDelivery): Promise<unknown>;
+  /** Abort this session's running turn (force+interrupt delivery). */
+  interrupt?(): void;
+  /** Per-frame formatting (verbosity, home room, reply hints). */
+  formatFor(frame: MeshFrame): FormatOpts;
+  /** Failure counters (Pi HUD parity). */
+  ledgerFailures: number;
+  transcriptFailures: number;
+  injectionFailures: number;
+  /** While set and in the future, inbound frames are held (provider rate limit). */
+  rateLimitedUntil?: number;
+  /** Deliver every frame held during the rate-limit hold. */
+  flushHeld?(): void;
+  /** Deferred broadcast inbox (opt-in `inboundBroadcasts: "deferred"`). */
+  deferredInbox?: DeferredInbox;
+  /** Real turn state from server events (best effort). */
+  markTurnActive(): void;
+  markTurnIdle(): void;
+  /** True while frames are held for a later delivery (never detach then). */
+  holdsInbound?(): boolean;
+  readonly runtimeDir: string;
+  /** Stop the sidebar status beacon timer (idempotent, best effort). */
+  stopStatus?(): void;
 }
 
 /** Per-session runtimes, keyed by OpenCode sessionID. */
@@ -77,12 +108,238 @@ export function registerRuntime(runtime: MeshSessionRuntime): void {
 
 /** Drop the runtime of a session (session ended). */
 export function unregisterRuntime(sessionID: string): void {
+  void disposeRuntime(sessionID);
+}
+
+/** Close one session's runtime: stop timers, clear queues, close the broker
+ *  connection (the alias/rooms free at the broker), write a final offline
+ *  beacon. Idempotent, best effort. */
+export async function disposeRuntime(sessionID: string): Promise<void> {
+  const runtime = runtimes.get(sessionID);
+  if (runtime === undefined) return;
   runtimes.delete(sessionID);
+  try {
+    runtime.stopStatus?.();
+  } catch {
+    // best effort
+  }
+  try {
+    runtime.deferredInbox?.clear();
+  } catch {
+    // best effort
+  }
+  try {
+    beaconPeers.set(runtime, []);
+  } catch {
+    // best effort
+  }
+  try {
+    await runtime.client.close();
+  } catch {
+    // best effort — teardown must never throw
+  }
+  try {
+    await writeStatusBeacon(runtime);
+  } catch {
+    // best effort — the sidebar falls back to "offline" by staleness anyway
+  }
+}
+
+// ---- sidebar status beacon ------------------------------------------------
+// The CLI (TUI) plugin reads this file to render the mesh card in the
+// sidebar — the same data the Pi HUD shows, scoped to one OpenCode session.
+
+/** How often the status beacon is refreshed (ms). */
+const STATUS_HEARTBEAT_MS = 2_000;
+
+/** Sessions idle this long detach from the broker — messages then queue in
+ *  the offline mailbox and the next session event re-attaches. Overridable
+ *  with MESH_OPENCODE_IDLE_DETACH_MS (tests). */
+function readIdleDetachMs(): number {
+  const raw = Number(process.env.MESH_OPENCODE_IDLE_DETACH_MS ?? "");
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return 15 * 60_000;
+}
+
+/** Sidebar status beacon: <stateDir>/mesh-status-<sessionId>.json. */
+export function statusBeaconPath(stateDir: string, sessionID: string): string {
+  return `${stateDir}/mesh-status-${sessionID}.json`;
+}
+
+// ---- user notifications (CLI toast bridge) --------------------------------
+// Commands must never inject chat messages; their feedback travels through
+// this append-only file, which the sidebar CLI plugin turns into toasts.
+
+/** Notification file: <stateDir>/mesh-notify-<sessionId>.jsonl. */
+export function notifyPath(stateDir: string, sessionID: string): string {
+  return `${stateDir}/mesh-notify-${sessionID}.jsonl`;
+}
+
+/** Append one user-facing notification (best effort, never throws). */
+export function notifySession(
+  stateDirPath: string,
+  sessionID: string,
+  text: string,
+  level: "info" | "warning" | "error" = "info",
+): void {
+  try {
+    const file = notifyPath(stateDirPath, sessionID);
+    mkdirSync(dirname(file), { recursive: true });
+    appendFileSync(file, JSON.stringify({ at: new Date().toISOString(), level, text }) + "\n", "utf8");
+  } catch {
+    // a notification must never break a command
+  }
+}
+
+/** Last identity snapshot per runtime (skip redundant disk writes). */
+const lastIdentity = new WeakMap<MeshSessionRuntime, string>();
+
+/** Persist the session identity when alias/rooms/reservations changed —
+ *  keeps the alias stable across reloads (same contract as the Pi adapter).
+ *  Also called right after `/mesh join|leave|alias`. */
+export function persistIdentity(runtime: MeshSessionRuntime): void {
+  try {
+    const identity = identityFromClient(runtime.sessionId, runtime.client);
+    const key = JSON.stringify({
+      alias: identity.alias,
+      rooms: identity.rooms,
+      reservations: identity.reservations,
+    });
+    if (lastIdentity.get(runtime) === key) return;
+    lastIdentity.set(runtime, key);
+    new MeshIdentity(runtime.stateDir).save(identity);
+  } catch {
+    // identity persistence is best effort — never break a session
+  }
+}
+
+/** Compact per-peer state carried by the sidebar beacon. */
+interface BeaconPeer {
+  alias: string;
+  rooms: string[];
+  state: "busy" | "idle" | "rate_limited" | "blocked" | "stuck" | "active";
+  /** D40: peer reaches the broker from another machine. */
+  remote: boolean;
+}
+
+function beaconPeer(p: MeshPeerInfo, runtime: MeshSessionRuntime): BeaconPeer {
+  const announced = p.activity?.state;
+  const state: BeaconPeer["state"] =
+    announced ??
+    computePeerStatus(
+      p.lastSeenAt,
+      (p.reservations?.length ?? 0) > 0,
+      runtime.client.activityIdleMs,
+      runtime.client.activityStuckMs,
+    ).status;
+  return {
+    alias: p.alias,
+    rooms: [...p.rooms],
+    state,
+    remote: p.via !== undefined,
+  };
+}
+
+/** Cached peer list per runtime — the beacon write never awaits the broker. */
+const beaconPeers = new WeakMap<MeshSessionRuntime, BeaconPeer[]>();
+/** At most one in-flight peer refresh per runtime. */
+const peerRefreshInFlight = new WeakSet<MeshSessionRuntime>();
+
+/** Refresh the cached peer list in the background (never throws). */
+function refreshBeaconPeers(runtime: MeshSessionRuntime): void {
+  if (!runtime.client.isOnline()) {
+    beaconPeers.set(runtime, []);
+    return;
+  }
+  if (peerRefreshInFlight.has(runtime)) return;
+  peerRefreshInFlight.add(runtime);
+  runtime.client
+    .status()
+    .then((snap) => {
+      beaconPeers.set(
+        runtime,
+        snap.peers
+          .filter((p) => p.alias !== runtime.client.alias)
+          .map((p) => beaconPeer(p, runtime)),
+      );
+    })
+    .catch(() => {
+      // keep the previous cache — a snapshot failure must not clear it
+    })
+    .finally(() => {
+      peerRefreshInFlight.delete(runtime);
+    });
+}
+
+/** Best-effort write of the session's live mesh state (never throws). */
+async function writeStatusBeacon(runtime: MeshSessionRuntime): Promise<void> {
+  try {
+    persistIdentity(runtime);
+    // Peer list for the sidebar: refreshed in the background, written from
+    // cache so a slow/hung broker round-trip can never stall the beacon.
+    refreshBeaconPeers(runtime);
+    const payload = JSON.stringify({
+      sessionId: runtime.sessionId,
+      alias: runtime.client.alias,
+      rooms: [...runtime.client.rooms],
+      homeRoom: runtime.client.homeRoom,
+      online: runtime.client.isOnline(),
+      busy: runtime.isBusy(),
+      peers: beaconPeers.get(runtime) ?? [],
+      updatedAt: new Date().toISOString(),
+    });
+    await writeFile(statusBeaconPath(runtime.stateDir, runtime.sessionId), payload + "\n", "utf8");
+  } catch {
+    // a failed beacon must never break a session
+  }
+}
+
+/** Extra rooms used as DEFAULT rooms on a fresh session (plugin options). */
+let configuredRooms: readonly string[] = [];
+
+/** Configure the default rooms of fresh OpenCode sessions (`options.rooms`).
+ *  Persisted identities always win — the user joins rooms with `/mesh join`. */
+export function configureRooms(rooms: readonly string[] | undefined): void {
+  configuredRooms = rooms !== undefined ? [...rooms] : [];
+}
+
+/** Rooms at session start — Pi semantics: the persisted identity wins; the
+ *  configured defaults (config.json ∪ plugin options) apply on first start. */
+function initialRooms(cfg: MeshConfig, stored: PersistedIdentity | null): string[] {
+  if (stored !== null && stored.rooms.length > 0) return [...stored.rooms];
+  const out: string[] = [];
+  for (const room of [...cfg.rooms, ...configuredRooms]) {
+    const value = typeof room === "string" ? room.trim() : "";
+    if (value.length > 0 && !out.includes(value)) out.push(value);
+  }
+  return out.length > 0 ? out : ["default"];
 }
 
 /** The runtime bound to a sessionID, if any. */
 export function runtimeBySession(sessionID: string): MeshSessionRuntime | undefined {
   return runtimes.get(sessionID);
+}
+
+/** Any online runtime — fallback when a hook event carries no sessionID. */
+export function anyOnlineRuntime(): MeshSessionRuntime | undefined {
+  for (const runtime of runtimes.values()) {
+    if (runtime.client.isOnline()) return runtime;
+  }
+  return undefined;
+}
+
+/** Close every session runtime — called when the plugin unloads/reloads so
+ *  no status timers or broker connections survive the module instance. */
+export async function disposeAllRuntimes(): Promise<void> {
+  const list = [...runtimes.keys()];
+  runtimes.clear();
+  for (const sessionID of list) {
+    try {
+      await disposeRuntime(sessionID);
+    } catch {
+      // best effort — a reload must never fail on teardown
+    }
+  }
 }
 
 /**
@@ -104,8 +361,10 @@ export async function createSessionRuntime(
   const clientOpts: MeshClientOpts = {
     runtimeDir: rtDir,
     config: cfg,
+    // Pi semantics: the persisted identity wins; configured defaults
+    // apply on first start. Rooms change through `/mesh join` / `/mesh leave`.
+    rooms: initialRooms(cfg, stored),
     ...(stored?.alias !== undefined ? { alias: stored.alias } : {}),
-    ...(stored !== null && stored.rooms.length > 0 ? { rooms: [...stored.rooms] } : {}),
     ...(stored !== null && stored.reservations.length > 0
       ? { initialReservations: [...stored.reservations] }
       : {}),
@@ -120,10 +379,13 @@ export async function createSessionRuntime(
     cfg.transcriptRetentionDays,
   );
 
-  // Whether a turn runs is not observable without session hooks, so the
-  // batcher only ever sees OUR OWN injections ("busy" until they settle).
+  // ---- turn state + activity ----------------------------------------------
+  // Real turn state arrives through server events (index.ts forwards them);
+  // busyUntilMs stays as the fallback for our OWN injections.
+  let turnActive = false;
   let busyUntilMs = 0;
-  const isBusy = (): boolean => Date.now() < busyUntilMs;
+  let lastEventAtMs = Date.now();
+  const isBusy = (): boolean => turnActive || Date.now() < busyUntilMs;
   const sendActivity = (state: ActivityState): void => client.sendActivity(state);
 
   let idleTimer: NodeJS.Timeout | null = null;
@@ -133,7 +395,7 @@ export async function createSessionRuntime(
     if (idleTimer !== null) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       busyUntilMs = 0;
-      sendActivity("idle");
+      if (!turnActive) sendActivity("idle");
     }, Math.max(1_000, cfg.activityIdleMs));
     idleTimer.unref();
   };
@@ -153,6 +415,14 @@ export async function createSessionRuntime(
     timer.unref();
   };
 
+  // ---- inbound pipeline (Pi parity) ----------------------------------------
+  const hintTracker = new ReplyHintTracker();
+  const formatFor = (frame: MeshFrame): FormatOpts => ({
+    verbose: cfg.contextVerbosity === "full",
+    homeRoom: client.homeRoom,
+    showReplyHint: hintTracker.shouldShow(frame.from),
+  });
+
   const runtime: MeshSessionRuntime = {
     client,
     guards,
@@ -160,8 +430,14 @@ export async function createSessionRuntime(
     transcript,
     stateDir: dir,
     sessionId,
-    alias: client.alias,
-    rooms: [...client.rooms],
+    // Live views: join/leave/rename reach every consumer immediately
+    // (`/mesh status` used to show the rooms snapshot taken at creation).
+    get alias(): string {
+      return client.alias;
+    },
+    get rooms(): readonly string[] {
+      return [...client.rooms];
+    },
     homeRoom: client.homeRoom,
     startedAt: Date.now(),
     sendActivity,
@@ -172,17 +448,157 @@ export async function createSessionRuntime(
     batcher: null as unknown as InboundBatcher,
     armAutoRelease,
     submit: (text, delivery) => submitInto(sessionId, text, delivery),
+    interrupt: (): void => {
+      void interruptInto(sessionId).catch(() => {
+        // abort is best effort — the message is injected anyway
+      });
+    },
+    formatFor,
+    ledgerFailures: 0,
+    transcriptFailures: 0,
+    injectionFailures: 0,
+    markTurnActive: (): void => {
+      lastEventAtMs = Date.now();
+      if (!turnActive) {
+        turnActive = true;
+        sendActivity("busy");
+      }
+    },
+    markTurnIdle: (): void => {
+      lastEventAtMs = Date.now();
+      turnActive = false;
+      notifyIdle();
+      try {
+        runtime.flushHeld?.();
+      } catch {
+        // best effort
+      }
+      try {
+        // deferred broadcasts ride the next user prompt (never wake the agent)
+        runtime.deferredInbox?.queueForPrompt();
+      } catch {
+        // best effort
+      }
+    },
+    runtimeDir: rtDir,
   };
+  runtime.holdsInbound = (): boolean =>
+    heldFrames.length > 0 || (runtime.deferredInbox?.count ?? 0) > 0;
   runtime.batcher = new InboundBatcher(
     cfg.inboundBatchMs ?? 0,
     cfg.inboundBatchMaxHoldMs ?? 0,
     isBusy,
     (frames) => {
-      void deliver(runtime, frames, sink);
+      void deliver(runtime, frames, sink).catch(() => {
+        runtime.injectionFailures += 1;
+      });
     },
   );
 
+  // Deferred broadcast inbox (opt-in `inboundBroadcasts: "deferred"`).
+  const inboxHost = {
+    sendMessage: (message: { content: string }, options?: unknown): void => {
+      const deliverAs = (options as { deliverAs?: string } | undefined)?.deliverAs;
+      const delivery: MeshDelivery = deliverAs === "followUp" ? "steer" : "queue";
+      void runtime.submit(message.content, delivery).catch(() => {
+        runtime.injectionFailures += 1;
+      });
+    },
+  } as unknown as Pick<ExtensionAPI, "sendMessage">;
+  const deferredInbox = new DeferredInbox(inboxHost, formatFor, () => {
+    // the status beacon refreshes every 2 s — nothing to push here
+  });
+  runtime.deferredInbox = deferredInbox;
+
+  // Frames held while the provider rejects turns (rate-limit hold).
+  const heldFrames: { frame: MeshFrame; matchedReply: boolean }[] = [];
+  runtime.flushHeld = (): void => {
+    const frames = heldFrames.splice(0);
+    for (const { frame, matchedReply } of frames) deliverFrame(frame, matchedReply);
+  };
+
+  /** Ledger/transcript/receipts/reply-chain — mirror of Pi's side effects. */
+  const sideEffects = (frame: MeshFrame): void => {
+    (frame as unknown as { __replyChain?: boolean }).__replyChain =
+      frame.type === "reply" && frame.replyTo !== undefined && client.isReplyToReply(frame.replyTo);
+    if ((frame.type === "msg" || frame.type === "mailbox") && frame.id !== undefined && frame.from !== undefined) {
+      try {
+        // the message reached this session → honest read receipt
+        client.sendRead(frame.id, frame.from);
+      } catch {
+        // best effort — a failed receipt must never break delivery
+      }
+    }
+    if (frame.type === "msg" || frame.type === "mailbox" || frame.type === "remind" || frame.type === "reply") {
+      try {
+        ledger.append({
+          event: "inbound",
+          id: frame.id,
+          from: frame.from,
+          to: client.alias,
+          room: frame.room,
+          priority: frame.priority ?? "normal",
+          bodyHash: frame.bodyHash,
+          refs: frame.refs,
+        });
+      } catch {
+        runtime.ledgerFailures += 1;
+      }
+    }
+    try {
+      transcript.record("in", frame);
+    } catch {
+      runtime.transcriptFailures += 1;
+    }
+  };
+
+  /** One inbound frame: side effects → policy → immediate or batched. */
+  const deliverFrame = (frame: MeshFrame, matchedReply: boolean): void => {
+    try {
+      sideEffects(frame);
+    } catch {
+      // side effects are best effort — delivery must still happen
+    }
+    if (classifyInbound(frame, client.alias, cfg.inboundBroadcasts, matchedReply) === "deferred") {
+      deferredInbox.push(frame);
+      return;
+    }
+    if (bypassesBatch(frame) || (cfg.inboundBatchMs ?? 0) <= 0) {
+      runtime.batcher.flushNow(); // keep ordering with any pending batch
+      void injectFrame(runtime, frame, { interrupt: frame.interrupt === true }).catch(() => {
+        runtime.injectionFailures += 1;
+      });
+      return;
+    }
+    runtime.batcher.push(frame);
+  };
+
+  client.on("inbound", (frame: MeshFrame, meta?: { matchedReply?: boolean }) => {
+    if (runtime.rateLimitedUntil !== undefined && runtime.rateLimitedUntil > Date.now()) {
+      heldFrames.push({ frame, matchedReply: meta?.matchedReply === true });
+      return;
+    }
+    deliverFrame(frame, meta?.matchedReply === true);
+  });
+
   registerRuntime(runtime);
+
+  // Sidebar status beacon: refresh while the session lives (the CLI plugin
+  // polls it). unref() so it never keeps the process alive. An idle session
+  // detaches from the broker after `detachAfterMs` (messages then queue in
+  // the offline mailbox; the next session event re-attaches).
+  const detachAfterMs = readIdleDetachMs();
+  const statusTimer = setInterval(() => {
+    void writeStatusBeacon(runtime);
+    if (Date.now() - lastEventAtMs > detachAfterMs && runtime.holdsInbound?.() !== true) {
+      void disposeRuntime(sessionId);
+    }
+  }, STATUS_HEARTBEAT_MS);
+  statusTimer.unref();
+  runtime.stopStatus = (): void => {
+    clearInterval(statusTimer);
+  };
+  void writeStatusBeacon(runtime); // immediate first paint
 
   void client.connect().catch(() => {
     // Broker absent: tools answer "broker_unavailable" until the host
@@ -219,12 +635,31 @@ export async function attachDefaultSink(fn: MeshInboundSink): Promise<void> {
   defaultSink = fn;
 }
 
-/** The OpenCode V2 session context, attached by the plugin entrypoint. */
+/** The OpenCode V2 session domain ({prompt, interrupt, wait}), attached by
+ *  the plugin entrypoint. NOTE: the session methods live at `ctx.session`,
+ *  NOT at the top of the plugin context — storing the raw ctx breaks
+ *  `session.prompt` (observed: "session.prompt is not a function"). */
 let attachedSessionContext: V2SessionHooks | null = null;
 
 /** Called by index.ts once the V2 plugin context is available. */
 export function attachOpenCodeSession(ctx: unknown): void {
-  attachedSessionContext = ctx as unknown as V2SessionHooks;
+  const record =
+    ctx !== null && typeof ctx === "object" ? (ctx as { session?: unknown; prompt?: unknown }) : undefined;
+  const domain = record?.session;
+  if (
+    domain !== null &&
+    domain !== undefined &&
+    typeof (domain as { prompt?: unknown }).prompt === "function"
+  ) {
+    attachedSessionContext = domain as V2SessionHooks;
+    return;
+  }
+  // Fallback for builds that expose the session methods at the top level.
+  if (typeof record?.prompt === "function") {
+    attachedSessionContext = record as unknown as V2SessionHooks;
+    return;
+  }
+  attachedSessionContext = null;
 }
 
 async function submitInto(
@@ -233,10 +668,19 @@ async function submitInto(
   delivery: MeshDelivery,
 ): Promise<unknown> {
   const session = attachedSessionContext;
-  if (session === null) {
-    throw new Error("pi-mesh: OpenCode plugin context is not attached");
+  if (session === null || typeof session.prompt !== "function") {
+    throw new Error("pi-mesh: OpenCode session.prompt is not available — inbound delivery disabled");
   }
   return session.prompt({ sessionID, text, delivery });
+}
+
+/** Abort the session's running turn (force+interrupt inbound delivery). */
+async function interruptInto(sessionID: string): Promise<unknown> {
+  const session = attachedSessionContext;
+  if (session === null || typeof session.interrupt !== "function") {
+    throw new Error("pi-mesh: OpenCode session.interrupt is not available");
+  }
+  return session.interrupt({ sessionID, continue: false });
 }
 
 /** Inject a batched set of inbound frames into the OpenCode session. */
