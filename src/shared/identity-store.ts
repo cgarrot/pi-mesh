@@ -35,6 +35,14 @@ export interface PersistedIdentity {
   version: typeof IDENTITY_VERSION;
   sessionId: string;
   alias: string;
+  /**
+   * The last alias the user EXPLICITLY chose (/mesh alias, /mesh join … as …).
+   * When a conflict forced a random fallback, `alias` holds the fallback but
+   * `preferredAlias` keeps the chosen one — the next attach retries it, so
+   * the identity self-heals once the holder disconnects. Optional for
+   * backward compatibility with identities written before the field.
+   */
+  preferredAlias?: string;
   rooms: string[];
   reservations: FileReservation[];
   updatedAt: string;
@@ -95,10 +103,18 @@ export class MeshIdentity {
       const reservations = isValidReservations(id.reservations)
         ? freshReservations(id.reservations)
         : [];
+      // The preferred alias is OPTIONAL (older identities predate it) —
+      // preserve it on load: it is what makes a conflicted identity
+      // self-heal at the next attach.
+      const preferredAlias =
+        typeof id.preferredAlias === "string" && id.preferredAlias !== ""
+          ? id.preferredAlias
+          : undefined;
       return {
         version: IDENTITY_VERSION,
         sessionId,
         alias: id.alias,
+        ...(preferredAlias !== undefined ? { preferredAlias } : {}),
         rooms,
         reservations,
         updatedAt: typeof id.updatedAt === "string" ? id.updatedAt : nowIso(),

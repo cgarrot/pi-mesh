@@ -163,6 +163,55 @@ test("runtime: the status beacon file reflects the live session", async (t) => {
   assert.deepEqual(beacon.rooms, ["default"]);
 });
 
+test("runtime: alias self-healing — fallback keeps the preferred alias, retried at the next attach", async (t) => {
+  const fx = await setup();
+  t.after(async () => {
+    await disposeRuntime("ses-heal");
+  });
+
+  // A live peer holds the wanted alias.
+  const holder = new MeshClient({ alias: "heal-x", runtimeDir: fx.dirs.runtimeDir, config: CFG });
+  await holder.connect();
+  t.after(async () => {
+    await holder.close();
+  });
+
+  // The session WANTS heal-x (identity with preferredAlias).
+  new (await import("../src/shared/identity-store.js")).MeshIdentity(fx.dirs.stateDir).save({
+    version: 1,
+    sessionId: "ses-heal",
+    alias: "heal-x",
+    preferredAlias: "heal-x",
+    rooms: ["default"],
+    reservations: [],
+    updatedAt: new Date().toISOString(),
+  } as never);
+
+  // Attach #1: alias_taken → random fallback, PREFERRED kept on disk.
+  // (the alias_taken retry ladder takes ~4s — wait generously)
+  const rt1 = await createSessionRuntime("ses-heal", CFG, async () => {});
+  await waitFor(() => (rt1.client.isOnline() ? true : undefined), 15_000);
+  assert.notEqual(rt1.client.alias, "heal-x");
+  const id1 = JSON.parse(
+    readFileSync(fx.dirs.stateDir + "/identity-ses-heal.json", "utf8"),
+  ) as { alias: string; preferredAlias?: string };
+  assert.notEqual(id1.alias, "heal-x");
+  assert.equal(id1.preferredAlias, "heal-x");
+  await disposeRuntime("ses-heal");
+  // let the broker reap attach #1's socket before #2 retries the alias
+  await new Promise((r) => setTimeout(r, 300));
+
+  // The holder disconnects → the alias frees.
+  await holder.close();
+  await new Promise((r) => setTimeout(r, 300));
+
+  // Attach #2: the preferred alias is retried and reclaimed — self-healed.
+  const rt2 = await createSessionRuntime("ses-heal", CFG, async () => {});
+  await waitFor(() => (rt2.client.isOnline() ? true : undefined), 15_000);
+  assert.equal(rt2.client.alias, "heal-x");
+  assert.equal(rt2.preferredAlias, "heal-x");
+});
+
 test("runtime: submit fails loud and clear without a session domain", async (t) => {
   const fx = await setup();
   t.after(async () => {

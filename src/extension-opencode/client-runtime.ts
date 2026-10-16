@@ -51,6 +51,9 @@ export interface MeshSessionRuntime {
   transcript: MeshTranscript;
   readonly stateDir: string;
   readonly sessionId: string;
+  /** The alias the user chose explicitly — retried at every attach even
+   *  after a conflict forced a random fallback (self-healing identity). */
+  preferredAlias: string;
   /** Alias after connect (random until then). */
   readonly alias: string;
   /** Rooms this session has joined. */
@@ -196,12 +199,16 @@ const lastIdentity = new WeakMap<MeshSessionRuntime, string>();
 
 /** Persist the session identity when alias/rooms/reservations changed —
  *  keeps the alias stable across reloads (same contract as the Pi adapter).
- *  Also called right after `/mesh join|leave|alias`. */
+ *  Also called right after `/mesh join|leave|alias`. The PREFERRED alias
+ *  survives fallbacks: `alias` may be a random fallback, but what the user
+ *  chose is retried at the next attach. */
 export function persistIdentity(runtime: MeshSessionRuntime): void {
   try {
     const identity = identityFromClient(runtime.sessionId, runtime.client);
+    identity.preferredAlias = runtime.preferredAlias;
     const key = JSON.stringify({
       alias: identity.alias,
+      preferredAlias: identity.preferredAlias,
       rooms: identity.rooms,
       reservations: identity.reservations,
     });
@@ -363,8 +370,12 @@ export async function createSessionRuntime(
     config: cfg,
     // Pi semantics: the persisted identity wins; configured defaults
     // apply on first start. Rooms change through `/mesh join` / `/mesh leave`.
+    // The PREFERRED alias is retried first — after a conflict forced a
+    // random fallback, the chosen identity self-heals at the next attach.
     rooms: initialRooms(cfg, stored),
-    ...(stored?.alias !== undefined ? { alias: stored.alias } : {}),
+    ...((stored?.preferredAlias ?? stored?.alias) !== undefined
+      ? { alias: (stored?.preferredAlias ?? stored?.alias) as string }
+      : {}),
     ...(stored !== null && stored.reservations.length > 0
       ? { initialReservations: [...stored.reservations] }
       : {}),
@@ -430,6 +441,7 @@ export async function createSessionRuntime(
     transcript,
     stateDir: dir,
     sessionId,
+    preferredAlias: stored?.preferredAlias ?? stored?.alias ?? client.alias,
     // Live views: join/leave/rename reach every consumer immediately
     // (`/mesh status` used to show the rooms snapshot taken at creation).
     get alias(): string {
@@ -582,6 +594,25 @@ export async function createSessionRuntime(
   });
 
   registerRuntime(runtime);
+
+  // Pi parity (attach.ts): a live peer holds our alias and the client fell
+  // back to a random one — say it LOUD (toast bridge), persist the fallback
+  // for this attach, and KEEP the preferred alias so the chosen identity is
+  // retried at the next attach (self-healing once the holder disconnects).
+  client.on("alias_fallback", ({ from, to }: { from: string; to: string }) => {
+    notifySession(
+      dir,
+      sessionId,
+      `mesh: alias @${from} taken — connected as @${to}` +
+        (runtime.preferredAlias === from ? ` (@${from} is retried on the next attach)` : ""),
+      "warning",
+    );
+    try {
+      persistIdentity(runtime);
+    } catch {
+      // best effort
+    }
+  });
 
   // Sidebar status beacon: refresh while the session lives (the CLI plugin
   // polls it). unref() so it never keeps the process alive. An idle session

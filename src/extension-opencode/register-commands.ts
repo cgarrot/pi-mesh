@@ -68,6 +68,28 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+/**
+ * Pi parity (commands.ts cmdAlias): on alias_taken, tell the user WHO holds
+ * the alias and since when — a live peer keeps it until it disconnects, so
+ * a rename can never steal it.
+ */
+async function aliasTakenHint(
+  runtime: MeshSessionRuntime,
+  alias: string,
+  reason: string,
+): Promise<string> {
+  if (reason !== "alias_taken" || !runtime.client.isOnline()) return "";
+  try {
+    const snap = await runtime.client.status();
+    const holder = snap.peers.find((p) => p.alias === alias);
+    if (holder === undefined) return "";
+    return ` — @${holder.alias} is connected${holder.since !== undefined ? ` since ${holder.since}` : ""}`;
+  } catch {
+    // best effort — the hint must never break the error path
+    return "";
+  }
+}
+
 /** Execute one `/mesh …` invocation; returns the text to notify. */
 export async function runMeshCommand(
   runtime: MeshSessionRuntime,
@@ -84,8 +106,10 @@ export async function runMeshCommand(
       if (parsed.asAlias !== undefined) {
         const renamed = await runtime.client.rename(parsed.asAlias);
         if (!renamed.ok) {
-          return `mesh: rename to "${parsed.asAlias}" failed: ${renamed.reason} — joining as @${runtime.client.alias}`;
+          const hint = await aliasTakenHint(runtime, parsed.asAlias, renamed.reason);
+          return `mesh: rename to "${parsed.asAlias}" failed: ${renamed.reason}${hint} — joining as @${runtime.client.alias}`;
         }
+        if (renamed.unchanged !== true) runtime.preferredAlias = renamed.alias;
         persistIdentity(runtime);
       }
       if (parsed.room === undefined) {
@@ -130,8 +154,10 @@ export async function runMeshCommand(
       if (next === undefined) return `mesh alias: @${runtime.client.alias}`;
       const renamed = await runtime.client.rename(next);
       if (!renamed.ok) {
-        return `mesh: rename to "${next}" failed: ${renamed.reason}`;
+        const hint = await aliasTakenHint(runtime, next, renamed.reason);
+        return `mesh: rename to "${next}" failed: ${renamed.reason}${hint}`;
       }
+      if (renamed.unchanged !== true) runtime.preferredAlias = renamed.alias;
       persistIdentity(runtime);
       return renamed.unchanged === true
         ? `mesh alias: @${runtime.client.alias}`

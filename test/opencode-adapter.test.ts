@@ -4,9 +4,10 @@
 // re-reply warning) against a fake runtime — no broker needed.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+const { join } = path;
 
 import { meshArgs, renderMeshStatus, runMeshCommand } from "../src/extension-opencode/register-commands.js";
 import { applyMeshTools, applyMeshToolsV1 } from "../src/extension-opencode/register-tools.js";
@@ -25,6 +26,7 @@ interface FakeClientBits {
   isOnline: () => boolean;
   alias: string;
   rooms: string[];
+  reservations: never[];
   knowsPeer: (alias: string) => boolean;
   knownPeerList: readonly string[];
   busyForMs: (alias: string) => number | undefined;
@@ -33,6 +35,9 @@ interface FakeClientBits {
   send: (input: unknown) => Promise<unknown>;
   reply: (msgId: string, message: string, opts?: unknown) => Promise<unknown>;
   forgetRoom: (room: string) => void;
+  rename?: (alias: string) => Promise<unknown>;
+  status?: () => Promise<unknown>;
+  leave?: (room: string) => Promise<void>;
 }
 
 const tempDirs: string[] = [];
@@ -61,6 +66,7 @@ function fakeRuntime(overrides: Record<string, unknown> = {}): MeshSessionRuntim
     knownPeerList: [] as readonly string[],
     busyForMs: (_alias: string) => undefined,
     peekInbox: (_msgId: string) => undefined,
+    reservations: [] as never[],
     connect: async () => {
       throw new Error("broker_unavailable");
     },
@@ -79,6 +85,7 @@ function fakeRuntime(overrides: Record<string, unknown> = {}): MeshSessionRuntim
     transcript: new MeshTranscript(dir, false),
     stateDir: dir,
     sessionId: "ses-unit",
+    preferredAlias: client.alias,
     alias: client.alias,
     rooms: [...client.rooms],
     homeRoom: "default",
@@ -144,6 +151,30 @@ test("/mesh leave online: broker round-trip and persist", async () => {
   const out = await runMeshCommand(rt, ["leave", "default"]);
   assert.match(out, /left default \(rooms: zoma\)/);
   assert.deepEqual(left, ["default"]);
+});
+
+test("/mesh alias success: preferredAlias updated and persisted", async () => {
+  const rt = fakeRuntime({
+    client: { rename: async () => ({ ok: true, alias: "azo-unit" }) },
+  });
+  const out = await runMeshCommand(rt, ["alias", "azo-unit"]);
+  assert.match(out, /alias changed @azo-unit/);
+  assert.equal(rt.preferredAlias, "azo-unit");
+  const id = JSON.parse(readFileSync(join(rt.stateDir, "identity-ses-unit.json"), "utf8"));
+  assert.equal(id.preferredAlias, "azo-unit");
+});
+
+test("/mesh alias taken: Pi-style holder hint (who, since when)", async () => {
+  const rt = fakeRuntime({
+    client: {
+      rename: async () => ({ ok: false, reason: "alias_taken" }),
+      status: async () => ({
+        peers: [{ alias: "azo-unit", since: "2026-10-16T18:00:00Z" }],
+      }),
+    },
+  });
+  const out = await runMeshCommand(rt, ["alias", "azo-unit"]);
+  assert.match(out, /failed: alias_taken — @azo-unit is connected since 2026-10-16T18:00:00Z/);
 });
 
 // ---------------------------------------------------------------- meshArgs
