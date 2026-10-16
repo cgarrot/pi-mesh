@@ -619,10 +619,10 @@ What it exposes:
 - **Reservation enforcement** — `edit`/`write` on a path another agent
   reserved is blocked with holder/reason/age (verified end-to-end).
 - **Session lifecycle** — runtimes attach automatically on session
-  activity, detach on `session.deleted`, and idle sessions (15 min without
-  events, `MESH_OPENCODE_IDLE_DETACH_MS` override) release their broker
-  connection; pending messages queue in the broker mailbox and arrive on
-  the next attach.
+  activity and stay online for the session's whole lifetime (Pi parity:
+  idle agents remain reachable — messages queue into their next turn,
+  not the mailbox). `session.deleted` detaches cleanly; an opt-in idle
+  detach remains available via `MESH_OPENCODE_IDLE_DETACH_MS > 0`.
 - **Honest activity** — busy/idle is announced from real session events
   (a turn's events → busy, `session.idle` → idle); rate-limited/blocked
   detection is planned (Phase 2).

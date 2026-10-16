@@ -73,6 +73,18 @@
 > 11. **Skill `mesh-coordination`** exposé à OpenCode (symlink
 >     `~/.config/opencode/skills/` — confirmé chargé en live).
 >
+> **Mise à jour (alignement identité/ présence)** — deux divergences Pi
+> corrigées après retour utilisateur réel :
+> 12. **Idle-detach supprimé par défaut** : les sessions OpenCode
+>     restaient 15 min puis se détachaient (« l'agent part offline /
+>     quitte la room »). Pi garde la session connectée toute sa vie —
+>     c'est maintenant le défaut (0 = jamais ;
+>     `MESH_OPENCODE_IDLE_DETACH_MS > 0` pour l'opt-in). Tests inclus.
+> 13. **`preferredAlias` (auto-réparation)** : l'alias choisi survit aux
+>     conflits — fallback temporaire persisté mais `preferredAlias`
+>     conservé, retenté à chaque attach ; toast `alias_fallback` (parité
+>     Pi) ; hint « qui tient l'alias, depuis quand » sur les échecs.
+>
 > **Mise à jour (sidebar « no session attached »)** — cause racine : le
 > serveur OpenCode (daemon, cwd = $HOME) écrit beacon/identity dans
 > `~/.mesh`, mais le TUI lancé depuis un dossier projet lit

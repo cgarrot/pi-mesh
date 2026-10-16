@@ -155,13 +155,16 @@ export async function disposeRuntime(sessionID: string): Promise<void> {
 /** How often the status beacon is refreshed (ms). */
 const STATUS_HEARTBEAT_MS = 2_000;
 
-/** Sessions idle this long detach from the broker — messages then queue in
- *  the offline mailbox and the next session event re-attaches. Overridable
- *  with MESH_OPENCODE_IDLE_DETACH_MS (tests). */
+/** Sessions idle this long CAN detach from the broker — overridable with
+ *  MESH_OPENCODE_IDLE_DETACH_MS. DEFAULT 0 = NEVER (Pi parity): a Pi
+ *  session stays online for its whole lifetime, and peers must be able to
+ *  reach an idle agent (messages queue in its turn, not in the mailbox).
+ *  The old 15-min default made agents "leave" rooms while their session
+ *  lived — observed as random offlines in the sidebar. */
 function readIdleDetachMs(): number {
   const raw = Number(process.env.MESH_OPENCODE_IDLE_DETACH_MS ?? "");
   if (Number.isFinite(raw) && raw > 0) return raw;
-  return 15 * 60_000;
+  return 0;
 }
 
 /** Sidebar status beacon: <stateDir>/mesh-status-<sessionId>.json. */
@@ -615,13 +618,19 @@ export async function createSessionRuntime(
   });
 
   // Sidebar status beacon: refresh while the session lives (the CLI plugin
-  // polls it). unref() so it never keeps the process alive. An idle session
-  // detaches from the broker after `detachAfterMs` (messages then queue in
-  // the offline mailbox; the next session event re-attaches).
+  // polls it). unref() so it never keeps the process alive. Pi parity: the
+  // runtime stays attached for the session's WHOLE lifetime — an idle
+  // detach (opt-in via MESH_OPENCODE_IDLE_DETACH_MS > 0) releases the
+  // broker connection; pending messages then queue in the broker mailbox
+  // and arrive on the next attach.
   const detachAfterMs = readIdleDetachMs();
   const statusTimer = setInterval(() => {
     void writeStatusBeacon(runtime);
-    if (Date.now() - lastEventAtMs > detachAfterMs && runtime.holdsInbound?.() !== true) {
+    if (
+      detachAfterMs > 0 &&
+      Date.now() - lastEventAtMs > detachAfterMs &&
+      runtime.holdsInbound?.() !== true
+    ) {
       void disposeRuntime(sessionId);
     }
   }, STATUS_HEARTBEAT_MS);

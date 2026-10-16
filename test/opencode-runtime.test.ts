@@ -18,6 +18,7 @@ import {
   createSessionRuntime,
   disposeRuntime,
   ensureSessionRuntime,
+  runtimeBySession,
   statusBeaconPath,
   type MeshSessionRuntime,
 } from "../src/extension-opencode/client-runtime.js";
@@ -210,6 +211,35 @@ test("runtime: alias self-healing — fallback keeps the preferred alias, retrie
   await waitFor(() => (rt2.client.isOnline() ? true : undefined), 15_000);
   assert.equal(rt2.client.alias, "heal-x");
   assert.equal(rt2.preferredAlias, "heal-x");
+});
+
+test("runtime: idle sessions stay attached by default (Pi parity — no random offlines)", async (t) => {
+  const fx = await setup();
+  delete process.env.MESH_OPENCODE_IDLE_DETACH_MS; // default = never
+  t.after(async () => {
+    await disposeRuntime("ses-idle-default");
+  });
+  const rt = await createSessionRuntime("ses-idle-default", CFG, async () => {});
+  await waitFor(() => (rt.client.isOnline() ? true : undefined));
+  rt.markTurnIdle();
+  // a few beacon ticks pass — the runtime must STAY attached
+  await new Promise((r) => setTimeout(r, 3_000));
+  assert.equal(runtimeBySession("ses-idle-default"), rt);
+  assert.ok(rt.client.isOnline());
+});
+
+test("runtime: idle detach remains available via MESH_OPENCODE_IDLE_DETACH_MS (opt-in)", async (t) => {
+  const fx = await setup();
+  process.env.MESH_OPENCODE_IDLE_DETACH_MS = "400";
+  t.after(async () => {
+    delete process.env.MESH_OPENCODE_IDLE_DETACH_MS;
+    await disposeRuntime("ses-idle-optin");
+  });
+  const rt = await createSessionRuntime("ses-idle-optin", CFG, async () => {});
+  await waitFor(() => (rt.client.isOnline() ? true : undefined));
+  rt.markTurnIdle();
+  await waitFor(() => (runtimeBySession("ses-idle-optin") === undefined ? true : undefined), 5_000);
+  assert.equal(runtimeBySession("ses-idle-optin"), undefined);
 });
 
 test("runtime: submit fails loud and clear without a session domain", async (t) => {
