@@ -86,13 +86,18 @@ async function readStatus(meshDir: string, sessionID: string): Promise<MeshStatu
   const liveAlias = typeof live?.alias === "string" ? live.alias : undefined
   const alias = storedAlias ?? liveAlias
   if (alias === undefined) return undefined
-  const rooms = stringList(stored?.rooms ?? live?.rooms)
   const at = typeof live?.updatedAt === "string" ? Date.parse(live.updatedAt) : Number.NaN
   const fresh = Number.isFinite(at) && Date.now() - at < STALE_MS
   // A beacon written under another alias belongs to a stale plugin
   // instance (hot-reload leftovers) — its live fields are not ours.
   const foreign = storedAlias !== undefined && liveAlias !== undefined && liveAlias !== storedAlias
   const trusted = !foreign
+  // Rooms: the LIVE beacon reflects what the broker actually has (the
+  // persisted identity can drift after alias-fallback churn); the stored
+  // rooms only serve as fallback (foreign/stale/absent beacon).
+  const rooms = stringList(
+    (trusted && fresh ? live?.rooms : undefined) ?? stored?.rooms ?? live?.rooms,
+  )
   const online = trusted && live?.online === true && fresh
   // Visible peers = share at least one room with this session (Pi's rule);
   // no rooms → no visibility.
