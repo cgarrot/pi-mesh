@@ -516,6 +516,61 @@ MESH_BROKER_URL=tcp://<machine-A>:8712 MESH_BROKER_TOKEN=change-me pi
   (`\\.\pipe\mesh-<hash>-broker`). Everything else is unchanged; the full
   test suite + smoke pass on Windows.
 
+## OpenCode
+
+Besides the Pi extension, pi-mesh also runs **inside OpenCode** as a
+plugin (double mode: V1 + V2), so a human or an agent in OpenCode and an
+agent in Pi can talk to each other through the same broker — no change to
+the Pi adapter is required, and the OpenCode side reuses the very same
+shared modules (`protocol`, `shared`, `broker`, `client`, the pure parts of
+`extension`).
+
+```typescript
+// The default export carries both plugin generations:
+//  - V2 half (ctx.command / ctx.tool / ctx.session) — current API;
+//  - V1 half (`server()` hook map) — legacy hook observation.
+```
+
+The plugin is activated by listing it in the OpenCode configuration
+(legacy key; see the [OpenCode docs](https://opencode.ai/docs)):
+
+```json
+{
+  "plugin": ["pi-mesh-extension"]
+}
+```
+
+What it exposes:
+
+- **Eight mesh tools** — `mesh_send`, `mesh_reply`, `mesh_status`,
+  `mesh_history`, `mesh_wait_all`, `mesh_ledger`, `mesh_reserve`,
+  `mesh_release`. They behave exactly like their Pi counterparts
+  (guards, honest statuses, batching, ledger, reservations).
+- **`/mesh` command** (V2) — reports the current mesh status.
+- **Inbound messages** addressed to a session are injected into that
+  session's next run, exactly like Pi injects them into the Pi session:
+  `priority=normal` queues for the next user prompt, `urgent` steers the
+  running turn, `force` interrupts it.
+- **Honest activity** — busy/idle/rate-limited/blocked is announced to the
+  broker, so `mesh_status` shows the same information Pi sessions see.
+- **Identity per session** — each OpenCode session keeps its own alias,
+  rooms and reservations, persisted like in Pi (`.mesh/identity-<sessionId>.json`).
+
+Limitations accepted for now (they are documented in code, see
+`src/extension-opencode/`):
+
+- The published typings of `@opencode-ai/plugin` lag behind the V2
+  documentation, so the V2 session/tool/permission domains are consumed
+  through a local, minimal view (`v2-surface.ts`). When the running
+  OpenCode exposes them, they are used; otherwise the integration falls
+  back to what is available.
+- There is no hook to observe turn start/end, so "busy" is announced
+  after the plugin itself submits an injected message, and cleared after
+  an approximate idle window.
+- The legacy V1 half only *observes* (`chat.message`,
+  `tool.execute.before`, `event`); the V1 tool map is registered, but older
+  OpenCode builds may not call `server()`.
+
 ## Known limitations
 
 - Broker restarts lose rooms/mailbox (clients re-declare on hello).
@@ -529,7 +584,7 @@ MESH_BROKER_URL=tcp://<machine-A>:8712 MESH_BROKER_TOKEN=change-me pi
 
 ```bash
 npm run build   # strict tsc (ESM, NodeNext)
-npm test        # build + node --test dist/test/*.test.js (405 tests)
+npm test        # build + node --test dist/test/*.test.js (470 tests)
 npm run smoke   # E2E without Pi: broker + 2 headless clients
 ```
 
