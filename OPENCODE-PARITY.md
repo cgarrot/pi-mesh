@@ -3,8 +3,9 @@
 > Audit daté du 16/10/2026, après la mise en place de l'adaptateur
 > (`server.ts` → `src/extension-opencode/`, `tui.tsx`) et le debug du
 > broker/alias/beacon. Référence = l'extension Pi complète (la seule vraie
-> spécificité de pi-mesh) ; pour le design d'origine de la migration, voir
-> `OPencode-PLAN.md` (document WIP, non modifié).
+> spécificité de pi-mesh) ; le design d'origine de la migration vit dans
+> l'historique git (`OPencode-PLAN.md`, supprimé — supersédé par ce
+> document).
 >
 > **Mise à jour (soirée du 16/10)** — la Phase 1 est implémentée :
 > livraison des entrants complète (le listener `client.on("inbound")`
