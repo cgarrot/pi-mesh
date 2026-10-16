@@ -21,6 +21,7 @@ import {
   MAILBOX_PURGE_INTERVAL_MS,
   SWEEP_INTERVAL_MS,
   WRITE_TIMEOUT_MS,
+  LOCK_VERIFY_WAIT_MS,
   loadConfig,
   type MeshConfig,
 } from "../shared/config.js";
@@ -697,6 +698,14 @@ const serverHandler = (socket: Socket, tokenRequired = false): void => {
       }
     });
     socket.on("error", () => {});
+    // Graceful client half-close (MeshClient.close() sends FIN): reply with
+    // our own FIN so both sides reach 'close' (which runs closePeer).
+    // Without this the accepted socket stays half-open forever — an fd
+    // leak on every graceful disconnect, and embedders' processes never
+    // exit (observed: lingering server-side sockets after client.close()).
+    socket.on("end", () => {
+      socket.end();
+    });
     socket.on("close", () => {
       clearTimeout(helloTimer);
       for (const peer of [...state.peers.values()]) {
@@ -885,10 +894,19 @@ function lockHeldByUs(lockPath: string): boolean {
   }
 }
 
-/** Acquire lock, stale-pid tolerant. Returns false if a live broker holds it. */
-export function acquireLock(dir: string): boolean {
+/** Acquire lock, stale-pid tolerant. Returns false if a live broker holds it.
+ *
+ *  A live foreign PID in the lock is NOT proof of a live broker: after a
+ *  hard kill (SIGKILL, power loss, panic) the lock survives while the OS
+ *  recycles the PID for an unrelated process — the plain pidAlive() check
+ *  then refuses takeover forever and the broker can never restart. So a
+ *  live foreign holder must additionally SERVE the socket within
+ *  LOCK_VERIFY_WAIT_MS (covers the legit lock→bind startup window); a
+ *  silent socket means recycled PID → stale → take over. */
+export async function acquireLock(dir: string): Promise<boolean> {
   mkdirSync(dir, { recursive: true });
   const lockPath = brokerLockPath(dir);
+  const sockPath = brokerSocketPath(dir);
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       writeFileSync(lockPath, String(process.pid), { flag: "wx" });
@@ -900,12 +918,16 @@ export function acquireLock(dir: string): boolean {
     } catch {
   // exists: check staleness
     }
+    let liveHolder = false;
     try {
       const pid = Number(readFileSync(lockPath, "utf8").trim());
-      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && pidAlive(pid)) return false;
+      if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && pidAlive(pid)) {
+        liveHolder = await socketServes(sockPath, LOCK_VERIFY_WAIT_MS);
+      }
     } catch {
   // unreadable → treat as stale
     }
+    if (liveHolder) return false;
     try {
       unlinkSync(lockPath);
     } catch {
@@ -934,11 +956,27 @@ function probeSocketAlive(sockPath: string, timeoutMs = 1000): Promise<boolean> 
   });
 }
 
+/** Repeated connect probe until `waitMs` elapses — true as soon as a
+ *  listener answers. Covers the legit startup window between lock
+ *  acquisition and bind so a concurrently starting broker is never
+ *  mistaken for a recycled stale PID. */
+async function socketServes(sockPath: string, waitMs: number): Promise<boolean> {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    if (await probeSocketAlive(sockPath, 1000)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 200);
+      timer.unref();
+    });
+  }
+}
+
 export async function main(): Promise<void> {
   const dir = runtimeDir();
   const sDir = stateDir();
   mkdirSync(dir, { recursive: true });
-  if (!acquireLock(dir)) {
+  if (!(await acquireLock(dir))) {
     process.stderr.write("mesh broker: lock held by a live process\n");
     process.exit(1);
   }

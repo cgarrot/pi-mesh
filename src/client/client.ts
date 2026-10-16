@@ -231,6 +231,10 @@ export class MeshClient extends EventEmitter {
   private socket: Socket | null = null;
   private online = false;
   private intentionallyClosed = false;
+  /** Set by close() ONLY (not the rename detach): an in-flight connect
+   *  must abort instead of resurrecting a closed client. Cleared by an
+   *  explicit connect() — a late reconnect stays allowed by design. */
+  private userClosed = false;
   private aliasFallbackDone = false;
   private connecting: Promise<WelcomeInfo> | null = null;
   private reconnectAttempt = 0;
@@ -691,6 +695,7 @@ export class MeshClient extends EventEmitter {
     }
   // explicit connect re-arms auto-reconnect after a prior close
     this.intentionallyClosed = false;
+    this.userClosed = false;
     this.connecting ??= this.doConnectWithAliasFallback().finally(() => {
       this.connecting = null;
     });
@@ -757,8 +762,15 @@ export class MeshClient extends EventEmitter {
     } else if (endpoint !== null && endpoint.kind === "unix") {
       socket = net.createConnection(endpoint.path);
     } else {
-      const sockPath = await ensureBroker(this.runtimeDir); // throws broker_unavailable 
+      const sockPath = await ensureBroker(this.runtimeDir); // throws broker_unavailable
       socket = net.createConnection(sockPath);
+    }
+    if (this.userClosed) {
+      // close() raced this in-flight connect (a session disposed while its
+      // initial connect was still handshaking) — never resurrect a closed
+      // client: the socket would stay open forever on both sides.
+      socket.destroy();
+      throw new Error("shutting_down");
     }
     this.socket = socket;
     this.debug(`doConnect: socket created → ${this.config.brokerUrl ?? "local unix"}`);
@@ -1751,6 +1763,7 @@ export class MeshClient extends EventEmitter {
 
   async close(): Promise<void> {
     this.intentionallyClosed = true;
+    this.userClosed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.stopHeartbeat();

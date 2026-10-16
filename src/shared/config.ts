@@ -59,6 +59,10 @@ export const MAX_REMINDS = 2;
 export const ENSURE_BROKER_POLL_MS = 50;
 export const ENSURE_BROKER_MAX_POLLS = 60; // 3 s
 export const LOCK_RETRY_MAX = 3;
+/** Broker lock takeover verification: a live FOREIGN lock pid must serve the
+ *  socket within this window (broker.ts acquireLock) or the lock counts as
+ *  stale — a recycled PID must never block a restart. */
+export const LOCK_VERIFY_WAIT_MS = 2_500;
 
 // ---- CLI ----
 /** last N ledger lines printed by `mesh tail` (no -f yet — Phase 3). */

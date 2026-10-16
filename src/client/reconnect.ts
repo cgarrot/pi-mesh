@@ -194,6 +194,16 @@ export async function ensureBroker(runtimeDir: string): Promise<string> {
       } catch {
   // best effort
       }
+    } else if (!(await connectProbe(sockPath, ENSURE_BROKER_POLL_MS))) {
+  // FOREIGN lock that never served the socket within the 3 s poll
+  // window: the holder is dead-but-uncleaned or a recycled PID (never a
+  // live broker — one would have answered). Clear it so the next attempt
+  // can spawn instead of burning LOCK_RETRY_MAX windows and failing.
+      try {
+        unlinkSync(lockPath);
+      } catch {
+  // already gone
+      }
     }
   }
   throw new Error("broker_unavailable");

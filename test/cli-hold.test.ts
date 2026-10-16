@@ -113,12 +113,13 @@ test("reserve --hold keeps the claim, then releases it cleanly when the hold ela
     const env = { MESH_RUNTIME_DIR: dirs.runtimeDir, MESH_STATE_DIR: dirs.stateDir };
     const proc = spawnCli(["reserve", "src/held.ts", "--reason", "holding", "--hold", "3000"], env);
 
-    // the claim becomes visible to peers…
+    // the claim becomes visible to peers… (bounded wait — child stdout
+    // chunks and the broker presence round-trip race each other)
     await until(async () => {
       const snap = await observer.status();
       return snap.peers.some((p) => (p.reservations ?? []).some((r) => r.pattern === "src/held.ts"));
     });
-    assert.match(proc.out, /holding for 3s/);
+    await until(() => proc.out.includes("holding for 3s"));
 
     // hold elapses → explicit release + clean exit 0 (same release+close
     // path the SIGINT handler uses)
