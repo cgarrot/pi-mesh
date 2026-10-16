@@ -131,6 +131,7 @@ export const ERROR_CODES = [
   "reply_without_target",
   "timeout",
   "expired",
+  "broker_unavailable",
   "shutting_down",
   "internal",
 ] as const;

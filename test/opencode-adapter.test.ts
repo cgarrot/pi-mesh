@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { meshArgs, renderMeshStatus } from "../src/extension-opencode/register-commands.js";
+import { meshArgs, renderMeshStatus, runMeshCommand } from "../src/extension-opencode/register-commands.js";
 import { applyMeshTools, applyMeshToolsV1 } from "../src/extension-opencode/register-tools.js";
 import type { EnsureRuntime } from "../src/extension-opencode/register-tools.js";
 import type { MeshSessionRuntime } from "../src/extension-opencode/client-runtime.js";
@@ -20,6 +20,20 @@ import { MeshTranscript } from "../src/extension/transcript.js";
 import { buildFrame } from "../src/protocol/envelope.js";
 
 // ---------------------------------------------------------------- fakes
+
+interface FakeClientBits {
+  isOnline: () => boolean;
+  alias: string;
+  rooms: string[];
+  knowsPeer: (alias: string) => boolean;
+  knownPeerList: readonly string[];
+  busyForMs: (alias: string) => number | undefined;
+  peekInbox: (msgId: string) => unknown;
+  connect: () => Promise<unknown>;
+  send: (input: unknown) => Promise<unknown>;
+  reply: (msgId: string, message: string, opts?: unknown) => Promise<unknown>;
+  forgetRoom: (room: string) => void;
+}
 
 const tempDirs: string[] = [];
 function tempDir(): string {
@@ -42,7 +56,7 @@ function fakeRuntime(overrides: Record<string, unknown> = {}): MeshSessionRuntim
   const client = {
     isOnline: () => true,
     alias: "oc-unit",
-    rooms: ["default"],
+    rooms: ["default"] as string[],
     knowsPeer: (_alias: string) => false,
     knownPeerList: [] as readonly string[],
     busyForMs: (_alias: string) => undefined,
@@ -52,8 +66,12 @@ function fakeRuntime(overrides: Record<string, unknown> = {}): MeshSessionRuntim
     },
     send: async () => ({ status: "delivered", msgId: "m_unit1" }),
     reply: async () => ({ status: "delivered", msgId: "m_unit2" }),
+    forgetRoom: (room: string) => {
+      client.rooms = client.rooms.filter((r) => r !== room);
+    },
     ...((overrides.client as Record<string, unknown>) ?? {}),
-  };
+  } as FakeClientBits & Record<string, unknown>;
+  const clientRef = client as FakeClientBits;
   const base = {
     client,
     guards: new MeshGuards(),
@@ -99,6 +117,34 @@ function captureTools(ensure: EnsureRuntime): Map<string, V2ToolDefinition> {
 }
 
 const CTX = { sessionID: "ses-unit", agent: "build" } as never;
+
+// ---------------------------------------------------------------- /mesh leave
+
+test("/mesh leave offline: drops the room locally, honest message", async () => {
+  const rt = fakeRuntime({
+    client: { isOnline: () => false, rooms: ["default", "zoma"] },
+  });
+  const out = await runMeshCommand(rt, ["leave", "default"]);
+  assert.match(out, /left default locally \(offline/);
+  assert.match(out, /zoma/);
+  assert.deepEqual([...rt.client.rooms], ["zoma"]);
+});
+
+test("/mesh leave online: broker round-trip and persist", async () => {
+  const left: string[] = [];
+  const fakeClient = {
+    rooms: ["default", "zoma"] as string[],
+    leave: async (room: string) => {
+      left.push(room);
+      // mutate IN PLACE: the merged fake client shares this array
+      fakeClient.rooms.splice(fakeClient.rooms.indexOf(room), 1);
+    },
+  };
+  const rt = fakeRuntime({ client: fakeClient });
+  const out = await runMeshCommand(rt, ["leave", "default"]);
+  assert.match(out, /left default \(rooms: zoma\)/);
+  assert.deepEqual(left, ["default"]);
+});
 
 // ---------------------------------------------------------------- meshArgs
 

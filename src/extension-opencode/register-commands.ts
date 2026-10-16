@@ -103,6 +103,15 @@ export async function runMeshCommand(
     case "leave": {
       const room = rest[0];
       if (room === undefined) return "usage: /mesh leave <room>";
+      if (!runtime.client.isOnline()) {
+        // Offline (connect failing or mid-churn): leaving is still valid
+        // LOCALLY — the next hello re-declares joinedRooms without the
+        // room, so the broker syncs at reconnect. Honest about it.
+        runtime.client.forgetRoom(room);
+        persistIdentity(runtime);
+        const rooms = runtime.client.rooms.length > 0 ? [...runtime.client.rooms].join(", ") : "(none)";
+        return `mesh: left ${room} locally (offline — the broker syncs at reconnect; rooms: ${rooms})`;
+      }
       try {
         await runtime.client.leave(room);
       } catch (err) {

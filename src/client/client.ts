@@ -714,7 +714,13 @@ export class MeshClient extends EventEmitter {
   private async doConnectWithAliasFallback(): Promise<WelcomeInfo> {
     for (let attempt = 0; ; attempt += 1) {
       try {
-        return await this.doConnect();
+        const welcome = await this.doConnect();
+        // A successful connection re-arms the alias fallback: a FUTURE
+        // alias_taken is a new conflict (not the same two claimants
+        // looping). Without this, a client that fell back once could
+        // never fall back again and stayed offline forever.
+        this.aliasFallbackDone = false;
+        return welcome;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (!msg.includes("alias_taken")) throw err;
@@ -733,6 +739,9 @@ export class MeshClient extends EventEmitter {
         try {
           const welcome = await this.doConnect();
           this.emit("alias_fallback", { from: previous, to: this.aliasInternal });
+          // Stable under the fallback alias — a FUTURE conflict is a new
+          // one, not the same two claimants looping: re-arm the fallback.
+          this.aliasFallbackDone = false;
           return welcome;
         } catch {
           this.aliasFallbackDone = false;
@@ -1663,6 +1672,16 @@ export class MeshClient extends EventEmitter {
   }
 
   /**
+   * Local-only room drop for an OFFLINE client: the next hello re-declares
+   * joinedRooms without it, so the broker state syncs at reconnect. Used by
+   * hosts (e.g. the OpenCode `/mesh leave`) when the broker round-trip is
+   * impossible — honest about being local-only.
+   */
+  forgetRoom(room: string): void {
+    this.joinedRooms.delete(room);
+  }
+
+  /**
   * In-flight alias change: detach from the broker under the old alias, then
   * re-hello under the new one. Rooms and reservations are re-declared in the
   * hello (broker state for the old alias — rooms, reservations, mailbox — is
@@ -1750,10 +1769,24 @@ export class MeshClient extends EventEmitter {
 
   private async roundTrip(frame: MeshFrame): Promise<MeshFrame> {
     if (!this.online) {
+      // close() is FINAL for send paths too — a late send must never
+      // resurrect a closed client (connect() would re-arm userClosed).
+      if (this.userClosed) {
+        return buildFrame({ type: "error", code: "shutting_down", id: frame.id });
+      }
       try {
         await this.connect();
-      } catch {
-        return buildFrame({ type: "error", code: "shutting_down", id: frame.id });
+      } catch (err) {
+        // Honest error code — the real connect failure, never a blanket
+        // "shutting_down" (alias_taken/timeout used to masquerade as
+        // shutdowns, hiding the actual problem from /mesh answers).
+        const msg = err instanceof Error ? err.message : String(err);
+        const code = msg.includes("alias_taken")
+          ? "alias_taken"
+          : msg.includes("timeout")
+            ? "timeout"
+            : "broker_unavailable";
+        return buildFrame({ type: "error", code, id: frame.id });
       }
     }
     const ackPromise = this.waitAck(frame.id);
