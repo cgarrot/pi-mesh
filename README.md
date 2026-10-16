@@ -532,11 +532,24 @@ shared modules (`protocol`, `shared`, `broker`, `client`, the pure parts of
 ```
 
 The plugin is activated by listing it in the OpenCode configuration
-(legacy key; see the [OpenCode docs](https://opencode.ai/docs)):
+(see the [OpenCode docs](https://opencode.ai/docs)):
 
-```json
+```jsonc
+// opencode.jsonc — server plugin: tools, /mesh, inbound delivery
 {
-  "plugin": ["pi-mesh-extension"]
+  "plugins": ["pi-mesh-extension"] // or an absolute path to this checkout
+}
+```
+
+```jsonc
+// ~/.config/opencode/cli.json — sidebar widget (TUI/CLI plugin)
+{
+  "plugins": [
+    // after `npm/bun install pi-mesh-extension` in ~/.config/opencode:
+    { "package": "pi-mesh-extension/tui.tsx" }
+    // …or an absolute path to a checkout:
+    // { "package": "/path/to/pi-mesh/tui.tsx" }
+  ]
 }
 ```
 
@@ -546,13 +559,34 @@ What it exposes:
   `mesh_history`, `mesh_wait_all`, `mesh_ledger`, `mesh_reserve`,
   `mesh_release`. They behave exactly like their Pi counterparts
   (guards, honest statuses, batching, ledger, reservations).
-- **`/mesh` command** (V2) — reports the current mesh status.
-- **Inbound messages** addressed to a session are injected into that
-  session's next run, exactly like Pi injects them into the Pi session:
-  `priority=normal` queues for the next user prompt, `urgent` steers the
-  running turn, `force` interrupts it.
-- **Honest activity** — busy/idle/rate-limited/blocked is announced to the
-  broker, so `mesh_status` shows the same information Pi sessions see.
+- **`/mesh` command** (V2) — `status` (default), `join <room> [as <alias>] [observer]`,
+  `leave <room>`, `alias [<new-alias>]`, `ping <alias>`, `stale`, `broker`,
+  `log [on|off]`, `inbox [flush]`. Sessions start in the `default` room like
+  Pi sessions; project rooms are joined explicitly. **The command never
+  writes into the chat**: outcomes are TUI toasts (via
+  `.mesh/mesh-notify-<sessionId>.jsonl`) and the sidebar.
+- **Sidebar card** (CLI plugin `tui.tsx`) — the OpenCode counterpart of the
+  Pi HUD: the current session's alias, connection state, rooms and the
+  agents visible in those rooms (activity marker per agent). It polls the
+  status beacon the server side refreshes every 2 s
+  (`.mesh/mesh-status-<sessionId>.json`) and falls back to the persisted
+  identity (`.mesh/identity-<sessionId>.json`) when no session is attached yet.
+- **Inbound delivery** — messages addressed to a session are batched and
+  injected (`normal`→queue, `urgent`/`force`→steer, `force`+`interrupt`
+  aborts the running turn first), with honest read receipts, hash-only
+  ledger entries and reply hints — the same pipeline as Pi. Broadcasts can
+  be deferred (opt-in `inboundBroadcasts: "deferred"`) and ride the next
+  prompt (`/mesh inbox`).
+- **Reservation enforcement** — `edit`/`write` on a path another agent
+  reserved is blocked with holder/reason/age (verified end-to-end).
+- **Session lifecycle** — runtimes attach automatically on session
+  activity, detach on `session.deleted`, and idle sessions (15 min without
+  events, `MESH_OPENCODE_IDLE_DETACH_MS` override) release their broker
+  connection; pending messages queue in the broker mailbox and arrive on
+  the next attach.
+- **Honest activity** — busy/idle is announced from real session events
+  (a turn's events → busy, `session.idle` → idle); rate-limited/blocked
+  detection is planned (Phase 2).
 - **Identity per session** — each OpenCode session keeps its own alias,
   rooms and reservations, persisted like in Pi (`.mesh/identity-<sessionId>.json`).
 
@@ -564,12 +598,25 @@ Limitations accepted for now (they are documented in code, see
   through a local, minimal view (`v2-surface.ts`). When the running
   OpenCode exposes them, they are used; otherwise the integration falls
   back to what is available.
+- The package keeps its **zero-runtime-dependency** contract: the legacy
+  V1 tool map imports `zod` lazily, so a V1-era OpenCode without a
+  resolvable zod degrades to observation-only hooks (V2 — every current
+  OpenCode — never touches zod at all).
+- Packaging is runtime-agnostic on purpose: `exports["./server"]` points
+  at the compiled `dist/server.js` (plain Node, no type stripping needed
+  inside node_modules), root `server.js`/`index.js` stubs cover
+  file-probing hosts, and the raw `server.ts` serves TS-native runtimes
+  (Bun).
 - There is no hook to observe turn start/end, so "busy" is announced
   after the plugin itself submits an injected message, and cleared after
   an approximate idle window.
 - The legacy V1 half only *observes* (`chat.message`,
-  `tool.execute.before`, `event`); the V1 tool map is registered, but older
-  OpenCode builds may not call `server()`.
+  `tool.execute.before`, `event`); the V1 tool map is registered when
+  zod resolves, but older OpenCode builds may not call `server()`.
+- Plugin hot reloads: the host does not always call the unload cleanup, so
+  the adapter takes a process-global generation, disposes the previous
+  instance's runtimes itself (awaited) and re-attaches each session's
+  runtime from the server event stream (any session-scoped event).
 
 ## Known limitations
 
