@@ -16,6 +16,7 @@ import type { RunningBroker } from "../src/broker/broker.js";
 import {
   attachOpenCodeSession,
   createSessionRuntime,
+  disposeAllRuntimes,
   disposeRuntime,
   ensureSessionRuntime,
   runtimeBySession,
@@ -240,6 +241,29 @@ test("runtime: idle detach remains available via MESH_OPENCODE_IDLE_DETACH_MS (o
   rt.markTurnIdle();
   await waitFor(() => (runtimeBySession("ses-idle-optin") === undefined ? true : undefined), 5_000);
   assert.equal(runtimeBySession("ses-idle-optin"), undefined);
+});
+
+test("runtime: disposeAllRuntimes REALLY closes every client (reload zombie factory fix)", async (t) => {
+  const fx = await setup();
+  const rtA = await createSessionRuntime("ses-disp-a", CFG, async () => {});
+  const rtB = await createSessionRuntime("ses-disp-b", CFG, async () => {});
+  await waitFor(() => (rtA.client.isOnline() && rtB.client.isOnline() ? true : undefined));
+  t.after(async () => {
+    await disposeRuntime("ses-disp-a");
+    await disposeRuntime("ses-disp-b");
+  });
+
+  await disposeAllRuntimes();
+  // both clients must be CLOSED (socket gone), not merely unregistered —
+  // the old id-based loop after runtimes.clear() closed NOTHING.
+  await waitFor(() => (!rtA.client.isOnline() && !rtB.client.isOnline() ? true : undefined), 5_000);
+  assert.equal(runtimeBySession("ses-disp-a"), undefined);
+  assert.equal(runtimeBySession("ses-disp-b"), undefined);
+  // and their aliases are FREE at the broker again
+  const probe = new MeshClient({ alias: rtA.client.alias, runtimeDir: fx.dirs.runtimeDir, config: CFG });
+  await probe.connect();
+  assert.equal(probe.alias, rtA.client.alias);
+  await probe.close();
 });
 
 test("runtime: submit fails loud and clear without a session domain", async (t) => {

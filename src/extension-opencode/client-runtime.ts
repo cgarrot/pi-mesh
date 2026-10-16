@@ -121,6 +121,15 @@ export async function disposeRuntime(sessionID: string): Promise<void> {
   const runtime = runtimes.get(sessionID);
   if (runtime === undefined) return;
   runtimes.delete(sessionID);
+  await disposeRuntime_(runtime);
+}
+
+/** The actual teardown, keyed by the runtime object (NOT the map — see
+ *  disposeAllRuntimes: clearing the map first used to make the per-id
+ *  lookup find nothing, so NO client was ever closed and every unload
+ *  leaked live sockets holding their aliases: the zombie factory behind
+ *  the whole evening's alias wars). */
+async function disposeRuntime_(runtime: MeshSessionRuntime): Promise<void> {
   try {
     runtime.stopStatus?.();
   } catch {
@@ -339,13 +348,17 @@ export function anyOnlineRuntime(): MeshSessionRuntime | undefined {
 }
 
 /** Close every session runtime — called when the plugin unloads/reloads so
- *  no status timers or broker connections survive the module instance. */
+ *  no status timers or broker connections survive the module instance.
+ *  Takes a snapshot of the RUNTIME OBJECTS (not ids): the old id-based loop
+ *  ran after runtimes.clear() and the per-id lookup found nothing, so no
+ *  client was ever closed — every reload leaked live sockets that kept
+ *  holding their aliases and injecting messages. */
 export async function disposeAllRuntimes(): Promise<void> {
-  const list = [...runtimes.keys()];
+  const list = [...runtimes.values()];
   runtimes.clear();
-  for (const sessionID of list) {
+  for (const runtime of list) {
     try {
-      await disposeRuntime(sessionID);
+      await disposeRuntime_(runtime);
     } catch {
       // best effort — a reload must never fail on teardown
     }
