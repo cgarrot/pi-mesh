@@ -301,6 +301,28 @@ test("runtime: alias auto-reclaim — falls back, then reclaims when the holder 
   assert.equal(id.alias, "rc-x");
 });
 
+test("runtime: concurrent ensureSessionRuntime creates exactly ONE runtime (double-attach race)", async (t) => {
+  const fx = await setup();
+  t.after(async () => {
+    await disposeRuntime("ses-race2");
+  });
+  // fire N parallel ensure calls — the reload re-attach + the event
+  // subscription do exactly this; the old check-then-await-then-set let
+  // TWO runtimes through, fighting for the session's alias.
+  const all = await Promise.all(
+    Array.from({ length: 5 }, () => ensureSessionRuntime("ses-race2", CFG, async () => {})),
+  );
+  const unique = new Set(all);
+  assert.equal(unique.size, 1, "all callers must share ONE runtime");
+  assert.equal(runtimeBySession("ses-race2"), all[0]);
+  await waitFor(() => (all[0]!.client.isOnline() ? true : undefined));
+  // exactly one broker connection for this alias exists — the mesh sees
+  // one peer, not a duplicate fighting over the name
+  const snap = await all[0]!.client.status();
+  const me = snap.peers.filter((p) => p.alias === all[0]!.client.alias);
+  assert.equal(me.length, 1);
+});
+
 test("runtime: submit fails loud and clear without a session domain", async (t) => {
   const fx = await setup();
   t.after(async () => {

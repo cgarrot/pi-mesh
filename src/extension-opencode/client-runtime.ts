@@ -717,9 +717,17 @@ export async function createSessionRuntime(
   return runtime;
 }
 
+/** In-flight runtime creations, keyed by sessionID: ensureSessionRuntime
+ *  can be called CONCURRENTLY (the reload re-attach loop races the event
+ *  subscription) — without this, the await between the map check and the
+ *  registration let two runtimes be created for one session, fighting
+ *  for its alias (the double-attach alias war). */
+const pendingRuntimes = new Map<string, Promise<MeshSessionRuntime>>();
+
 /**
  * Get (creating on demand) the runtime of an OpenCode session. `sink` is
- * where batched inbound frames are injected (see inject.ts).
+ * where batched inbound frames are injected (see inject.ts). Concurrency-
+ * safe: parallel callers share ONE creation promise.
  */
 export async function ensureSessionRuntime(
   sessionID: string,
@@ -728,7 +736,15 @@ export async function ensureSessionRuntime(
 ): Promise<MeshSessionRuntime> {
   const existing = runtimeBySession(sessionID);
   if (existing !== undefined) return existing;
-  return createSessionRuntime(sessionID, cfg, sink ?? defaultSink);
+  const pending = pendingRuntimes.get(sessionID);
+  if (pending !== undefined) return pending;
+  const created = createSessionRuntime(sessionID, cfg, sink ?? defaultSink);
+  pendingRuntimes.set(sessionID, created);
+  try {
+    return await created;
+  } finally {
+    pendingRuntimes.delete(sessionID);
+  }
 }
 
 /**
