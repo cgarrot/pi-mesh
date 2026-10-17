@@ -323,6 +323,25 @@ test("runtime: concurrent ensureSessionRuntime creates exactly ONE runtime (doub
   assert.equal(me.length, 1);
 });
 
+test("runtime: TWO plugin instances share ONE runtime per session (host double-load)", async (t) => {
+  const fx = await setup();
+  // simulate the host loading the plugin module twice: a cache-busted
+  // import creates a genuinely separate module instance (own module
+  // state) — only the process-global registries can dedupe the runtimes.
+  const url2 = new URL("../src/extension-opencode/client-runtime.js", import.meta.url).href + "?v=instance2";
+  const instance2 = (await import(url2)) as typeof import("../src/extension-opencode/client-runtime.js");
+  t.after(async () => {
+    await disposeRuntime("ses-two-instances");
+  });
+
+  const fromInstance1 = await ensureSessionRuntime("ses-two-instances", CFG, async () => {});
+  const fromInstance2 = await instance2.ensureSessionRuntime("ses-two-instances", CFG, async () => {});
+  assert.equal(fromInstance1, fromInstance2, "both instances must share ONE runtime");
+  await waitFor(() => (fromInstance1.client.isOnline() ? true : undefined));
+  const snap = await fromInstance1.client.status();
+  assert.equal(snap.peers.filter((p) => p.alias === fromInstance1.client.alias).length, 1);
+});
+
 test("runtime: submit fails loud and clear without a session domain", async (t) => {
   const fx = await setup();
   t.after(async () => {

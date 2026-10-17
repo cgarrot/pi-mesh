@@ -101,8 +101,19 @@ export interface MeshSessionRuntime {
   stopStatus?(): void;
 }
 
-/** Per-session runtimes, keyed by OpenCode sessionID. */
-const runtimes = new Map<string, MeshSessionRuntime>();
+/** Per-session runtimes, keyed by OpenCode sessionID.
+ *
+ *  PROCESS-GLOBAL on purpose: the host loads the plugin module TWICE (the
+ *  double setup at every boot) — module-local maps gave each instance its
+ *  own registry, so BOTH attached a runtime for the same session and
+ *  fought over its alias (the "double-attach alias war"). One shared map
+ *  + the pending-creation memoization = exactly one runtime per session,
+ *  whichever instance wins the race. */
+const RUNTIMES_KEY = Symbol.for("pi-mesh.opencode.runtimes");
+const runtimes: Map<string, MeshSessionRuntime> = ((store: Record<symbol, Map<string, MeshSessionRuntime> | undefined>) => {
+  store[RUNTIMES_KEY] ??= new Map<string, MeshSessionRuntime>();
+  return store[RUNTIMES_KEY];
+})(globalThis as unknown as Record<symbol, Map<string, MeshSessionRuntime> | undefined>);
 
 /** Register (or replace) the runtime of a session. */
 export function registerRuntime(runtime: MeshSessionRuntime): void {
@@ -721,8 +732,13 @@ export async function createSessionRuntime(
  *  can be called CONCURRENTLY (the reload re-attach loop races the event
  *  subscription) — without this, the await between the map check and the
  *  registration let two runtimes be created for one session, fighting
- *  for its alias (the double-attach alias war). */
-const pendingRuntimes = new Map<string, Promise<MeshSessionRuntime>>();
+ *  for its alias (the double-attach alias war). PROCESS-GLOBAL for the
+ *  same reason as `runtimes`: the host runs TWO plugin instances. */
+const PENDING_KEY = Symbol.for("pi-mesh.opencode.pending-runtimes");
+const pendingRuntimes: Map<string, Promise<MeshSessionRuntime>> = ((store: Record<symbol, Map<string, Promise<MeshSessionRuntime>> | undefined>) => {
+  store[PENDING_KEY] ??= new Map<string, Promise<MeshSessionRuntime>>();
+  return store[PENDING_KEY];
+})(globalThis as unknown as Record<symbol, Map<string, Promise<MeshSessionRuntime>> | undefined>);
 
 /**
  * Get (creating on demand) the runtime of an OpenCode session. `sink` is
