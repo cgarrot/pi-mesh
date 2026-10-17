@@ -378,7 +378,7 @@ export function anyOnlineRuntime(): MeshSessionRuntime | undefined {
  *  ran after runtimes.clear() and the per-id lookup found nothing, so no
  *  client was ever closed — every reload leaked live sockets that kept
  *  holding their aliases and injecting messages. */
-export async function disposeAllRuntimes(): Promise<void> {
+export async function disposeAllRuntimes(): Promise<string[]> {
   const list = [...runtimes.values()];
   runtimes.clear();
   logMeshEvent(stateDir(), "dispose_all", { count: list.length, aliases: list.map((r) => r.client.alias) });
@@ -389,6 +389,7 @@ export async function disposeAllRuntimes(): Promise<void> {
       // best effort — a reload must never fail on teardown
     }
   }
+  return list.map((r) => r.sessionId);
 }
 
 /**

@@ -177,21 +177,22 @@ const PREVIOUS_DISPOSER = Symbol.for("pi-mesh.opencode.dispose-runtimes");
 
 /** Dispose the previous instance's runtimes; awaited (bounded) so the
  *  identity alias is free before this instance attaches. */
-async function disposePreviousInstance(): Promise<void> {
-  const store = globalThis as unknown as Record<symbol, (() => Promise<void>) | undefined>;
+async function disposePreviousInstance(): Promise<string[]> {
+  const store = globalThis as unknown as Record<symbol, (() => Promise<string[]>) | undefined>;
   const previous = store[PREVIOUS_DISPOSER];
-  store[PREVIOUS_DISPOSER] = (): Promise<void> => disposeAllRuntimes();
-  if (previous === undefined) return;
+  store[PREVIOUS_DISPOSER] = (): Promise<string[]> => disposeAllRuntimes();
+  if (previous === undefined) return [];
   try {
-    await Promise.race([
+    return await Promise.race([
       Promise.resolve(previous()),
-      new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, 5_000);
+      new Promise<string[]>((resolve) => {
+        const timer = setTimeout(() => resolve([]), 5_000);
         timer.unref();
       }),
     ]);
   } catch {
     // best effort — a stale instance must never break the new one
+    return [];
   }
 }
 
@@ -215,7 +216,22 @@ export default {
     const generation = nextGeneration();
     const isCurrent = (): boolean => generationIsCurrent(generation);
     logPluginEvent("plugin_setup", { generation });
-    await disposePreviousInstance();
+    // Reload handover: the host reloads plugins OFTEN (16+ generations
+    // observed in one evening). Disposing the previous runtimes without
+    // re-attaching left every idle session OFFLINE until its next event —
+    // the "agent disappears after a while" effect. Re-attach them NOW,
+    // same second, under their persisted (preferred) identities.
+    const disposedSessions = await disposePreviousInstance();
+    if (disposedSessions.length > 0) {
+      logPluginEvent("reattach_after_reload", { sessions: disposedSessions.map((s) => s.slice(0, 22)) });
+      for (const sessionID of disposedSessions) {
+        if (!isCurrent()) break; // superseded again — stop
+        if (deletedSessions.has(sessionID)) continue;
+        void ensureSessionRuntime(sessionID).catch(() => {
+          // best effort — session events re-attach later anyway
+        });
+      }
+    }
     attachOpenCodeSession(ctx);
     // options.rooms: default rooms for FRESH sessions (Pi semantics — the
     // persisted identity always wins; rooms change via `/mesh join`).
