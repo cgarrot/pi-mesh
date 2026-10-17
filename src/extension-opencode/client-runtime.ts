@@ -8,7 +8,7 @@
 // reaches a session) live here and in inject.ts.
 import { appendFileSync, mkdirSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join as joinPath } from "node:path";
 import { loadConfig, type MeshConfig } from "../shared/config.js";
 import { runtimeDir, stateDir } from "../shared/paths.js";
 import { identityFromClient, MeshIdentity, type PersistedIdentity } from "../shared/identity-store.js";
@@ -121,6 +121,7 @@ export async function disposeRuntime(sessionID: string): Promise<void> {
   const runtime = runtimes.get(sessionID);
   if (runtime === undefined) return;
   runtimes.delete(sessionID);
+  logMeshEvent(runtime.stateDir, "dispose", { session: sessionID.slice(0, 22), alias: runtime.client.alias });
   await disposeRuntime_(runtime);
 }
 
@@ -301,6 +302,19 @@ function refreshBeaconPeers(runtime: MeshSessionRuntime): void {
     });
 }
 
+/** Diagnostic trail for the alias/presence churn: append-only JSONL in
+ *  <stateDir>/mesh-opencode.log. Small, always-on — every dispose,
+ *  fallback, reclaim, deleted-session and plugin generation lands here
+ *  with a timestamp, so the next incident reads like a story. */
+export function logMeshEvent(stateDirPath: string, event: string, detail: Record<string, unknown> = {}): void {
+  try {
+    const file = joinPath(stateDirPath, "mesh-opencode.log");
+    appendFileSync(file, JSON.stringify({ at: new Date().toISOString(), event, ...detail }) + "\n", "utf8");
+  } catch {
+    // best effort — diagnostics must never break the runtime
+  }
+}
+
 /** Best-effort write of the session's live mesh state (never throws). */
 async function writeStatusBeacon(runtime: MeshSessionRuntime): Promise<void> {
   try {
@@ -367,6 +381,7 @@ export function anyOnlineRuntime(): MeshSessionRuntime | undefined {
 export async function disposeAllRuntimes(): Promise<void> {
   const list = [...runtimes.values()];
   runtimes.clear();
+  logMeshEvent(stateDir(), "dispose_all", { count: list.length, aliases: list.map((r) => r.client.alias) });
   for (const runtime of list) {
     try {
       await disposeRuntime_(runtime);
@@ -627,6 +642,7 @@ export async function createSessionRuntime(
   // for this attach, and KEEP the preferred alias so the chosen identity is
   // retried at the next attach (self-healing once the holder disconnects).
   client.on("alias_fallback", ({ from, to }: { from: string; to: string }) => {
+    logMeshEvent(dir, "alias_fallback", { session: sessionId.slice(0, 22), from, to });
     notifySession(
       dir,
       sessionId,
@@ -672,8 +688,11 @@ export async function createSessionRuntime(
       .rename(runtime.preferredAlias)
       .then((res) => {
         if (res.ok && res.unchanged !== true) {
+          logMeshEvent(dir, "alias_reclaimed", { session: sessionId.slice(0, 22), alias: runtime.preferredAlias });
           persistIdentity(runtime);
           notifySession(dir, sessionId, `mesh: alias @${runtime.preferredAlias} reclaimed`);
+        } else if (!res.ok) {
+          logMeshEvent(dir, "reclaim_blocked", { session: sessionId.slice(0, 22), want: runtime.preferredAlias, reason: res.reason });
         }
       })
       .catch(() => {

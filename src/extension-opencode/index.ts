@@ -19,10 +19,12 @@ import {
   disposeAllRuntimes,
   disposeRuntime,
   ensureSessionRuntime,
+  logMeshEvent,
   runtimeBySession,
 } from "./client-runtime.js";
 import type { MeshSessionRuntime } from "./client-runtime.js";
 import { findConflict } from "../shared/reservations.js";
+import { stateDir } from "../shared/paths.js";
 import { injectBatch } from "./inject.js";
 
 /** Resolve (or create) the runtime of an OpenCode session. */
@@ -127,6 +129,7 @@ function attachOnSessionEvents(
         if (type === "session.deleted") {
           // the session is gone: detach from the broker (alias/rooms free).
           deletedSessions.add(sessionID);
+          logPluginEvent("session_deleted", { session: sessionID.slice(0, 22) });
           void disposeRuntime(sessionID);
           continue;
         }
@@ -153,6 +156,9 @@ function nextGeneration(): number {
   const next = (store[GENERATION_KEY] ?? 0) + 1;
   store[GENERATION_KEY] = next;
   return next;
+}
+function logPluginEvent(event: string, detail: Record<string, unknown> = {}): void {
+  logMeshEvent(stateDir(), event, detail); // best effort — never throws
 }
 
 function generationIsCurrent(mine: number): boolean {
@@ -208,6 +214,7 @@ export default {
     // the closes — the identity alias is then free for this instance.
     const generation = nextGeneration();
     const isCurrent = (): boolean => generationIsCurrent(generation);
+    logPluginEvent("plugin_setup", { generation });
     await disposePreviousInstance();
     attachOpenCodeSession(ctx);
     // options.rooms: default rooms for FRESH sessions (Pi semantics — the
