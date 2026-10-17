@@ -82,6 +82,39 @@ test("alias fallback re-arms after a successful connect (no permanent offline)",
   await a.close();
 });
 
+test("involuntary reconnect keeps the alias despite a lingering old connection (message-churn fix)", async (t) => {
+  const dirs = makeTempDirs("patient-reconnect-");
+  const broker = await startTestBroker(dirs.runtimeDir);
+  const keepAlive = setInterval(() => {}, 100);
+  t.after(async () => {
+    clearInterval(keepAlive);
+    await broker.close();
+    dirs.cleanup();
+  });
+
+  // The client connects as keep-x, then its socket dies hard (no close()).
+  const c = new MeshClient({ alias: "keep-x", runtimeDir: dirs.runtimeDir, config: DEFAULT_CONFIG });
+  await c.connect();
+  assert.equal(c.alias, "keep-x");
+
+  // Simulate the broker-side lag: a SECOND client grabs keep-x the moment
+  // the first socket drops (exactly what our own dying connection does).
+  (c as unknown as { socket: { destroy(): void } }).socket.destroy();
+  const squatter = new MeshClient({ alias: "keep-x", runtimeDir: dirs.runtimeDir, config: DEFAULT_CONFIG });
+  await squatter.connect(); // holds keep-x while c reconnects
+
+  // c reconnects involuntarily: it must WAIT for keep-x (patient ladder)
+  // instead of taking a random alias. Free the alias after ~1.5s — the
+  // reap lag the fix tolerates.
+  setTimeout(() => {
+    void squatter.close();
+  }, 1_500);
+  const t0 = Date.now();
+  while (!c.isOnline() && Date.now() - t0 < 20_000) await sleep(200);
+  assert.ok(c.isOnline());
+  assert.equal(c.alias, "keep-x"); // KEPT its alias — no fallback churn
+});
+
 test("forgetRoom drops the room locally (offline leave)", async () => {
   const dirs = makeTempDirs("honest-forget-");
   const client = new MeshClient({

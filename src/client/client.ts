@@ -188,6 +188,12 @@ const WATCHDOG_INTERVAL_MS = 60_000;
 /** alias_taken: retries of the original alias before falling back to random. */
 const ALIAS_RETRY_ATTEMPTS = 4;
 const ALIAS_RETRY_DELAY_MS = 250;
+/** After an INVOLUNTARY disconnect, the old alias is typically held by our
+ *  own dying connection until the broker reaps it (bounded writes, TCP
+ *  keepalive — up to ~10 s). Be patient: retry the SAME alias much longer
+ *  before falling back, so a message-triggered reconnect keeps its name. */
+const ALIAS_RETRY_ATTEMPTS_INVOLUNTARY = 8;
+const ALIAS_RETRY_DELAY_CAP_MS = 2_000;
 
 /** a reply target stays "handled" for 30 min (duplicates dropped). */
 const HANDLED_REPLY_WINDOW_MS = 1_800_000;
@@ -239,6 +245,10 @@ export class MeshClient extends EventEmitter {
   private connecting: Promise<WelcomeInfo> | null = null;
   private reconnectAttempt = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  /** True between an involuntary disconnect and the next successful
+   *  connect: the alias retry ladder extends (our own dying connection
+   *  still holds the alias at the broker for a few seconds). */
+  private involuntaryClose = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   /** D39 watchdog: guarantees recovery if the reconnect chain ever dies
   *  (observed once on a remote TCP client: socket gone, no retry). */
@@ -712,6 +722,14 @@ export class MeshClient extends EventEmitter {
   * extension can notify the user and persist the new identity.
   */
   private async doConnectWithAliasFallback(): Promise<WelcomeInfo> {
+    // After an INVOLUNTARY disconnect our own dying connection may still
+    // hold the alias at the broker for seconds (bounded writes, keepalive)
+    // — retry the SAME alias patiently instead of falling back to a
+    // random alias on the first bounce (the message-triggered reconnect
+    // alias churn).
+    const attempts = this.involuntaryClose
+      ? ALIAS_RETRY_ATTEMPTS_INVOLUNTARY
+      : ALIAS_RETRY_ATTEMPTS;
     for (let attempt = 0; ; attempt += 1) {
       try {
         const welcome = await this.doConnect();
@@ -720,14 +738,17 @@ export class MeshClient extends EventEmitter {
         // looping). Without this, a client that fell back once could
         // never fall back again and stayed offline forever.
         this.aliasFallbackDone = false;
+        this.involuntaryClose = false;
         return welcome;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (!msg.includes("alias_taken")) throw err;
-        if (attempt < ALIAS_RETRY_ATTEMPTS) {
-          await sleepMs(ALIAS_RETRY_DELAY_MS * 2 ** attempt);
+        if (attempt < attempts) {
+          const delay = ALIAS_RETRY_DELAY_MS * 2 ** attempt;
+          await sleepMs(Math.min(delay, ALIAS_RETRY_DELAY_CAP_MS));
           continue;
         }
+        this.involuntaryClose = false;
         // strictAlias: keep the transient RETRIES (a mid-close race must not
         // fail the caller) but skip the random-alias FALLBACK — a one-shot
         // caller (CLI --alias) wants THIS alias or an honest failure, never
@@ -913,6 +934,10 @@ export class MeshClient extends EventEmitter {
       if (wasOnline) this.emit("closed");
       return;
     }
+    // mark the disconnect as INVOLUNTARY: the reconnect must patiently
+    // retry the SAME alias (our dying socket may hold it at the broker
+    // for seconds) before any random fallback.
+    this.involuntaryClose = true;
   // backoff 250ms ×2^n cap 5s → ensureBroker → re-hello
     const delay = backoffMs(this.reconnectAttempt);
     this.reconnectAttempt += 1;
