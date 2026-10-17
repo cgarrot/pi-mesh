@@ -164,6 +164,17 @@ async function disposeRuntime_(runtime: MeshSessionRuntime): Promise<void> {
 /** How often the status beacon is refreshed (ms). */
 const STATUS_HEARTBEAT_MS = 2_000;
 
+/** How often a fallen-back runtime retries its PREFERRED alias (self
+ *  healing: when the conflict holder disconnects — leaked runtime, other
+ *  window, crash — the session reclaims its name automatically). Tests
+ *  override with MESH_ALIAS_RECLAIM_MS. */
+const ALIAS_RECLAIM_MS = 60_000;
+function readAliasReclaimMs(): number {
+  const raw = Number(process.env.MESH_ALIAS_RECLAIM_MS ?? "");
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return ALIAS_RECLAIM_MS;
+}
+
 /** Sessions idle this long CAN detach from the broker — overridable with
  *  MESH_OPENCODE_IDLE_DETACH_MS. DEFAULT 0 = NEVER (Pi parity): a Pi
  *  session stays online for its whole lifetime, and peers must be able to
@@ -647,9 +658,34 @@ export async function createSessionRuntime(
       void disposeRuntime(sessionId);
     }
   }, STATUS_HEARTBEAT_MS);
+
+  // Self-healing alias: a conflict may have forced a random fallback (the
+  // holder can be a leaked runtime, another window, a crashed session).
+  // Retry the PREFERRED alias periodically — the session reclaims its
+  // name AUTOMATICALLY as soon as the holder disconnects: no restart, no
+  // user action. Failures are silent (a live peer keeps its alias); only
+  // the successful reclaim is visible (toast + persist).
+  const reclaimTimer = setInterval(() => {
+    if (!client.isOnline()) return;
+    if (runtime.preferredAlias === client.alias) return;
+    void client
+      .rename(runtime.preferredAlias)
+      .then((res) => {
+        if (res.ok && res.unchanged !== true) {
+          persistIdentity(runtime);
+          notifySession(dir, sessionId, `mesh: alias @${runtime.preferredAlias} reclaimed`);
+        }
+      })
+      .catch(() => {
+        // best effort — the next tick retries
+      });
+  }, readAliasReclaimMs());
+  reclaimTimer.unref();
+
   statusTimer.unref();
   runtime.stopStatus = (): void => {
     clearInterval(statusTimer);
+    clearInterval(reclaimTimer);
   };
   void writeStatusBeacon(runtime); // immediate first paint
 

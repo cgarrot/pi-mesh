@@ -266,6 +266,40 @@ test("runtime: disposeAllRuntimes REALLY closes every client (reload zombie fact
   await probe.close();
 });
 
+test("runtime: alias auto-reclaim — falls back, then reclaims when the holder dies", async (t) => {
+  const fx = await setup();
+  process.env.MESH_ALIAS_RECLAIM_MS = "300";
+  t.after(async () => {
+    delete process.env.MESH_ALIAS_RECLAIM_MS;
+    await disposeRuntime("ses-reclaim");
+  });
+
+  const holder = new MeshClient({ alias: "rc-x", runtimeDir: fx.dirs.runtimeDir, config: CFG });
+  await holder.connect();
+
+  const { MeshIdentity } = await import("../src/shared/identity-store.js");
+  new MeshIdentity(fx.dirs.stateDir).save({
+    version: 1,
+    sessionId: "ses-reclaim",
+    alias: "rc-x",
+    preferredAlias: "rc-x",
+    rooms: ["default"],
+    reservations: [],
+    updatedAt: new Date().toISOString(),
+  } as never);
+
+  const rt = await createSessionRuntime("ses-reclaim", CFG, async () => {});
+  await waitFor(() => (rt.client.isOnline() ? true : undefined), 15_000);
+  assert.notEqual(rt.client.alias, "rc-x"); // fell back
+
+  // the holder dies → the runtime must reclaim rc-x BY ITSELF
+  await holder.close();
+  await waitFor(() => (rt.client.alias === "rc-x" ? true : undefined), 15_000);
+  assert.equal(rt.client.alias, "rc-x");
+  const id = JSON.parse(readFileSync(fx.dirs.stateDir + "/identity-ses-reclaim.json", "utf8"));
+  assert.equal(id.alias, "rc-x");
+});
+
 test("runtime: submit fails loud and clear without a session domain", async (t) => {
   const fx = await setup();
   t.after(async () => {
