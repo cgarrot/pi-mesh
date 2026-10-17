@@ -62,6 +62,16 @@ function attachSession(sessionID: string): void {
   });
 }
 
+/** Process-global session registry: every generation records the sessions
+ *  it served, and every setup re-attaches them — a reload CHAIN (setups
+ *  42ms apart were observed) must not lose the ids between generations. */
+const KNOWN_SESSIONS = Symbol.for("pi-mesh.opencode.known-sessions");
+function knownSessions(): Set<string> {
+  const store = globalThis as unknown as Record<symbol, Set<string> | undefined>;
+  store[KNOWN_SESSIONS] ??= new Set<string>();
+  return store[KNOWN_SESSIONS];
+}
+
 /** Sessions the server deleted — never attach them again. */
 const deletedSessions = new Set<string>();
 
@@ -129,6 +139,7 @@ function attachOnSessionEvents(
         if (type === "session.deleted") {
           // the session is gone: detach from the broker (alias/rooms free).
           deletedSessions.add(sessionID);
+          knownSessions().delete(sessionID);
           logPluginEvent("session_deleted", { session: sessionID.slice(0, 22) });
           void disposeRuntime(sessionID);
           continue;
@@ -222,11 +233,15 @@ export default {
     // the "agent disappears after a while" effect. Re-attach them NOW,
     // same second, under their persisted (preferred) identities.
     const disposedSessions = await disposePreviousInstance();
-    if (disposedSessions.length > 0) {
-      logPluginEvent("reattach_after_reload", { sessions: disposedSessions.map((s) => s.slice(0, 22)) });
-      for (const sessionID of disposedSessions) {
+    // union with the persistent registry — reload chains (N setups within
+    // milliseconds) lose the disposed ids between generations otherwise
+    const toReattach = [...new Set([...disposedSessions, ...knownSessions()])].filter(
+      (s) => !deletedSessions.has(s),
+    );
+    if (toReattach.length > 0) {
+      logPluginEvent("reattach_after_reload", { sessions: toReattach.map((s) => s.slice(0, 22)) });
+      for (const sessionID of toReattach) {
         if (!isCurrent()) break; // superseded again — stop
-        if (deletedSessions.has(sessionID)) continue;
         void ensureSessionRuntime(sessionID).catch(() => {
           // best effort — session events re-attach later anyway
         });
@@ -242,6 +257,7 @@ export default {
     // Attach mesh runtimes as sessions act: the sidebar/beacon goes live
     // without a mesh tool call and survives plugin reloads.
     const attach = (sessionID: string): void => {
+      knownSessions().add(sessionID);
       if (isCurrent()) attachSession(sessionID);
     };
     const controller = new AbortController();
