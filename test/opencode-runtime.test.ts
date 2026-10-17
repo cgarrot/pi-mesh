@@ -342,6 +342,23 @@ test("runtime: TWO plugin instances share ONE runtime per session (host double-l
   assert.equal(snap.peers.filter((p) => p.alias === fromInstance1.client.alias).length, 1);
 });
 
+test("runtime: stuck-busy watchdog — a silent turn falls back to idle", async (t) => {
+  const fx = await setup();
+  process.env.MESH_BUSY_STUCK_MS = "400";
+  t.after(async () => {
+    delete process.env.MESH_BUSY_STUCK_MS;
+    await disposeRuntime("ses-stuck-busy");
+  });
+  const rt = await createSessionRuntime("ses-stuck-busy", CFG, async () => {});
+  await waitFor(() => (rt.client.isOnline() ? true : undefined));
+  rt.markTurnActive();
+  assert.ok(rt.isBusy());
+  // the turn goes SILENT (no session.idle ever comes) — after the
+  // watchdog window the runtime must announce idle on its own
+  await waitFor(() => (rt.isBusy() ? undefined : true), 5_000);
+  assert.equal(rt.isBusy(), false);
+});
+
 test("runtime: submit fails loud and clear without a session domain", async (t) => {
   const fx = await setup();
   t.after(async () => {

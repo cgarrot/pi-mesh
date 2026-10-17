@@ -173,6 +173,18 @@ async function disposeRuntime_(runtime: MeshSessionRuntime): Promise<void> {
 // The CLI (TUI) plugin reads this file to render the mesh card in the
 // sidebar — the same data the Pi HUD shows, scoped to one OpenCode session.
 
+/** A LIVE turn emits session events continuously (steps, tools,
+ *  reasoning). Silence longer than this while turnActive means the turn
+ *  ended WITHOUT a usable session.idle event (missing, late, or trailing
+ *  noise re-marking busy) — fall back to idle so peers see the truth.
+ *  Overridable with MESH_BUSY_STUCK_MS (tests). */
+const BUSY_STUCK_TIMEOUT_MS = 120_000;
+function readBusyStuckMs(): number {
+  const raw = Number(process.env.MESH_BUSY_STUCK_MS ?? "");
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return BUSY_STUCK_TIMEOUT_MS;
+}
+
 /** How often the status beacon is refreshed (ms). */
 const STATUS_HEARTBEAT_MS = 2_000;
 
@@ -678,6 +690,16 @@ export async function createSessionRuntime(
   const detachAfterMs = readIdleDetachMs();
   const statusTimer = setInterval(() => {
     void writeStatusBeacon(runtime);
+    // stuck-busy watchdog: session.idle may never arrive (or trailing
+    // events re-mark busy after it) — a turn silent for this long is
+    // over; announce idle so peers stop seeing a phantom "busy".
+    if (turnActive && Date.now() - lastEventAtMs > readBusyStuckMs()) {
+      logMeshEvent(dir, "turn_idle_watchdog", {
+        session: sessionId.slice(0, 22),
+        silentMs: Date.now() - lastEventAtMs,
+      });
+      runtime.markTurnIdle();
+    }
     if (
       detachAfterMs > 0 &&
       Date.now() - lastEventAtMs > detachAfterMs &&
