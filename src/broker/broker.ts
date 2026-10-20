@@ -14,6 +14,7 @@ import {
   type MeshFrame,
 } from "../protocol/envelope.js";
 import { encodeFrame, FrameDecoder, FrameSizeError, makeMsgId, sha256 } from "../protocol/frames.js";
+import { capTargetName } from "../protocol/task-package.js";
 import {
   DEFAULT_MAX_FRAME_BYTES,
   DEFAULT_ROOM,
@@ -144,8 +145,9 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
     interruptStatus?: string,
     deliveredCount?: number,
     totalCount?: number,
+    routedTo?: string,
   ): void => {
-    sendTo(peer, buildFrame({ type: "ack", id, status, interruptStatus, deliveredCount, totalCount }));
+    sendTo(peer, buildFrame({ type: "ack", id, status, interruptStatus, deliveredCount, totalCount, routedTo }));
   };
 
   /** Honest drop receipts: tell each ORIGINAL sender (when online) that
@@ -423,6 +425,14 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
       sendError(from.socket, "observer_readonly", frame.id);
       return;
     }
+    // B: `cap:<name>` routes to an idle capable member of the room. The
+    // package is validated by the sender (extension/envelope); the broker
+    // only resolves the target and applies policy per candidate.
+    const cap = capTargetName(to);
+    if (cap !== undefined) {
+      routeCapMsg(from, frame, cap, room);
+      return;
+    }
     const target = state.peers.get(to);
     const knownOnline = target !== undefined && target.helloDone && !target.socket.destroyed;
     if (!knownOnline && !state.knownAliases.has(to)) {
@@ -485,6 +495,90 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
       state.stats.relayed += 1;
       sendAck(from, frame.id, "queued_offline", interruptStatus);
     }
+  };
+
+  /** B: resolve `cap:<name>` to an online member of the room, idle-first.
+   *  v1 deliberately has no cap queue: no idle candidate -> honest error
+   *  (offline peers are still reachable by alias/mailbox). */
+  const routeCapMsg = (from: PeerRecord, frame: MeshFrame, cap: string, room: string): void => {
+    const priority = frame.priority ?? "normal";
+    const kind: RateKind = priority === "force" ? "force" : priority === "urgent" ? "urgent" : "msg";
+    if (!checkRate(state, from.alias, kind, policy.rateLimits)) {
+      state.stats.refused += 1;
+      sendError(from.socket, "rate_limited", frame.id);
+      return;
+    }
+    const members = state.rooms.get(room);
+    if (members === undefined) {
+      state.stats.refused += 1;
+      sendError(from.socket, "peer_not_found", frame.id);
+      return;
+    }
+    const busyScore = (peer: PeerRecord): number => {
+      const act = peer.activity;
+      if (act === undefined || act.state === "idle") return 0;
+      if (act.state === "busy") {
+        const at = Date.parse(act.at);
+        return Number.isFinite(at) ? Math.max(1, Date.now() - at) : 1;
+      }
+      return Number.MAX_SAFE_INTEGER / 2; // rate_limited / blocked
+    };
+    let sawOnline = false;
+    let sawAnyCaps = false;
+    let sawCap = false;
+    const candidates: { peer: PeerRecord; score: number }[] = [];
+    for (const alias of members) {
+      if (alias === from.alias) continue;
+      const peer = state.peers.get(alias);
+      if (peer === undefined || !peer.helloDone || peer.socket.destroyed) continue;
+      sawOnline = true;
+      if ((peer.caps ?? []).length > 0) sawAnyCaps = true;
+      if (peer.rooms.get(room) !== "member") continue;
+      if (!(peer.caps ?? []).includes(cap)) continue;
+      sawCap = true;
+      const decision = evaluatePolicy(policy, { from: from.alias, to: peer.alias, room, priority });
+      if (decision.action === "deny") continue;
+      candidates.push({ peer, score: busyScore(peer) });
+    }
+    if (candidates.length === 0) {
+      state.stats.refused += 1;
+      const code: MeshErrorCode = sawCap
+        ? "policy_denied"
+        : !sawOnline
+          ? "no_capable_peer"
+          : !sawAnyCaps
+            ? "caps_unsupported"
+            : "no_capable_peer";
+      sendError(from.socket, code, frame.id);
+      return;
+    }
+    candidates.sort((a, b) => a.score - b.score || a.peer.alias.localeCompare(b.peer.alias));
+    const chosen = candidates[0]!.peer;
+    const decision = evaluatePolicy(policy, { from: from.alias, to: chosen.alias, room, priority });
+    if (decision.action === "deny") {
+      state.stats.refused += 1;
+      sendError(from.socket, "policy_denied", frame.id);
+      return;
+    }
+    let routedFrame: MeshFrame = { ...frame, to: chosen.alias, routedCap: cap, routedTo: chosen.alias };
+    let interruptStatus: string | undefined;
+    if (decision.action === "downgrade") {
+      routedFrame = { ...routedFrame, priority: "urgent", interrupt: undefined };
+      interruptStatus = "force_downgraded";
+    } else if (priority === "force") {
+      interruptStatus = "force_accepted";
+    }
+    const target = chosen;
+    writeFrame(target.socket, routedFrame, config.maxFrameBytes, (ok) => {
+      if (ok) {
+        state.stats.relayed += 1;
+        sendAck(from, frame.id, "delivered", interruptStatus, undefined, undefined, target.alias);
+      } else {
+        if (state.peers.get(target.alias) === target) closePeer(state, target.alias, "write_failure");
+        notifyDropped(enqueueMailbox(state, config, target.alias, routedFrame));
+        sendAck(from, frame.id, "queued_offline", interruptStatus, undefined, undefined, target.alias);
+      }
+    });
   };
 
   /** read receipt — deliver to the original message sender (frame.to). */

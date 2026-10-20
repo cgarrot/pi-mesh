@@ -12,6 +12,7 @@ import {
   MAX_REPLY_TARGETS,
   PROTO_VERSION,
   ROOM_REGEX,
+  normalizeCaps,
   SHA256_HEX_REGEX,
 } from "../shared/config.js";
 import { makeMsgId, nowIso, sha256 } from "./frames.js";
@@ -66,6 +67,10 @@ export interface MeshFrame {
   refs?: string[];
   /** B: five-field assignment contract (required for `cap:` sends). */
   taskPackage?: MeshTaskPackage;
+  /** B: set by the broker on a cap-routed message (recipient sees why). */
+  routedCap?: string;
+  /** B: resolved alias of a cap-routed message (sender sees who got it). */
+  routedTo?: string;
   reasonHash?: string; // force only
   expiresAt?: string;
   code?: string;
@@ -141,6 +146,8 @@ export const ERROR_CODES = [
   "peer_not_found",
   "rate_limited",
   "policy_denied",
+  "no_capable_peer",
+  "caps_unsupported",
   "force_requires_reason",
   "hash_mismatch",
   "reply_without_target",
@@ -266,6 +273,9 @@ export interface BuildFrameOpts {
   clientVersion?: string;
   /** B: five-field assignment contract (required for `cap:` sends). */
   taskPackage?: MeshTaskPackage;
+  /** B: cap-routed result fields (broker → sender). */
+  routedCap?: string;
+  routedTo?: string;
   /** B: hello/presence capabilities. */
   caps?: string[];
   /** B: protocol version (hello/welcome/presence). */
@@ -314,6 +324,8 @@ export function buildFrame(opts: BuildFrameOpts): MeshFrame {
   if (opts.receipt !== undefined) frame.receipt = opts.receipt;
   if (opts.clientVersion !== undefined) frame.clientVersion = opts.clientVersion;
   if (opts.taskPackage !== undefined) frame.taskPackage = opts.taskPackage;
+  if (opts.routedCap !== undefined) frame.routedCap = opts.routedCap;
+  if (opts.routedTo !== undefined) frame.routedTo = opts.routedTo;
   if (opts.caps !== undefined) frame.caps = [...opts.caps];
   if (opts.proto !== undefined) frame.proto = opts.proto;
   if (opts.stats !== undefined) frame.stats = { ...opts.stats };
@@ -519,6 +531,14 @@ export function validateFrame(value: unknown, opts: ValidateOpts = {}): Validati
   if (value.taskPackage !== undefined) {
     const pkg = validateTaskPackage(value.taskPackage);
     if (!pkg.ok) return { ok: false, code: "invalid_frame", detail: `bad taskPackage: ${pkg.reason}` };
+  }
+  if (value.routedCap !== undefined) {
+    if (typeof value.routedCap !== "string" || normalizeCaps([value.routedCap]).length !== 1) {
+      return { ok: false, code: "invalid_frame", detail: "bad routedCap" };
+    }
+  }
+  if (value.routedTo !== undefined && (typeof value.routedTo !== "string" || !isValidAlias(value.routedTo))) {
+    return { ok: false, code: "invalid_alias", detail: "bad routedTo" };
   }
   if (value.caps !== undefined && !isValidCaps(value.caps)) {
     return { ok: false, code: "invalid_frame", detail: "bad caps" };

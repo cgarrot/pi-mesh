@@ -110,8 +110,8 @@ export interface ReplyOpts {
 }
 
 export type SendResult =
-  | { status: "delivered"; msgId: string; deliveredCount?: number; totalCount?: number }
-  | { status: "queued_offline"; msgId: string; deliveredCount?: number; totalCount?: number }
+  | { status: "delivered"; msgId: string; deliveredCount?: number; totalCount?: number; routedTo?: string }
+  | { status: "queued_offline"; msgId: string; deliveredCount?: number; totalCount?: number; routedTo?: string }
   | { status: "reply"; msgId: string; response: string; outputHash: string }
   | { status: "expired" | "blocked" | "error"; msgId?: string; reason: string };
 
@@ -1401,6 +1401,7 @@ export class MeshClient extends EventEmitter {
           msgId: frame.id,
           deliveredCount: ack.deliveredCount,
           totalCount: ack.totalCount,
+          routedTo: ack.routedTo,
         };
       }
       if (ack.status === "queued_offline") {
@@ -1409,6 +1410,7 @@ export class MeshClient extends EventEmitter {
           msgId: frame.id,
           deliveredCount: ack.deliveredCount,
           totalCount: ack.totalCount,
+          routedTo: ack.routedTo,
         };
       }
   // an unknown/unexpected ack status (e.g. dropped_offline on a msg)

@@ -114,16 +114,20 @@ function str(v: unknown): string | undefined {
 
 function resultText(res: SendResult): string {
   switch (res.status) {
-    case "delivered":
+    case "delivered": {
+      const routed = res.routedTo !== undefined ? ` → @${res.routedTo}` : "";
       if (res.deliveredCount !== undefined && res.totalCount !== undefined) {
-        return `delivered ${res.msgId} (${res.deliveredCount}/${res.totalCount} online)`;
+        return `delivered ${res.msgId}${routed} (${res.deliveredCount}/${res.totalCount} online)`;
       }
-      return `delivered ${res.msgId}`;
-    case "queued_offline":
+      return `delivered ${res.msgId}${routed}`;
+    }
+    case "queued_offline": {
+      const routed = res.routedTo !== undefined ? ` → @${res.routedTo}` : "";
       if (res.deliveredCount !== undefined && res.totalCount !== undefined) {
-        return `queued_offline ${res.msgId} (${res.totalCount} targets offline)`;
+        return `queued_offline ${res.msgId}${routed} (${res.totalCount} targets offline)`;
       }
-      return `queued_offline ${res.msgId}`;
+      return `queued_offline ${res.msgId}${routed}`;
+    }
     case "reply":
       return `reply ${res.msgId}: ${res.response}`;
     case "expired":
@@ -475,13 +479,13 @@ async function execMeshSend(
   switch (res.status) {
     case "delivered":
       safeLedger(rt, {
-        event: "delivered", id: res.msgId, from: rt.client.alias, to, room, priority, bodyHash, reasonHash, refs,
+        event: "delivered", id: res.msgId, from: rt.client.alias, to: res.routedTo ?? to, room, priority, bodyHash, reasonHash, refs,
         code: broadcast ? `broadcast:${res.deliveredCount ?? 0}/${res.totalCount ?? 0}` : undefined,
       });
       break;
     case "queued_offline":
       safeLedger(rt, {
-        event: "queued_offline", id: res.msgId, from: rt.client.alias, to, room, priority, bodyHash, reasonHash, refs,
+        event: "queued_offline", id: res.msgId, from: rt.client.alias, to: res.routedTo ?? to, room, priority, bodyHash, reasonHash, refs,
         code: broadcast ? `broadcast:${res.deliveredCount ?? 0}/${res.totalCount ?? 0}` : undefined,
       });
       break;
@@ -503,6 +507,7 @@ async function execMeshSend(
     status: res.status,
     msgId: "msgId" in res ? res.msgId : undefined,
     to, room, priority, bodyHash,
+    routedTo: "routedTo" in res ? res.routedTo : undefined,
     broadcast: broadcast || undefined,
     deliveredCount: "deliveredCount" in res ? res.deliveredCount : undefined,
     totalCount: "totalCount" in res ? res.totalCount : undefined,

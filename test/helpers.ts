@@ -180,8 +180,14 @@ export class RawClient {
     return waitFor(() => (this.closed ? true : undefined), timeoutMs);
   }
 
-  hello(alias: string, rooms?: string[], role?: "member" | "observer"): void {
-    this.send({ type: "hello", from: alias, rooms, role });
+  hello(
+    alias: string,
+    rooms?: string[],
+    role?: "member" | "observer",
+    caps?: string[],
+    proto?: number,
+  ): void {
+    this.send({ type: "hello", from: alias, rooms, role, caps, proto });
   }
 
   close(): void {
