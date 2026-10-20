@@ -8,8 +8,11 @@
 //   3 expired / wait timeout (a late reply is still delivered)
 //   4 honest partial (queued_offline, broadcast deliveredCount < totalCount,
 //     wait verdict timeout/cancelled WITH answers received)
+//   5 stale task lease (Mesh-Lease trailer no longer current; the commit-msg
+//     hook turns this into a rejected commit)
 export const EXIT_OK = 0;
 export const EXIT_MESH_FAILURE = 1;
 export const EXIT_USAGE = 2;
 export const EXIT_EXPIRED = 3;
 export const EXIT_PARTIAL = 4;
+export const EXIT_LEASE_STALE = 5;

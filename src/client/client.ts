@@ -121,6 +121,7 @@ export interface LeaseInfo {
 
 export type LeaseResult =
   | { status: "granted"; lease: LeaseInfo }
+  | { status: "current"; lease: LeaseInfo }
   | { status: "released"; lease: LeaseInfo }
   | { status: "held"; holder: string }
   | { status: "not_held" }
@@ -1978,6 +1979,13 @@ export class MeshClient extends EventEmitter {
     return this.requestLease(frame, opts.timeoutMs ?? 5_000);
   }
 
+  /** Read-only: is this task leased, and by which epoch:fence? Used by the
+   *  commit-msg hook — a query must never create or extend a lease. */
+  leaseStatus(task: string, timeoutMs?: number): Promise<LeaseResult> {
+    const frame = buildFrame({ type: "lease_status", from: this.alias, room: this.homeRoom, task });
+    return this.requestLease(frame, timeoutMs ?? 5_000);
+  }
+
   private requestLease(frame: MeshFrame, timeoutMs: number): Promise<LeaseResult> {
     if (!this.online || this.socket === null || this.socket.destroyed) {
       return Promise.resolve({ status: "error", reason: "broker_unavailable" });
@@ -1999,7 +2007,7 @@ export class MeshClient extends EventEmitter {
 
 function leaseResult(frame: MeshFrame): LeaseResult {
   const status = frame.status;
-  if (status === "granted" || status === "released") {
+  if (status === "granted" || status === "released" || status === "current") {
     return {
       status,
       lease: {

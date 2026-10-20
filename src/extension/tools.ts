@@ -1123,6 +1123,8 @@ function leaseText(res: LeaseResult): string {
       return `lease granted ${res.lease.leaseId} task=${res.lease.task} fence=${res.lease.epoch}:${res.lease.fence} expires=${res.lease.expiresAt}`;
     case "held":
       return `lease held by @${res.holder}`;
+    case "current":
+      return `lease current ${res.lease.leaseId} task=${res.lease.task} fence=${res.lease.epoch}:${res.lease.fence} expires=${res.lease.expiresAt}`;
     case "released":
       return `lease released ${res.lease.leaseId} task=${res.lease.task}`;
     case "not_held":

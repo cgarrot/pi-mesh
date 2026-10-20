@@ -4,7 +4,7 @@
 // every command lives in cmd/ and talks to the mesh through MeshClient
 // (never the broker internals). Ephemeral clients: alias cli-<rand6>.
 import { parseArgs, type ArgSpec } from "./args.js";
-import { sayErr } from "./out.js";
+import { say, sayErr } from "./out.js";
 import { setColorOverride } from "./out.js";
 import { EXIT_USAGE } from "./codes.js";
 import { CLI_LEDGER_DEFAULT_LIMIT, CLI_LEDGER_MAX_LIMIT } from "../shared/config.js";
@@ -21,6 +21,7 @@ import { cmdStatus, STATUS_USAGE } from "./cmd/status.js";
 import { cmdConfigShow, CONFIG_USAGE } from "./cmd/configshow.js";
 import { cmdRoom } from "./cmd/rooms.js";
 import { cmdReserve, cmdRelease, RESERVE_USAGE, RELEASE_USAGE } from "./cmd/reserve.js";
+import { cmdLeaseVerify, LEASE_USAGE, usageError as leaseUsageError, type LeaseVerifyArgs } from "./cmd/lease.js";
 import { cmdWatch, WATCH_USAGE } from "./cmd/watch.js";
 import { cmdSessions, SESSIONS_USAGE } from "./cmd/sessions.js";
 import { cmdAttach, ATTACH_USAGE } from "./cmd/attach.js";
@@ -57,6 +58,14 @@ const RESERVE_SPECS: ArgSpec[] = [
 ];
 
 const RELEASE_SPECS: ArgSpec[] = [{ name: "all", kind: "flag", help: "release everything this process holds" }];
+
+const LEASE_SPECS: ArgSpec[] = [
+  { name: "task", kind: "value", meta: "T", help: "task id of the lease" },
+  { name: "lease-id", kind: "value", meta: "ID", help: "leaseId from mesh_claim" },
+  { name: "epoch", kind: "value", meta: "N", help: "broker epoch" },
+  { name: "fence", kind: "value", meta: "N", help: "fence counter" },
+  { name: "timeout-ms", kind: "value", meta: "MS", help: "query timeout (default 5000)" },
+];
 
 const WATCH_SPECS: ArgSpec[] = [
   { name: "alias", kind: "value", meta: "A", help: "strict alias (collision = exit 1)" },
@@ -507,6 +516,39 @@ export async function main(argv: string[]): Promise<number> {
         return 0;
       }
       return cmdRelease(r.parsed.positionals, r.parsed.flags.has("all"));
+    }
+    case "lease": {
+      if (rest[0] !== "verify") {
+        return leaseUsageError("lease supports: verify");
+      }
+      const r = parseArgs(rest.slice(1), LEASE_SPECS);
+      if (!r.ok) {
+        sayErr(`${r.error}`);
+        return leaseUsageError("bad arguments");
+      }
+      if (r.help) {
+        say(LEASE_USAGE);
+        return 0;
+      }
+      const task = r.parsed.values.get("task");
+      const leaseId = r.parsed.values.get("lease-id");
+      const epochRaw = r.parsed.values.get("epoch");
+      const fenceRaw = r.parsed.values.get("fence");
+      const timeoutRaw = r.parsed.values.get("timeout-ms");
+      if (task === undefined || leaseId === undefined || epochRaw === undefined || fenceRaw === undefined) {
+        return leaseUsageError("--task, --lease-id, --epoch and --fence are required");
+      }
+      const epoch = Number(epochRaw);
+      const fence = Number(fenceRaw);
+      if (!Number.isInteger(epoch) || epoch < 1 || !Number.isInteger(fence) || fence < 1) {
+        return leaseUsageError("--epoch and --fence must be positive integers");
+      }
+      const args: LeaseVerifyArgs = { task, leaseId, epoch, fence };
+      if (timeoutRaw !== undefined) {
+        const t = Number(timeoutRaw);
+        if (Number.isFinite(t) && t >= 100) args.timeoutMs = Math.round(t);
+      }
+      return cmdLeaseVerify(args);
     }
     case "watch": {
       const r = parseArgs(rest, WATCH_SPECS);

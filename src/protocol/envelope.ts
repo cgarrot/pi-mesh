@@ -140,6 +140,7 @@ export const FRAME_TYPES = [
   "claim",
   "release",
   "lease",
+  "lease_status",
   "error",
 ] as const;
 export type MeshFrameType = (typeof FRAME_TYPES)[number];

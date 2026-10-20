@@ -641,6 +641,9 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
       case "release":
         handleRelease(peer, frame);
         break;
+      case "lease_status":
+        handleLeaseStatus(peer, frame);
+        break;
       case "msg":
         routeMsg(peer, frame);
         break;
@@ -922,6 +925,24 @@ const onTcpConn = (socket: Socket): void => serverHandler(socket, true);
     } else {
       sendLease(peer, frame.id, { status: "invalid", task: frame.task, body: outcome.reason });
     }
+  };
+  const handleLeaseStatus = (peer: PeerRecord, frame: MeshFrame): void => {
+    const lease = leases.get(frame.task ?? "");
+    if (lease === undefined) {
+      sendLease(peer, frame.id, { status: "not_held", task: frame.task, body: "not_held" });
+      return;
+    }
+    sendLease(peer, frame.id, {
+      status: "current",
+      task: lease.task,
+      owner: lease.owner,
+      leaseId: lease.leaseId,
+      fence: lease.fence,
+      epoch: lease.epoch,
+      paths: lease.paths,
+      expiresAt: lease.expiresAt,
+      body: "current",
+    });
   };
   const handleRelease = (peer: PeerRecord, frame: MeshFrame): void => {
     const room = frame.room ?? DEFAULT_ROOM;
