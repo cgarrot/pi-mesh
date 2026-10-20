@@ -1,7 +1,7 @@
 // extension/tools.ts — the mesh tools (send/reply/status/history/wait_all/
 // ledger/reserve/release). Plain JSON Schema parameters (zero-dependency).
 // Honest statuses: delivered ≠ read ≠ answered. Offline → blocked.
-import { computePeerStatus, MeshClient, type SendResult } from "../client/client.js";
+import { computePeerStatus, MeshClient, type LeaseResult, type SendResult } from "../client/client.js";
 import type { MeshPriority } from "../protocol/envelope.js";
 import { buildFrame, normalizeAlias } from "../protocol/envelope.js";
 import { capTargetName, checkCapSend, validateTaskPackage, type MeshTaskPackage } from "../protocol/task-package.js";
@@ -1090,8 +1090,61 @@ const MESH_RELEASE_PARAMETERS: Record<string, unknown> = {
       items: { type: "string" },
       description: "Specific patterns to release. Omit to release ALL reservations.",
     },
+    task: { type: "string", description: "B: task id (with leaseId) to release a lease instead of reservations." },
+    leaseId: { type: "string", description: "B: lease id returned by mesh_claim." },
   },
 };
+
+const MESH_CLAIM_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["task", "paths"],
+  properties: {
+    task: { type: "string", description: "Stable task id (the lease key)." },
+    paths: {
+      type: "array",
+      minItems: 1,
+      maxItems: MAX_TASK_PATHS,
+      items: { type: "string" },
+      description: "Writable repo-relative paths owned by this task.",
+    },
+    ttlMs: {
+      type: "integer",
+      minimum: 1000,
+      maximum: 86_400_000,
+      description: "Lease TTL (default 6 h).",
+    },
+  },
+};
+
+function leaseText(res: LeaseResult): string {
+  switch (res.status) {
+    case "granted":
+      return `lease granted ${res.lease.leaseId} task=${res.lease.task} fence=${res.lease.epoch}:${res.lease.fence} expires=${res.lease.expiresAt}`;
+    case "held":
+      return `lease held by @${res.holder}`;
+    case "released":
+      return `lease released ${res.lease.leaseId} task=${res.lease.task}`;
+    case "not_held":
+      return "lease not held (wrong owner/leaseId, expired, or already released)";
+    case "error":
+      return `lease error: ${res.reason}`;
+  }
+}
+
+async function execMeshClaim(getRuntime: GetRuntime, params: Record<string, unknown>): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
+  const task = str(params.task);
+  const paths = Array.isArray(params.paths) ? params.paths.filter((p): p is string => typeof p === "string") : [];
+  const ttlMs = typeof params.ttlMs === "number" && Number.isInteger(params.ttlMs) ? params.ttlMs : undefined;
+  if (task === undefined || paths.length === 0) {
+    return textResult("error: task and paths are required", sendDetails({ status: "error", reason: "invalid_frame" }));
+  }
+  const res = await rt.client.claim({ task, paths, ttlMs });
+  const status = res.status === "granted" ? "delivered" : "blocked";
+  return textResult(leaseText(res), sendDetails({ status, task, ...("lease" in res ? { leaseId: res.lease.leaseId, fence: res.lease.fence, epoch: res.lease.epoch, expiresAt: res.lease.expiresAt } : {}), ...("holder" in res ? { holder: res.holder } : {}) }));
+}
 
 async function execMeshRelease(
   getRuntime: GetRuntime,
@@ -1099,6 +1152,16 @@ async function execMeshRelease(
 ): Promise<ToolResult> {
   const rt = getRuntime();
   if (rt === null) return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
+  const leaseId = str(params.leaseId);
+  const leaseTask = str(params.task);
+  if (leaseId !== undefined || leaseTask !== undefined) {
+    if (leaseId === undefined || leaseTask === undefined) {
+      return textResult("error: task and leaseId are required to release a lease", sendDetails({ status: "error", reason: "invalid_frame" }));
+    }
+    const leaseRes = await rt.client.releaseLease({ task: leaseTask, leaseId });
+    const status = leaseRes.status === "released" ? "delivered" : "blocked";
+    return textResult(leaseText(leaseRes), sendDetails({ status, task: leaseTask, leaseId }));
+  }
   const rawPaths = Array.isArray(params.paths)
     ? params.paths.filter((p): p is string => typeof p === "string")
     : undefined;
@@ -1244,12 +1307,23 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
   });
 
   pi.registerTool({
+    name: "mesh_claim",
+    label: "Mesh Claim",
+    description:
+      "Claim a single-writer task lease (task + paths + ttlMs). Returns leaseId " +
+      "and epoch:fence. A second owner gets 'held'; the lease expires by TTL.",
+    promptSnippet: "Claim a task lease before editing (single writer).",
+    parameters: MESH_CLAIM_PARAMETERS,
+    execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshClaim(getRuntime, params),
+  });
+
+  pi.registerTool({
     name: "mesh_release",
     label: "Mesh Release",
     description:
-      "Release reservations. Omit paths to release all. " +
+      "Release reservations (omit paths = all) or a task lease (task + leaseId). " +
       "Peers are notified immediately.",
-    promptSnippet: "Release claimed files.",
+    promptSnippet: "Release claimed files or a task lease.",
     parameters: MESH_RELEASE_PARAMETERS,
     execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshRelease(getRuntime, params),
   });

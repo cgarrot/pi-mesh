@@ -15,6 +15,7 @@ import {
 } from "../protocol/envelope.js";
 import { encodeFrame, FrameDecoder, FrameSizeError, makeMsgId, sha256 } from "../protocol/frames.js";
 import { capTargetName } from "../protocol/task-package.js";
+import { LeaseTable, nextEpoch } from "./lease.js";
 import {
   DEFAULT_MAX_FRAME_BYTES,
   DEFAULT_ROOM,
@@ -25,6 +26,7 @@ import {
   WRITE_TIMEOUT_MS,
   LOCK_VERIFY_WAIT_MS,
   PROTO_VERSION,
+  DEFAULT_LEASE_TTL_MS,
   loadConfig,
   type MeshConfig,
 } from "../shared/config.js";
@@ -53,6 +55,8 @@ export interface BrokerOptions {
   *  alongside TCP/TLS — local sessions keep working unchanged while
   *  remote machines join over the network. */
   alsoUnix?: boolean;
+  /** State dir for the persisted lease epoch (defaults to stateDir()). */
+  stateDir?: string;
 }
 
 export interface RunningBroker {
@@ -64,6 +68,8 @@ export interface RunningBroker {
    *  does the same every MAILBOX_PURGE_INTERVAL_MS; this hook makes the
    *  behavior testable/deterministic). */
   purgeMailboxExpired: (now?: number) => void;
+  /** B: task leases (in-memory; the epoch is persisted in stateDir). */
+  leases: LeaseTable;
 }
 
 type WriteCallback = (ok: boolean) => void;
@@ -107,14 +113,16 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
   const { config, policy } = options;
   const sockPath = options.socketPath ?? brokerSocketPath();
   const state = new BrokerState();
+  const brokerStateDir = options.stateDir ?? stateDir();
+  const leases = new LeaseTable(nextEpoch(brokerStateDir));
   const tcp = options.tcpListen;
   // D39: broker-side lifecycle debug (MESH_DEBUG=1) — destroys, write
   // failures, close reasons. NEVER bodies.
   const dbg = (line: string): void => {
     if (config.debug !== true) return;
     try {
-      mkdirSync(stateDir(), { recursive: true });
-      appendFileSync(`${stateDir()}/broker-debug.log`, `${new Date().toISOString()} ${line}\n`);
+      mkdirSync(brokerStateDir, { recursive: true });
+      appendFileSync(`${brokerStateDir}/broker-debug.log`, `${new Date().toISOString()} ${line}\n`);
     } catch {
       // best effort
     }
@@ -627,6 +635,12 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
     peer.lastSeenAt = Date.now();
 
     switch (frame.type) {
+      case "claim":
+        handleClaim(peer, frame);
+        break;
+      case "release":
+        handleRelease(peer, frame);
+        break;
       case "msg":
         routeMsg(peer, frame);
         break;
@@ -874,6 +888,66 @@ const onTcpConn = (socket: Socket): void => serverHandler(socket, true);
     MAILBOX_PURGE_INTERVAL_MS,
   );
   mailboxPurge.unref();
+  /** B: one reply shape for claim/release outcomes. */
+  const sendLease = (peer: PeerRecord, id: string, fields: Record<string, unknown>): void => {
+    sendTo(peer, buildFrame({ type: "lease", id, replyTo: id, ...fields }));
+  };
+  const handleClaim = (peer: PeerRecord, frame: MeshFrame): void => {
+    const room = frame.room ?? DEFAULT_ROOM;
+    if (!peer.rooms.has(room)) {
+      sendError(peer.socket, "not_member", frame.id);
+      return;
+    }
+    const outcome = leases.claim(
+      frame.task ?? "",
+      peer.alias,
+      frame.paths ?? [],
+      frame.ttlMs ?? DEFAULT_LEASE_TTL_MS,
+    );
+    if (outcome.status === "granted") {
+      const l = outcome.lease;
+      sendLease(peer, frame.id, {
+        status: "granted",
+        task: l.task,
+        owner: l.owner,
+        leaseId: l.leaseId,
+        fence: l.fence,
+        epoch: l.epoch,
+        paths: l.paths,
+        expiresAt: l.expiresAt,
+        body: outcome.reused ? "reused" : "granted",
+      });
+    } else if (outcome.status === "held") {
+      sendLease(peer, frame.id, { status: "held", task: frame.task, owner: outcome.holder, body: "held" });
+    } else {
+      sendLease(peer, frame.id, { status: "invalid", task: frame.task, body: outcome.reason });
+    }
+  };
+  const handleRelease = (peer: PeerRecord, frame: MeshFrame): void => {
+    const room = frame.room ?? DEFAULT_ROOM;
+    if (!peer.rooms.has(room)) {
+      sendError(peer.socket, "not_member", frame.id);
+      return;
+    }
+    const outcome = leases.release(frame.task ?? "", peer.alias, frame.leaseId ?? "");
+    if (outcome.status === "released") {
+      const l = outcome.lease;
+      sendLease(peer, frame.id, {
+        status: "released",
+        task: l.task,
+        owner: l.owner,
+        leaseId: l.leaseId,
+        fence: l.fence,
+        epoch: l.epoch,
+        paths: l.paths,
+        expiresAt: l.expiresAt,
+        body: "released",
+      });
+    } else {
+      sendLease(peer, frame.id, { status: "not_held", task: frame.task, body: "not_held" });
+    }
+  };
+
   const purgeMailboxExpired = (now?: number): void => {
     notifyDropped(purgeAllExpired(state, config, now));
   };
@@ -903,6 +977,7 @@ const onTcpConn = (socket: Socket): void => serverHandler(socket, true);
         state,
         socketPath: unixServer !== undefined ? `${bound} + unix://${sockPath}` : bound,
         purgeMailboxExpired,
+        leases,
         close: () =>
           new Promise<void>((res) => {
             clearInterval(sweep);

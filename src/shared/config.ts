@@ -145,6 +145,9 @@ export const MAX_CAP_CHARS = 32;
 export const CAP_REGEX = /^[a-z0-9][a-z0-9._-]*$/;
 export const MAX_TASK_PACKAGE_BYTES = 4_096;
 export const MAX_TASK_PATHS = 32;
+export const MIN_LEASE_TTL_MS = 1_000;
+export const MAX_LEASE_TTL_MS = 24 * 60 * 60 * 1_000;
+export const DEFAULT_LEASE_TTL_MS = 6 * 60 * 60 * 1_000;
 
 /** Lowercase, de-dupe, validate and bound a capability list. Invalid
  *  entries are dropped (a bad MESH_CAPS value must not break the hello). */

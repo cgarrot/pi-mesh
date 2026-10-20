@@ -10,6 +10,7 @@ import {
   MAX_REFS,
   MAX_REF_CHARS,
   MAX_REPLY_TARGETS,
+  MAX_TASK_PATHS,
   PROTO_VERSION,
   ROOM_REGEX,
   normalizeCaps,
@@ -71,6 +72,14 @@ export interface MeshFrame {
   routedCap?: string;
   /** B: resolved alias of a cap-routed message (sender sees who got it). */
   routedTo?: string;
+  /** B: task lease fields (claim/release/lease). */
+  task?: string;
+  paths?: string[];
+  ttlMs?: number;
+  leaseId?: string;
+  fence?: number;
+  epoch?: number;
+  owner?: string;
   reasonHash?: string; // force only
   expiresAt?: string;
   code?: string;
@@ -128,6 +137,9 @@ export const FRAME_TYPES = [
   "ping",
   "pong",
   "activity",
+  "claim",
+  "release",
+  "lease",
   "error",
 ] as const;
 export type MeshFrameType = (typeof FRAME_TYPES)[number];
@@ -148,6 +160,9 @@ export const ERROR_CODES = [
   "policy_denied",
   "no_capable_peer",
   "caps_unsupported",
+  "lease_held",
+  "lease_not_held",
+  "lease_stale",
   "force_requires_reason",
   "hash_mismatch",
   "reply_without_target",
@@ -276,6 +291,14 @@ export interface BuildFrameOpts {
   /** B: cap-routed result fields (broker → sender). */
   routedCap?: string;
   routedTo?: string;
+  /** B: task lease fields (claim/release/lease). */
+  task?: string;
+  paths?: string[];
+  ttlMs?: number;
+  leaseId?: string;
+  fence?: number;
+  epoch?: number;
+  owner?: string;
   /** B: hello/presence capabilities. */
   caps?: string[];
   /** B: protocol version (hello/welcome/presence). */
@@ -326,6 +349,14 @@ export function buildFrame(opts: BuildFrameOpts): MeshFrame {
   if (opts.taskPackage !== undefined) frame.taskPackage = opts.taskPackage;
   if (opts.routedCap !== undefined) frame.routedCap = opts.routedCap;
   if (opts.routedTo !== undefined) frame.routedTo = opts.routedTo;
+  if (opts.task !== undefined) frame.task = opts.task;
+  if (opts.paths !== undefined) frame.paths = [...opts.paths];
+  if (opts.ttlMs !== undefined) frame.ttlMs = opts.ttlMs;
+  if (opts.leaseId !== undefined) frame.leaseId = opts.leaseId;
+  if (opts.fence !== undefined) frame.fence = opts.fence;
+  if (opts.epoch !== undefined) frame.epoch = opts.epoch;
+  if (opts.owner !== undefined) frame.owner = opts.owner;
+  if (opts.expiresAt !== undefined) frame.expiresAt = opts.expiresAt;
   if (opts.caps !== undefined) frame.caps = [...opts.caps];
   if (opts.proto !== undefined) frame.proto = opts.proto;
   if (opts.stats !== undefined) frame.stats = { ...opts.stats };
@@ -539,6 +570,37 @@ export function validateFrame(value: unknown, opts: ValidateOpts = {}): Validati
   }
   if (value.routedTo !== undefined && (typeof value.routedTo !== "string" || !isValidAlias(value.routedTo))) {
     return { ok: false, code: "invalid_alias", detail: "bad routedTo" };
+  }
+  if (value.task !== undefined && (typeof value.task !== "string" || value.task.length === 0 || value.task.length > 128)) {
+    return { ok: false, code: "invalid_frame", detail: "bad task" };
+  }
+  if (value.paths !== undefined) {
+    if (!Array.isArray(value.paths) || value.paths.length === 0 || value.paths.length > MAX_TASK_PATHS) {
+      return { ok: false, code: "invalid_frame", detail: "bad paths" };
+    }
+    for (const p of value.paths) {
+      if (typeof p !== "string" || p.length === 0 || p.length > 256) {
+        return { ok: false, code: "invalid_frame", detail: "bad paths" };
+      }
+    }
+  }
+  if (value.ttlMs !== undefined && (typeof value.ttlMs !== "number" || !Number.isInteger(value.ttlMs) || value.ttlMs <= 0)) {
+    return { ok: false, code: "invalid_frame", detail: "bad ttlMs" };
+  }
+  if (value.leaseId !== undefined && (typeof value.leaseId !== "string" || value.leaseId.length === 0 || value.leaseId.length > 128)) {
+    return { ok: false, code: "invalid_frame", detail: "bad leaseId" };
+  }
+  if (value.fence !== undefined && (typeof value.fence !== "number" || !Number.isInteger(value.fence) || value.fence < 1)) {
+    return { ok: false, code: "invalid_frame", detail: "bad fence" };
+  }
+  if (value.epoch !== undefined && (typeof value.epoch !== "number" || !Number.isInteger(value.epoch) || value.epoch < 1)) {
+    return { ok: false, code: "invalid_frame", detail: "bad epoch" };
+  }
+  if (value.owner !== undefined && (typeof value.owner !== "string" || !isValidAlias(value.owner))) {
+    return { ok: false, code: "invalid_alias", detail: "bad owner" };
+  }
+  if (value.expiresAt !== undefined && (typeof value.expiresAt !== "string" || Number.isNaN(Date.parse(value.expiresAt)))) {
+    return { ok: false, code: "invalid_frame", detail: "bad expiresAt" };
   }
   if (value.caps !== undefined && !isValidCaps(value.caps)) {
     return { ok: false, code: "invalid_frame", detail: "bad caps" };

@@ -109,6 +109,23 @@ export interface ReplyOpts {
   room?: string;
 }
 
+export interface LeaseInfo {
+  leaseId: string;
+  task: string;
+  owner: string;
+  paths: string[];
+  fence: number;
+  epoch: number;
+  expiresAt: string;
+}
+
+export type LeaseResult =
+  | { status: "granted"; lease: LeaseInfo }
+  | { status: "released"; lease: LeaseInfo }
+  | { status: "held"; holder: string }
+  | { status: "not_held" }
+  | { status: "error"; reason: string };
+
 export type SendResult =
   | { status: "delivered"; msgId: string; deliveredCount?: number; totalCount?: number; routedTo?: string }
   | { status: "queued_offline"; msgId: string; deliveredCount?: number; totalCount?: number; routedTo?: string }
@@ -286,6 +303,7 @@ export class MeshClient extends EventEmitter {
   private ownReservations: FileReservation[] = [];
   /** msgIds we sent that have been READ by peers (read receipts). */
   private readonly readBy = new Map<string, { alias: string; at: string }>();
+  private readonly leaseWaiters = new Map<string, { resolve: (frame: MeshFrame) => void; timer: NodeJS.Timeout }>();
   /** ids of replies WE sent — used to tag reply-à-reply chains. */
   private readonly sentReplies = new Set<string>();
   /** missions sent with awaitReply — who answered (for mesh_wait_all).
@@ -1027,6 +1045,16 @@ export class MeshClient extends EventEmitter {
   private onFrame(frame: MeshFrame): void {
     this.ring(frame);
     switch (frame.type) {
+      case "lease": {
+        const key = frame.replyTo ?? frame.id;
+        const waiter = this.leaseWaiters.get(key);
+        if (waiter !== undefined) {
+          this.leaseWaiters.delete(key);
+          clearTimeout(waiter.timer);
+          waiter.resolve(frame);
+        }
+        break;
+      }
       case "ack": {
         const w = this.ackWaiters.get(frame.id);
         if (w) {
@@ -1920,4 +1948,72 @@ export class MeshClient extends EventEmitter {
     }
     this.emit("closed");
   }
+
+  // ---- B: task leases ----
+
+  /** Claim (or reuse) a task lease. The broker owns the single-holder rule;
+   *  `reused` claims keep the same leaseId/fence so retries are idempotent. */
+  claim(opts: { task: string; paths: string[]; ttlMs?: number; timeoutMs?: number }): Promise<LeaseResult> {
+    const frame = buildFrame({
+      type: "claim",
+      from: this.alias,
+      room: this.homeRoom,
+      task: opts.task,
+      paths: opts.paths,
+      ttlMs: opts.ttlMs,
+    });
+    return this.requestLease(frame, opts.timeoutMs ?? 5_000);
+  }
+
+  /** Release a held lease; the fence stays in the broker's history so a late
+   *  worker cannot resurrect it. */
+  releaseLease(opts: { task: string; leaseId: string; timeoutMs?: number }): Promise<LeaseResult> {
+    const frame = buildFrame({
+      type: "release",
+      from: this.alias,
+      room: this.homeRoom,
+      task: opts.task,
+      leaseId: opts.leaseId,
+    });
+    return this.requestLease(frame, opts.timeoutMs ?? 5_000);
+  }
+
+  private requestLease(frame: MeshFrame, timeoutMs: number): Promise<LeaseResult> {
+    if (!this.online || this.socket === null || this.socket.destroyed) {
+      return Promise.resolve({ status: "error", reason: "broker_unavailable" });
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.leaseWaiters.delete(frame.id);
+        resolve({ status: "error", reason: "timeout" });
+      }, timeoutMs);
+      timer.unref();
+      this.leaseWaiters.set(frame.id, {
+        timer,
+        resolve: (reply) => resolve(leaseResult(reply)),
+      });
+      this.writeOrQueue(frame);
+    });
+  }
+}
+
+function leaseResult(frame: MeshFrame): LeaseResult {
+  const status = frame.status;
+  if (status === "granted" || status === "released") {
+    return {
+      status,
+      lease: {
+        leaseId: frame.leaseId ?? "",
+        task: frame.task ?? "",
+        owner: frame.owner ?? "",
+        paths: frame.paths ?? [],
+        fence: frame.fence ?? 0,
+        epoch: frame.epoch ?? 0,
+        expiresAt: frame.expiresAt ?? "",
+      },
+    };
+  }
+  if (status === "held") return { status: "held", holder: frame.owner ?? "?" };
+  if (status === "not_held") return { status: "not_held" };
+  return { status: "error", reason: frame.body ?? status ?? "lease_failed" };
 }
