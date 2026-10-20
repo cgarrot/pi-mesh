@@ -34,6 +34,7 @@ import {
   MAX_REPLY_TARGETS,
   MIN_AWAIT_REPLY_TIMEOUT_MS,
   OUTBOX_FLUSH_CAP,
+  PROTO_VERSION,
   STATUS_REQ_TIMEOUT_MS,
   TRANSCRIPT_RING_SIZE,
   type MeshConfig,
@@ -244,6 +245,8 @@ export class MeshClient extends EventEmitter {
 
   private socket: Socket | null = null;
   private online = false;
+  /** B: broker protocol version from the last welcome (absent = legacy 1). */
+  private brokerProtoValue = 1;
   private intentionallyClosed = false;
   /** Set by close() ONLY (not the rename detach): an in-flight connect
    *  must abort instead of resurrecting a closed client. Cleared by an
@@ -350,6 +353,11 @@ export class MeshClient extends EventEmitter {
 
   get alias(): string {
     return this.aliasInternal;
+  }
+
+  /** B: broker protocol version (1 = legacy, cap routing unsupported). */
+  get brokerProto(): number {
+    return this.brokerProtoValue;
   }
 
   /** All rooms this client is a member of (re-declared at every hello). */
@@ -887,6 +895,8 @@ export class MeshClient extends EventEmitter {
           reservations: this.ownReservations.length > 0 ? [...this.ownReservations] : undefined,
           token: this.config.brokerToken !== undefined ? sha256(this.config.brokerToken) : undefined,
           clientVersion: MESH_VERSION, // M1: peers see each other's version
+          caps: this.config.caps ?? [], // B: routing hints (proto 2)
+          proto: PROTO_VERSION,
         });
         socket.write(encodeFrame(hello, this.config.maxFrameBytes));
       });
@@ -908,6 +918,7 @@ export class MeshClient extends EventEmitter {
               settled = true;
               clearTimeout(this.helloTimer ?? undefined);
               this.online = true;
+              this.brokerProtoValue = typeof frame.proto === "number" ? frame.proto : 1;
               this.reconnectAttempt = 0;
               this.attachSocket(socket, decoder);
   // seed the peer reservation cache from the welcome snapshot

@@ -8,6 +8,7 @@ import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import {
   buildFrame,
+  effectiveCaps,
   parseFrameLine,
   type MeshErrorCode,
   type MeshFrame,
@@ -22,6 +23,7 @@ import {
   SWEEP_INTERVAL_MS,
   WRITE_TIMEOUT_MS,
   LOCK_VERIFY_WAIT_MS,
+  PROTO_VERSION,
   loadConfig,
   type MeshConfig,
 } from "../shared/config.js";
@@ -283,6 +285,11 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
       via: tokenSockets.has(socket)
         ? `${tcp?.tls === true ? "tls" : "tcp"}:${(socket.remoteAddress ?? "?").replace(/^::ffff:/, "")}`
         : undefined,
+      // B: caps are routing hints only (authorization stays in policy);
+      // a legacy peer (proto<2) advertises none, so cap routing can never
+      // silently target it.
+      caps: effectiveCaps(frame.proto, frame.caps),
+      proto: frame.proto ?? 1,
     };
     state.peers.set(alias, peer);
     state.knownAliases.set(alias, Date.now()); // (re)stamp on every hello
@@ -318,6 +325,7 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
         rooms: [...peer.rooms.keys()],
         peers: peersSnapshot(state),
         mailboxCount: mailboxFrames.length,
+        proto: PROTO_VERSION,
       }),
     );
     for (const mf of mailboxFrames) sendTo(peer, mf); // mailbox frames right after welcome

@@ -2,11 +2,15 @@
 // No Pi imports. Validation rules applied by BOTH broker and client.
 import {
   ALIAS_REGEX,
+  CAP_REGEX,
   MAX_BODY_BYTES,
+  MAX_CAP_CHARS,
+  MAX_CAPS,
   MAX_FRAME_ID_CHARS,
   MAX_REFS,
   MAX_REF_CHARS,
   MAX_REPLY_TARGETS,
+  PROTO_VERSION,
   ROOM_REGEX,
   SHA256_HEX_REGEX,
 } from "../shared/config.js";
@@ -36,6 +40,10 @@ export interface MeshPeerInfo {
   /** D40: how this peer reaches the broker — "tcp:<ip>"/"tls:<ip>" for
   *  remote machines, undefined for broker-local (unix socket) peers. */
   via?: string;
+  /** B: advertised capabilities (routing hints; proto<2 peers advertise none). */
+  caps?: string[];
+  /** B: client protocol version (absent = legacy 1). */
+  proto?: number;
 }
 
 
@@ -84,6 +92,10 @@ export interface MeshFrame {
   /** M1: extension version of the sender (hello) — shown in status snapshots
   *  so stale sessions are visible at a glance. */
   clientVersion?: string;
+  /** B: hello/presence capabilities (routing hints; never authorization). */
+  caps?: string[];
+  /** B: protocol version (hello/welcome/presence; absent = legacy 1). */
+  proto?: number;
   /** M2: broker counters (status_res). */
   stats?: { relayed: number; refused: number; mailboxDelivered: number; mailboxDropped: number };
   ts: string;
@@ -249,6 +261,10 @@ export interface BuildFrameOpts {
   receipt?: boolean;
   /** M1: extension version (hello). */
   clientVersion?: string;
+  /** B: hello/presence capabilities. */
+  caps?: string[];
+  /** B: protocol version (hello/welcome/presence). */
+  proto?: number;
   /** M2: broker counters (status_res). */
   stats?: { relayed: number; refused: number; mailboxDelivered: number; mailboxDropped: number };
 }
@@ -292,6 +308,8 @@ export function buildFrame(opts: BuildFrameOpts): MeshFrame {
   if (opts.interrupt !== undefined) frame.interrupt = opts.interrupt;
   if (opts.receipt !== undefined) frame.receipt = opts.receipt;
   if (opts.clientVersion !== undefined) frame.clientVersion = opts.clientVersion;
+  if (opts.caps !== undefined) frame.caps = [...opts.caps];
+  if (opts.proto !== undefined) frame.proto = opts.proto;
   if (opts.stats !== undefined) frame.stats = { ...opts.stats };
   return frame;
 }
@@ -310,6 +328,32 @@ const ISO_8601_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}
 
 function isValidIso(s: unknown): s is string {
   return typeof s === "string" && ISO_8601_REGEX.test(s) && !Number.isNaN(Date.parse(s));
+}
+
+/** B: capabilities are honored only from proto>=2 peers; legacy peers
+ *  advertise none, so a cap route never silently targets an old client. */
+export function effectiveCaps(proto: number | undefined, caps: string[] | undefined): string[] {
+  if (proto === undefined || proto < PROTO_VERSION) return [];
+  return caps ?? [];
+}
+
+function isValidCaps(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length > MAX_CAPS) return false;
+  for (const cap of value) {
+    if (
+      typeof cap !== "string" ||
+      cap.length === 0 ||
+      cap.length > MAX_CAP_CHARS ||
+      !CAP_REGEX.test(cap)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isValidProto(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 1000;
 }
 
 export interface ValidateOpts {
@@ -456,6 +500,29 @@ export function validateFrame(value: unknown, opts: ValidateOpts = {}): Validati
   if (value.clientVersion !== undefined) {
     if (typeof value.clientVersion !== "string" || value.clientVersion.length === 0 || value.clientVersion.length > 64) {
       return { ok: false, code: "invalid_frame", detail: "bad clientVersion" };
+    }
+  }
+
+  // B: caps/proto — shape-checked; effectiveCaps() decides whether they
+  // are honored (proto>=2), so a legacy peer's stray caps are inert.
+  if (value.caps !== undefined && !isValidCaps(value.caps)) {
+    return { ok: false, code: "invalid_frame", detail: "bad caps" };
+  }
+  if (value.proto !== undefined && !isValidProto(value.proto)) {
+    return { ok: false, code: "invalid_frame", detail: "bad proto" };
+  }
+  if (value.peers !== undefined) {
+    if (!Array.isArray(value.peers)) {
+      return { ok: false, code: "invalid_frame", detail: "bad peers" };
+    }
+    for (const p of value.peers) {
+      if (!isRecord(p)) return { ok: false, code: "invalid_frame", detail: "bad peer" };
+      if (p.caps !== undefined && !isValidCaps(p.caps)) {
+        return { ok: false, code: "invalid_frame", detail: "bad peer caps" };
+      }
+      if (p.proto !== undefined && !isValidProto(p.proto)) {
+        return { ok: false, code: "invalid_frame", detail: "bad peer proto" };
+      }
     }
   }
 

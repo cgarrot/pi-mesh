@@ -18,6 +18,10 @@ export interface PeerRecord {
   /** D40: connection origin — "tcp:<remote-ip>" / "tls:<remote-ip>" for
   *  network peers, undefined for broker-local unix-socket peers. */
   via?: string;
+  /** B: routed capabilities (effective caps after proto negotiation). */
+  caps?: string[];
+  /** B: client protocol version (absent = legacy 1). */
+  proto?: number;
 }
 
 export interface StoredMsg {

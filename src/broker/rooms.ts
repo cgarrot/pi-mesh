@@ -57,8 +57,10 @@ export function presenceFrame(
   alias: string,
   status: "online" | "offline",
   room: string,
+  caps?: string[],
+  proto?: number,
 ): ReturnType<typeof buildFrame> {
-  return buildFrame({ type: "presence", from: alias, status, room });
+  return buildFrame({ type: "presence", from: alias, status, room, caps, proto });
 }
 
 /** Write a frame to every online member of a room (optionally excluding one). */
@@ -85,7 +87,7 @@ export function announceOnline(
   write: (peer: PeerRecord, frame: ReturnType<typeof buildFrame>) => void,
 ): void {
   for (const roomId of peer.rooms.keys()) {
-    broadcastToRoom(state, roomId, presenceFrame(peer.alias, "online", roomId), peer.alias, write);
+    broadcastToRoom(state, roomId, presenceFrame(peer.alias, "online", roomId, peer.caps, peer.proto), peer.alias, write);
   }
 }
 
@@ -114,6 +116,8 @@ export function peersSnapshot(state: BrokerState, roomId?: string): {
   clientVersion?: string;
   activity?: { state: "busy" | "idle" | "rate_limited" | "blocked"; at: string };
   via?: string;
+  caps?: string[];
+  proto?: number;
 }[] {
   const out: {
     alias: string;
@@ -125,6 +129,8 @@ export function peersSnapshot(state: BrokerState, roomId?: string): {
     clientVersion?: string;
     activity?: { state: "busy" | "idle" | "rate_limited" | "blocked"; at: string };
     via?: string;
+    caps?: string[];
+    proto?: number;
   }[] = [];
   for (const peer of state.peers.values()) {
     if (!peer.helloDone) continue;
@@ -140,6 +146,8 @@ export function peersSnapshot(state: BrokerState, roomId?: string): {
       clientVersion: peer.clientVersion,
       activity: peer.activity,
       via: peer.via,
+      caps: peer.caps !== undefined && peer.caps.length > 0 ? [...peer.caps] : undefined,
+      proto: peer.proto,
     });
   }
   return out;
