@@ -4,6 +4,7 @@
 import { computePeerStatus, MeshClient, type SendResult } from "../client/client.js";
 import type { MeshPriority } from "../protocol/envelope.js";
 import { buildFrame, normalizeAlias } from "../protocol/envelope.js";
+import { capTargetName, checkCapSend, validateTaskPackage, type MeshTaskPackage } from "../protocol/task-package.js";
 import { sha256 } from "../protocol/frames.js";
 import {
   DEFAULT_AWAIT_REPLY_TIMEOUT_MS,
@@ -12,6 +13,7 @@ import {
   MAX_BODY_BYTES,
   MAX_REFS,
   MAX_REPLY_TARGETS,
+  MAX_TASK_PATHS,
   MIN_AWAIT_REPLY_TIMEOUT_MS,
   TRANSCRIPT_RING_SIZE,
 } from "../shared/config.js";
@@ -214,7 +216,7 @@ export function busyTargetWarning(
 const MESH_SEND_PARAMETERS: Record<string, unknown> = {
   type: "object",
   properties: {
-    to: { type: "string", description: "Target alias ('@' tolerated, case-insensitive). OMIT when broadcast: true." },
+    to: { type: "string", description: "Target alias ('@' tolerated, case-insensitive) or 'cap:<name>' (requires taskPackage). OMIT when broadcast: true." },
     message: { type: "string", description: "Message body (1..32 KiB)." },
     room: {
       type: "string",
@@ -265,6 +267,44 @@ const MESH_SEND_PARAMETERS: Record<string, unknown> = {
       maxItems: MAX_REFS,
       description: "Repo-relative reference paths (≤ 8).",
     },
+    taskPackage: {
+      type: "object",
+      additionalProperties: false,
+      required: ["task", "goalAcceptance", "paths", "branchBase", "reply"],
+      description:
+        "B: five-field assignment contract. REQUIRED for to:'cap:<name>'; " +
+        "the lane has no access to your session, so this must be self-contained.",
+      properties: {
+        task: { type: "string", description: "Stable task id (used by lease + evidence)." },
+        goalAcceptance: { type: "string", description: "Testable goal + acceptance criteria." },
+        paths: {
+          type: "array",
+          minItems: 1,
+          maxItems: MAX_TASK_PATHS,
+          items: { type: "string" },
+          description: "Writable repo-relative paths.",
+        },
+        branchBase: {
+          type: "object",
+          additionalProperties: false,
+          required: ["branch", "base"],
+          properties: {
+            branch: { type: "string", description: "Worktree branch, e.g. agent/<alias>/<task>." },
+            base: { type: "string", description: "Base branch/commit." },
+          },
+        },
+        reply: {
+          type: "object",
+          additionalProperties: false,
+          required: ["to", "deadline", "format"],
+          properties: {
+            to: { type: "string", description: "Who receives the reply." },
+            deadline: { type: "string", description: "ISO date-time." },
+            format: { type: "string", description: "What to report (commit/tests/blockers)." },
+          },
+        },
+      },
+    },
     replyTo: {
       type: "array",
       items: { type: "string" },
@@ -297,10 +337,46 @@ async function execMeshSend(
   if (broadcast && toRaw !== undefined) {
     return textResult("error: broadcast_with_to (omit 'to' when broadcasting)", sendDetails({ status: "error", reason: "broadcast_with_to" }));
   }
+  // B: cap targets are not aliases; the broker routes by capability later.
+  // The five-field package is mandatory for cap sends — a bare "capable and
+  // idle" peer without the contract is exactly the wrong worker.
+  const capName = !broadcast && toRaw !== undefined ? capTargetName(toRaw) : undefined;
+  if (!broadcast && toRaw !== undefined && toRaw.trim().toLowerCase().startsWith("cap:") && capName === undefined) {
+    return textResult(
+      "error: invalid_target (cap:<name> is not a valid capability)",
+      sendDetails({ status: "error", reason: "invalid_target" }),
+    );
+  }
+  let taskPackage: MeshTaskPackage | undefined;
+  if (capName !== undefined && toRaw !== undefined) {
+    const gate = checkCapSend(toRaw, params.taskPackage);
+    if (!gate.ok) {
+      return textResult(
+        `error: ${gate.reason} — to:'cap:<name>' needs a valid five-field taskPackage`,
+        sendDetails({ status: "error", reason: gate.reason, to: toRaw }),
+      );
+    }
+    taskPackage = gate.value;
+  } else if (params.taskPackage !== undefined) {
+    const pkg = validateTaskPackage(params.taskPackage);
+    if (!pkg.ok) {
+      return textResult(
+        `error: invalid_task_package — ${pkg.reason}`,
+        sendDetails({ status: "error", reason: "invalid_task_package", to: toRaw }),
+      );
+    }
+    taskPackage = pkg.value;
+  }
   // A8: ledger records + tool details store the CANONICAL alias ('@Bob' → 'bob')
   // so ledger predicates are insensitive to how the model typed the alias.
   // Guards (checkSend) and client.send normalize idempotently; result text unchanged.
-  const to = toRaw !== undefined ? normalizeAlias(toRaw) : "*"; // '*' = broadcast target
+  const to = broadcast
+    ? "*"
+    : capName !== undefined
+      ? `cap:${capName}`
+      : toRaw !== undefined
+        ? normalizeAlias(toRaw)
+        : "*"; // '*' = broadcast target
   // Room resolution mirrors the client: explicit room wins; otherwise
   // "default" when still joined, else the FIRST joined room. A session
   // that left "default" (e.g. agent-master in cs-room only) must NOT
@@ -330,7 +406,7 @@ async function execMeshSend(
   // can ONLY come from an explicit to:"*" (broadcast sends skip this block
   // — they set to internally and never re-enter), so it is caught too.
   const sendWarnings: string[] = [];
-  if (!broadcast) {
+  if (!broadcast && capName === undefined) {
     const check = checkSendTarget(
       to,
       (a) => rt.client.knowsPeer(a),
@@ -346,10 +422,12 @@ async function execMeshSend(
       );
     }
     if (check.warning !== undefined) sendWarnings.push(check.warning);
+  } else if (!broadcast && capName !== undefined) {
+    sendWarnings.push(`cap:${capName} — broker picks an idle capable peer`);
   }
   // M2 busy-target warning: awaitReply toward a peer busy for longer than
   // the timeout is a near-certain expiry (measured: 6/6 in cs-room).
-  if (!broadcast && awaitReply) {
+  if (!broadcast && awaitReply && capName === undefined) {
     const busyWarn = busyTargetWarning(
       to,
       rt.client.busyForMs(to),
@@ -388,7 +466,7 @@ async function execMeshSend(
 
   const res = await rt.client.send({
     to: broadcast ? undefined : to,
-    message, room, priority, reason, interrupt, awaitReply, block, timeoutMs, refs, broadcast, replyTo,
+    message, room, priority, reason, interrupt, awaitReply, block, timeoutMs, refs, taskPackage, broadcast, replyTo,
     signal: !launch && signal !== undefined ? signal : undefined,
   });
 

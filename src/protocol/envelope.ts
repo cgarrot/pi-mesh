@@ -15,6 +15,7 @@ import {
   SHA256_HEX_REGEX,
 } from "../shared/config.js";
 import { makeMsgId, nowIso, sha256 } from "./frames.js";
+import { capTargetName, validateTaskPackage, type MeshTaskPackage } from "./task-package.js";
 
 export type MeshPriority = "normal" | "urgent" | "force";
 export type MeshRole = "member" | "observer";
@@ -63,6 +64,8 @@ export interface MeshFrame {
   body?: string; // TRANSIENT — never persisted 
   bodyHash?: string;
   refs?: string[];
+  /** B: five-field assignment contract (required for `cap:` sends). */
+  taskPackage?: MeshTaskPackage;
   reasonHash?: string; // force only
   expiresAt?: string;
   code?: string;
@@ -261,6 +264,8 @@ export interface BuildFrameOpts {
   receipt?: boolean;
   /** M1: extension version (hello). */
   clientVersion?: string;
+  /** B: five-field assignment contract (required for `cap:` sends). */
+  taskPackage?: MeshTaskPackage;
   /** B: hello/presence capabilities. */
   caps?: string[];
   /** B: protocol version (hello/welcome/presence). */
@@ -308,6 +313,7 @@ export function buildFrame(opts: BuildFrameOpts): MeshFrame {
   if (opts.interrupt !== undefined) frame.interrupt = opts.interrupt;
   if (opts.receipt !== undefined) frame.receipt = opts.receipt;
   if (opts.clientVersion !== undefined) frame.clientVersion = opts.clientVersion;
+  if (opts.taskPackage !== undefined) frame.taskPackage = opts.taskPackage;
   if (opts.caps !== undefined) frame.caps = [...opts.caps];
   if (opts.proto !== undefined) frame.proto = opts.proto;
   if (opts.stats !== undefined) frame.stats = { ...opts.stats };
@@ -379,10 +385,15 @@ export function validateFrame(value: unknown, opts: ValidateOpts = {}): Validati
   }
   if (!isValidIso(value.ts)) return { ok: false, code: "invalid_frame", detail: "bad ts" };
 
-  // Rule 2: aliases
+  // Rule 2: aliases — `to` may also be a capability route ("cap:<name>").
   for (const key of ["from", "to"] as const) {
     const alias = value[key];
-    if (alias !== undefined && (typeof alias !== "string" || !isValidAlias(alias))) {
+    if (alias === undefined) continue;
+    if (typeof alias !== "string") {
+      return { ok: false, code: "invalid_alias", detail: `bad ${key}` };
+    }
+    if (key === "to" && capTargetName(alias) !== undefined) continue;
+    if (!isValidAlias(alias)) {
       return { ok: false, code: "invalid_alias", detail: `bad ${key}` };
     }
   }
@@ -505,6 +516,10 @@ export function validateFrame(value: unknown, opts: ValidateOpts = {}): Validati
 
   // B: caps/proto — shape-checked; effectiveCaps() decides whether they
   // are honored (proto>=2), so a legacy peer's stray caps are inert.
+  if (value.taskPackage !== undefined) {
+    const pkg = validateTaskPackage(value.taskPackage);
+    if (!pkg.ok) return { ok: false, code: "invalid_frame", detail: `bad taskPackage: ${pkg.reason}` };
+  }
   if (value.caps !== undefined && !isValidCaps(value.caps)) {
     return { ok: false, code: "invalid_frame", detail: "bad caps" };
   }

@@ -42,6 +42,7 @@ import {
 import { runtimeDir, stateDir } from "../shared/paths.js";
 import { MESH_VERSION } from "../shared/version.js";
 import { PendingReplies } from "./pending.js";
+import { capTargetName, type MeshTaskPackage } from "../protocol/task-package.js";
 import { backoffMs, ensureBroker } from "./reconnect.js";
 
 export interface WelcomeInfo {
@@ -72,6 +73,8 @@ export interface SendOpts {
   block?: boolean;
   timeoutMs?: number;
   refs?: string[];
+  /** B: five-field assignment contract (required for `cap:` targets). */
+  taskPackage?: MeshTaskPackage;
   /** fan out to every room member (room required, to must be absent). */
   broadcast?: boolean;
   /** aliases that should receive the reply instead of the sender
@@ -1272,12 +1275,19 @@ export class MeshClient extends EventEmitter {
 
   async send(opts: SendOpts): Promise<SendResult> {
     const broadcast = opts.broadcast === true;
-    const to = opts.to !== undefined ? normalizeAlias(opts.to) : undefined;
+    const cap = !broadcast && opts.to !== undefined ? capTargetName(opts.to.trim()) : undefined;
+    const to = cap !== undefined
+      ? `cap:${cap}`
+      : opts.to !== undefined
+        ? normalizeAlias(opts.to)
+        : undefined;
     if (broadcast) {
   // broadcast needs a room and must NOT carry a target
       if (to !== undefined) return { status: "error", reason: "broadcast_with_to" };
     } else {
-      if (to === undefined || !isValidAlias(to)) return { status: "error", reason: "invalid_alias" };
+      if (to === undefined || (cap === undefined && !isValidAlias(to))) {
+        return { status: "error", reason: "invalid_alias" };
+      }
       if (to === this.alias) return { status: "blocked", reason: "self_send" };
     }
   // Room resolution: explicit room wins; otherwise prefer "default" when
@@ -1346,6 +1356,7 @@ export class MeshClient extends EventEmitter {
       priority,
       body: opts.message,
       refs: opts.refs,
+      taskPackage: opts.taskPackage,
       broadcast: broadcast ? true : undefined,
       replyTargets,
       reasonHash: priority === "force" ? sha256(opts.reason ?? "") : undefined,
