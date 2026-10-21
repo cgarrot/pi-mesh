@@ -171,6 +171,49 @@ describe("waitAll (D42)", () => {
     assert.equal(again.missing.length, 1);
   });
 
+  it("an uncorrelated plain msg from the target does NOT settle the mission — but the verdict surfaces it as lastActivity", async () => {
+    lead.cancelAllAwaited();
+    bob.removeAllListeners("inbound");
+    carol.removeAllListeners("inbound");
+  // the azo-ext failure mode (2026-10-18): the target answers with a FRESH
+  // send instead of a correlated mesh_reply — the answer visibly arrives
+  // (mesh-live preview) yet the mission is legitimately NOT answered.
+    const r = await lead.send({ to: "bob", message: "answer me properly", awaitReply: true, block: false, timeoutMs: 30_000 });
+    assert.equal(r.status, "delivered");
+    const note = await bob.send({ to: "lead", message: "status note: working on it (uncorrelated)" });
+    assert.equal(note.status, "delivered");
+  // lead received bob's plain msg
+    await waitFor(() => (lead.lastInboundSince("bob", 0) !== undefined ? true : undefined));
+    const res = await lead.waitAll(500);
+    assert.equal(res.status, "timeout");
+    assert.equal(res.answered, 0, "a plain msg never settles a mission");
+    assert.equal(res.missing.length, 1);
+    const miss = res.missing[0]!;
+    assert.equal(miss.to, "bob");
+    assert.ok(miss.lastActivity !== undefined, "verdict carries the uncorrelated activity");
+    assert.equal(miss.lastActivity!.type, "msg");
+    assert.equal(miss.lastActivity!.msgId, note.status === "delivered" ? note.msgId : "");
+    assert.ok(miss.lastActivity!.at > "", "activity timestamp present");
+  // and the evidence window is anchored on the mission send time
+    const m = lead.missionStatus().find((x) => x.msgId === r.msgId);
+    assert.ok(m !== undefined && !m.answered, "mission still honestly unanswered");
+  });
+
+  it("lastInboundSince ignores activity that predates the mission", async () => {
+    lead.cancelAllAwaited();
+  // bob's earlier note is in the map; a NEW mission starts AFTER it — its
+  // verdict must NOT show the pre-mission note as lastActivity.
+    const before = lead.lastInboundSince("bob", 0);
+    assert.ok(before !== undefined, "pre-mission note recorded");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const r = await lead.send({ to: "bob", message: "fresh mission", awaitReply: true, block: false, timeoutMs: 30_000 });
+    assert.equal(r.status, "delivered");
+    const res = await lead.waitAll(300);
+    const miss = res.missing.find((m) => m.msgId === r.msgId);
+    assert.ok(miss !== undefined);
+    assert.equal(miss.lastActivity, undefined, "pre-mission activity is not evidence");
+  });
+
 });
 
 

@@ -8,12 +8,14 @@ import os from "node:os";
 import path from "node:path";
 import { MeshClient } from "../src/client/client.js";
 import {
+  chooseInitialIdentity,
   PENDING_TTL_MS,
   identityFileExists,
   identityFromClient,
   identityPath,
   MeshIdentity,
   RESERVATION_TTL_MS,
+  saveIdentityOf,
 } from "../src/shared/identity-store.js";
 import { makeTempDirs, startTestBroker, waitFor, type TempDirs } from "./helpers.js";
 
@@ -329,6 +331,188 @@ describe("identity pending handoff (D30: /mesh new)", () => {
       stale.updatedAt = new Date(Date.now() - PENDING_TTL_MS - 60_000).toISOString();
       id.savePending(stale);
       assert.equal(id.consumePending(), null);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pi parity: the chosen alias must survive a conflict fallback, and the
+// /mesh new / fork handoff must be bound to its intended child session.
+// (The OpenCode adapter had both; the Pi adapter wrote the fallback and lost
+// the chosen name — "my agent keeps changing name and room".)
+// ---------------------------------------------------------------------------
+
+describe("identity: preferredAlias survives every save (Pi write path)", () => {
+  it("identityFromClient carries preferredAlias and parse preserves it", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      const id = new MeshIdentity(dir);
+      // a conflict fallback: connected as the random alias, chosen one kept
+      const persisted = identityFromClient(
+        SID,
+        { alias: "agent-abc123", rooms: ["aso12"], reservations: [] },
+        "aso-12",
+      );
+      assert.equal(persisted.preferredAlias, "aso-12");
+      id.save(persisted);
+      const loaded = id.load(SID);
+      assert.equal(loaded?.alias, "agent-abc123");
+      assert.equal(loaded?.preferredAlias, "aso-12", "preferred alias must NOT be wiped by a save");
+      assert.deepEqual(loaded?.rooms, ["aso12"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("save → reload → retry preferred: the attach choice is the chosen alias", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      const id = new MeshIdentity(dir);
+      id.save(identityFromClient(SID, { alias: "agent-abc123", rooms: ["aso12"], reservations: [] }, "aso-12"));
+      const choice = chooseInitialIdentity({ rooms: ["default"] }, id.load(SID));
+      assert.equal(choice.alias, "aso-12", "preferred alias is retried at attach");
+      assert.equal(choice.preferredAlias, "aso-12");
+      assert.deepEqual(choice.rooms, ["aso12"], "persisted rooms win over defaults");
+      assert.equal(choice.reason, "preferred");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("identity: naming precedence (alias + rooms)", () => {
+  const persisted = {
+    version: 1 as const,
+    sessionId: SID,
+    alias: "agent-fallback",
+    preferredAlias: "aso-12",
+    rooms: ["aso12"],
+    reservations: [],
+    updatedAt: new Date().toISOString(),
+  };
+
+  it("explicit config alias wins over the persisted preference", () => {
+    const choice = chooseInitialIdentity({ alias: "pinned", rooms: ["default"] }, persisted);
+    assert.equal(choice.alias, "pinned");
+    assert.equal(choice.preferredAlias, "pinned");
+    assert.equal(choice.reason, "config-alias");
+  });
+
+  it("a PINNED room list (MESH_ROOMS / roomsPinned) wins over stale persisted rooms", () => {
+    const choice = chooseInitialIdentity(
+      { rooms: ["aso12"], roomsPinned: true },
+      { ...persisted, rooms: ["default"] },
+    );
+    assert.deepEqual(choice.rooms, ["aso12"], "an explicit room pin must not be overridden by disk state");
+  });
+
+  it("without a pin, live membership survives the reload", () => {
+    const choice = chooseInitialIdentity({ rooms: ["default"] }, persisted);
+    assert.deepEqual(choice.rooms, ["aso12"]);
+  });
+
+  it("a fresh session gets the configured rooms", () => {
+    const choice = chooseInitialIdentity({ rooms: ["aso12"] }, null);
+    assert.equal(choice.alias, undefined);
+    assert.deepEqual(choice.rooms, ["aso12"]);
+    assert.equal(choice.reason, "fresh");
+  });
+});
+
+describe("identity: named agent slot (identityKey)", () => {
+  it("one slot survives a NEW session id (restart/new conversation)", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      const id = new MeshIdentity(dir);
+      const oldSession = "019faaaa-0000-7000-8000-0000000000c1";
+      const newSession = "019faaaa-0000-7000-8000-0000000000c2";
+      id.save(
+        identityFromClient(oldSession, { alias: "aso-12", rooms: ["aso12"], reservations: [] }, "aso-12"),
+        "aso12",
+      );
+      assert.equal(id.load(newSession), null, "per-session identity does not leak");
+      const slot = id.load(newSession, "aso12");
+      assert.equal(slot?.alias, "aso-12");
+      assert.equal(slot?.preferredAlias, "aso-12");
+      assert.deepEqual(slot?.rooms, ["aso12"]);
+      assert.notEqual(id.fileFor(newSession, "aso12"), id.fileFor(newSession), "slot file is its own path");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("reset wipes the slot, and an invalid key cannot escape the stateDir", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      const id = new MeshIdentity(dir);
+      id.save(identityFromClient(SID, { alias: "aso-12", rooms: ["aso12"], reservations: [] }), "aso12");
+      id.reset(SID, "aso12");
+      assert.equal(id.load(SID, "aso12"), null);
+      assert.equal(id.load(SID, "../escape"), null, "path traversal key is refused");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("identity handoff: bound to the intended child session", () => {
+  const parent = "/tmp/mesh-parent-session.jsonl";
+  const other = "/tmp/mesh-other-session.jsonl";
+
+  it("another new session in the same stateDir can NOT steal alias+rooms", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      const id = new MeshIdentity(dir);
+      id.savePending(
+        identityFromClient(SID, { alias: "aso-12", rooms: ["aso12"], reservations: [] }, "aso-12"),
+        undefined,
+        { forParent: parent },
+      );
+      // an unrelated session (no parent) and a sibling's child: both refused
+      assert.equal(id.consumePending({ parentFile: undefined }), null);
+      assert.equal(id.consumePending({ parentFile: other }), null);
+      // the intended child takes it exactly once
+      const taken = id.consumePending({ parentFile: parent });
+      assert.equal(taken?.identity.alias, "aso-12");
+      assert.deepEqual(taken?.identity.rooms, ["aso12"]);
+      assert.equal(id.consumePending({ parentFile: parent }), null);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("legacy (unbound) handoffs keep the single-consumer behavior", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      const id = new MeshIdentity(dir);
+      id.savePending(identityFromClient(SID, { alias: "legacy", rooms: ["room-a"], reservations: [] }));
+      assert.equal(id.consumePending({ parentFile: other })?.identity.alias, "legacy");
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe("identity: single write path (saveIdentityOf)", () => {
+  it("reservation / rename / shutdown saves all keep preferredAlias + slot key", () => {
+    const { dir, cleanup } = tmpStateDir();
+    try {
+      const id = new MeshIdentity(dir);
+      const rt = {
+        sessionId: SID,
+        preferredAlias: "aso-12",
+        identityKey: "aso12",
+        client: { alias: "agent-fallback", rooms: ["aso12"], reservations: [] },
+      };
+      saveIdentityOf(id, rt);
+      const stored = id.load(SID, "aso12");
+      assert.equal(stored?.alias, "agent-fallback");
+      assert.equal(stored?.preferredAlias, "aso-12", "a reserve/release save must not erase the chosen alias");
+      assert.deepEqual(stored?.rooms, ["aso12"]);
+      // a later plain per-session save must not appear (slot is its own file)
+      assert.equal(id.load(SID), null);
     } finally {
       cleanup();
     }
