@@ -7,7 +7,7 @@ import { brokerLockPath, brokerSocketPath } from "../shared/paths.js";
 import { MESH_VERSION } from "../shared/version.js";
 import { attachClientListeners, updateSessionName } from "./attach.js";
 import type { MeshHud } from "./hud.js";
-import { identityFromClient } from "../shared/identity-store.js";
+import { identityFromClient, saveIdentityOf } from "../shared/identity-store.js";
 import type { ExtensionAPI, SessionContext } from "./pi-types.js";
 import type { GetRuntime, MeshRuntime } from "./tools.js";
 
@@ -34,11 +34,9 @@ function notify(ctx: SessionContext, message: string): void {
 
 /** persist alias/rooms after a mutation (join/leave/rename). */
 function persistIdentity(rt: MeshRuntime): void {
-  try {
-    rt.identity.save(identityFromClient(rt.sessionId, rt.client));
-  } catch {
-  // best effort
-  }
+  // preferredAlias travels with every save: the chosen name must survive a
+  // conflict fallback (see MeshRuntime.preferredAlias).
+  saveIdentityOf(rt.identity, rt);
 }
 
 /**
@@ -103,6 +101,7 @@ async function cmdJoin(
     const renamed = await rt.client.rename(asAlias);
     if (renamed.ok) {
       if (renamed.unchanged !== true) {
+        rt.preferredAlias = renamed.alias; // the alias the user chose
         notify(ctx, `mesh: alias changed @${renamed.alias}`);
         persistIdentity(rt);
       }
@@ -150,12 +149,16 @@ async function cmdLeave(rt: MeshRuntime, ctx: SessionContext, room: string | und
 
 async function cmdAlias(rt: MeshRuntime, ctx: SessionContext, alias: string | undefined, pi: ExtensionAPI): Promise<void> {
   if (alias === undefined) {
-    notify(ctx, `mesh alias: @${rt.client.alias}`);
+    const preferred =
+      rt.preferredAlias !== rt.client.alias ? ` (preferred: @${rt.preferredAlias} — reclaimed automatically)` : "";
+    const slot = rt.identityKey !== undefined ? ` · slot=${rt.identityKey}` : "";
+    notify(ctx, `mesh alias: @${rt.client.alias}${preferred}${slot}`);
     return;
   }
   const renamed = await rt.client.rename(alias);
   if (renamed.ok) {
     if (renamed.unchanged !== true) {
+      rt.preferredAlias = renamed.alias; // pin the new name across conflicts
       notify(ctx, `mesh: alias changed @${renamed.alias}`);
       persistIdentity(rt);
       updateSessionName(pi, rt);
@@ -197,7 +200,10 @@ async function cmdNew(
             `${f.ts.slice(11, 19)} ${f.type} ${f.from ?? "?"}→${f.to ?? "*"}: ${(f.body ?? "").slice(0, 120)}`,
         )
     : undefined;
-  rt.identity.savePending(identityFromClient(rt.sessionId, rt.client), history);
+  rt.identity.savePending(identityFromClient(rt.sessionId, rt.client, rt.preferredAlias), history, {
+    // Bind the handoff to THIS session's file: only its child may take it.
+    forParent: rt.ctx?.sessionManager?.getSessionFile?.(),
+  });
   if (typeof ctx.newSession !== "function") {
     notify(ctx, "mesh: /mesh new requires a TUI session (newSession unavailable)");
     return;
@@ -205,8 +211,26 @@ async function cmdNew(
   // The ctx becomes STALE after newSession resolves — notify BEFORE, and
   // do any post-replacement work inside withSession (fresh ctx).
   notify(ctx, `mesh: opening a new session — @${rt.client.alias} handed off (rooms/reservations kept)`);
+  const parentFile = rt.ctx?.sessionManager?.getSessionFile?.();
   const res = await ctx.newSession({
+    ...(parentFile !== undefined && parentFile !== "" ? { parentSession: parentFile } : {}),
     withSession: async (newCtx) => {
+  // DIRECT handoff too: the child may have started before this callback
+  // (session_start runs first) — writing its identity file makes the handoff
+  // idempotent and lets us clear the staged fallback. With a named slot the
+  // child already loaded the same file at boot.
+      try {
+        const newId = newCtx.sessionManager?.getSessionId?.() ?? "";
+        if (newId !== "" || rt.identityKey !== undefined) {
+          rt.identity.save(
+            identityFromClient(newId !== "" ? newId : rt.sessionId, rt.client, rt.preferredAlias),
+            rt.identityKey,
+          );
+          rt.identity.clearPending();
+        }
+      } catch {
+  // best effort — the bound pending file is the fallback
+      }
   // fresh session context: report the handoff there
       try {
         newCtx.ui?.notify("mesh: identity handoff received — same alias/rooms/reservations", {
@@ -234,8 +258,8 @@ async function cmdReset(
   rt.markDetached?.();
   // 1. leave the mesh cleanly (alias/rooms/reservations purged at the broker)
   await rt.client.close().catch(() => {});
-  // 2. factory-reset the persisted identity for this session
-  rt.identity.reset(rt.sessionId);
+  // 2. factory-reset the persisted identity for this session (or SLOT)
+  rt.identity.reset(rt.sessionId, rt.identityKey);
   // 3. spawn a fresh client in-place (same runtime object, re-attached)
   const config = loadConfig(rt.stateDir);
   const fresh = new MeshClient({
@@ -245,12 +269,9 @@ async function cmdReset(
     config,
   });
   rt.client = fresh;
+  rt.preferredAlias = config.alias !== undefined && config.alias !== "" ? config.alias : fresh.alias;
   attachClientListeners(pi, rt, getHud, ctx, fresh, (r) => {
-    try {
-      r.identity.save(identityFromClient(r.sessionId, r.client));
-    } catch {
-  // best effort
-    }
+    saveIdentityOf(r.identity, r);
   });
   try {
     await fresh.connect();
@@ -391,6 +412,9 @@ function cmdBroker(rt: MeshRuntime, ctx: SessionContext): void {
     `  version: ${MESH_VERSION}`,
     `  socket: ${sock}`,
     `  lock: ${lockInfo}`,
+    `  identity: @${rt.client.alias}${rt.preferredAlias !== rt.client.alias ? ` (preferred @${rt.preferredAlias})` : ""}`,
+    `  identity: rooms=${rt.client.rooms.join(",") || "(none)"} · slot=${rt.identityKey ?? "(per-session)"}`,
+    `  identity file: ${rt.identity.fileFor(rt.sessionId, rt.identityKey)}`,
     `  online: ${rt.client.isOnline()}`,
     `  session uptime: ${uptimeS}s`,
     `  inbound failures: ledger=${rt.ledgerFailures} transcript=${rt.transcriptFailures} injection=${rt.injectionFailures}`,

@@ -72,7 +72,10 @@ local broker (NDJSON frames over a unix socket or named pipe, protocol
   Reservations live with the connection and expire via TTL.
 - **Identity persistence** — alias, rooms and reservations survive `/reload`
   (one file per pi session, never overwritten); `/mesh new` and pi `fork`
-  hand the identity over; `/mesh reset` factory-resets in place.
+  hand the identity over (bound to the intended child session); `/mesh reset`
+  factory-resets in place. The alias you CHOSE survives a conflict fallback
+  (retried at attach + auto-reclaimed), and an optional `identityKey` keeps
+  alias+rooms across brand-new sessions (one named agent slot).
 - **Multi-machine** — TCP/TLS broker with a shared token; everything works
   unchanged across machines (VPS, LAN, Tailscale…).
 - **Hash-only ledger** — durable history with bodies never stored, plus an
@@ -154,6 +157,36 @@ and in the bundled skill):
    LLM tokens).
 3. Re-send ONLY to the missing (`✗ NOT ANSWERED`). Never poll with
    `mesh_history`.
+
+**Uncorrelated answers (⚠ verdict lines)** — only a `mesh_reply`
+correlated to the mission `msgId` settles a mission. A peer that answers
+with a plain `mesh_send` back to you (external relay peers often do —
+measured incident 2026-10-18: an `azo-ext` relay sent status notes and even
+final answers as fresh messages while `mesh_wait_all` kept saying
+`NOT ANSWERED`) does NOT settle it. The verdict now says so explicitly:
+
+```
+✗ @azo-ext: NOT ANSWERED (m_mvdkuts3_50a9721) — ⚠ uncorrelated msg from
+  @azo-ext at 08:44:40 (m_mvdkxjve_bbeb5a2d): a plain message does NOT
+  settle a mission; a mesh_reply correlated to (m_mvdkuts3_50a9721) is
+  still expected — check mesh_history before re-sending
+```
+
+The target DID talk to you after the mission went out — read that message
+(`mesh_history`) before re-sending: it is often the answer itself, or a
+progress note announcing the real reply. The evidence window starts at the
+mission's send time, so older chatter from the same peer is never mistaken
+for an answer.
+
+**Abort-safe injections (re-delivery guard)** — a batch injected while a
+run is streaming lands in the host's agent queue, which the TUI **purges
+on ESC** (`restoreQueuedMessagesToEditor` → `clearQueue`). The broker had
+already acked `delivered` and the live preview was on screen, yet the
+message silently never reached the LLM context. pi-mesh now keeps the last
+flushed batch unconfirmed and re-delivers it through the abort-safe
+`nextTurn` queue when the surrounding turn ends aborted/errored (bounded
+re-tries; `mesh_status` shows `batches re-delivered (abort purge
+recovery): N`).
 
 **Delivery modes** — `normal` → followUp · `urgent` → steer (interrupts the
 current reflection) · `force` → controlled abort of the recipient's turn +
@@ -285,6 +318,7 @@ Precedence: defaults < config file < environment.
 
 ```jsonc
 { "alias": "alice", "rooms": ["default"], "transcript": false,
+  "identityKey": "aso12", "roomsPinned": false,
   "mailboxCap": 100, "mailboxTtlMs": 3600000, "ledgerMaxBytes": 5242880,
   "activityIdleMs": 120000, "activityStuckMs": 900000,
   "reservationTtlMs": 21600000,
@@ -294,6 +328,35 @@ Precedence: defaults < config file < environment.
   "interruptReceipts": true,
   "inboundBatchMs": 250, "inboundBatchMaxHoldMs": 30000 }
 ```
+
+### Identity stability (why an agent keeps its name and rooms)
+
+Three independent layers, all persisted per session (or per named slot):
+
+1. **`preferredAlias` survives every conflict.** When a live peer already
+   holds your alias (a ghost socket from a crash/kill, or your own dying
+   connection during a message-triggered reconnect), the client falls back
+   to a random alias — but the CHOSEN alias is stored next to it. The next
+   attach retries it first, and a background reclaim loop (60 s,
+   `MESH_ALIAS_RECLAIM_MS`) renames back the moment the holder disconnects.
+   The reclaim never fires mid-turn or while an `awaitReply` mission is
+   pending (a rename detaches the socket and cancels missions).
+2. **Rooms belong to the identity, not to config.** `/mesh join|leave` are
+   persisted and reloaded. An explicit pin wins over disk state instead:
+   `MESH_ROOMS=aso12` (a launcher placing this agent) or `"roomsPinned":
+   true` + `"rooms"` in `config.json`.
+3. **Named agent slot (`identityKey`).** A brand-new pi session normally
+   gets a fresh identity (random alias, config rooms) — correct for a new
+   conversation, wrong for a fixed agent slot. Set `"identityKey": "aso12"`
+   (or `MESH_IDENTITY_KEY=aso12`) and alias+rooms+reservations live in
+   `identity-key-aso12.json`: every restart/new session of that slot starts
+   with the same name and rooms. `/mesh reset` wipes the slot.
+
+`/mesh new` and pi `fork` hand the identity to the NEXT session through
+`identity-pending.json`, now **bound to the parent session file**
+(`handoffFor`): another pi session starting in the same `stateDir` can no
+longer consume (steal) the alias and room list. `/mesh broker` prints the
+live identity, the preferred alias, the slot and the identity file path.
 
 ### Deferring unrelated broadcasts
 
@@ -384,7 +447,8 @@ v0.5 highlights:
   "rateLimits": { "msgPerMin": 30, "urgentPerMin": 15, "forcePerMin": 1 } }
 ```
 
-Env overrides: `MESH_ALIAS`, `MESH_ROOMS`, `MESH_RUNTIME_DIR`,
+Env overrides: `MESH_ALIAS`, `MESH_ROOMS`, `MESH_IDENTITY_KEY`,
+`MESH_ALIAS_RECLAIM_MS`, `MESH_RUNTIME_DIR`,
 `MESH_STATE_DIR`, `MESH_BROKER_URL`, `MESH_BROKER_TOKEN`, `MESH_LISTEN`,
 `MESH_TLS_CERT/KEY/CA`, `MESH_TLS_INSECURE`, `MESH_MAX_FRAME_BYTES`,
 `MESH_BROKER_ENTRY`, `MESH_BROKER_EXEC_PATH` (see
@@ -414,7 +478,11 @@ ping <alias> · broker · help`.
   session, stable across reloads, sessions sharing a stateDir never
   overwrite each other. Stale persisted reservations older than 24 h are
   dropped at load; if a crashed session still holds the alias, the client
-  falls back to a random one (notified + persisted) instead of looping.
+  retries it patiently, keeps it as `preferredAlias`, and reclaims it
+  automatically (notified) instead of silently adopting a random name.
+  A named slot (`identityKey`) persists the same identity across new
+  sessions; `/mesh alias` (no argument) shows the live + preferred alias,
+  the slot and whether a reclaim is pending.
 - **HUD**: a live widget above the editor shows the connection dot, rooms,
   peers with per-agent colors and turn-state markers (`●`/`○`/`✕`),
   pending awaits, transcript state and the last inbound preview.

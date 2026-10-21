@@ -19,9 +19,17 @@ duplicates, loops and confusion.
 - **If in doubt, `mesh_status` shows your alias** (first line) and who is
   online. Never guess who you are from the conversation alone.
 - A session that inherits an alias (e.g. `/mesh new` handoff) IS that agent:
-  same alias, same rooms, same reservations.
+  same alias, same rooms, same reservations. The handoff is bound to the
+  intended child session — it cannot be picked up by another session.
 - You can NEVER take an alias held by a live peer (`alias_taken`): the error
-  names the holder. Close that session first, or pick another alias.
+  names the holder. Close that session first, or pick another alias. If the
+  holder is a GHOST (crashed session), your chosen alias is kept as
+  `preferredAlias` and reclaimed automatically — do not improvise a new name
+  (`/mesh alias` shows the live and preferred alias).
+- Rooms live in the identity: `/mesh join <room>` persists across reloads.
+  A room pinned by the launcher (`MESH_ROOMS` / config `roomsPinned`) wins
+  over the persisted list — if your room looks wrong, `/mesh broker` shows
+  the resolved rooms, the preferred alias and the identity file.
 
 ## Get oriented
 
@@ -90,6 +98,12 @@ duplicates, loops and confusion.
    so a later `mesh_wait_all` re-lists them. Use it to abort a long wait
    without losing the batch.
 4. Re-send ONLY to the missing (`✗ NOT ANSWERED`).
+5. **A `NOT ANSWERED` line with `⚠ uncorrelated msg from @X`** means X
+   DID send you something after the mission went out — but as a plain
+   message, which NEVER settles a mission (only a `mesh_reply` correlated
+   to the mission msgId does). Read it (`mesh_history`) before re-sending:
+   it is often the answer, or a progress note announcing the real reply.
+   Do not re-send a mission on a ⚠ line without checking first.
 - Never poll with `mesh_history`/`mesh_status` to check who answered —
   that is what `mesh_wait_all` is for.
 - `block: false` without `awaitReply` is refused; `awaitReply` without

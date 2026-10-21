@@ -8,11 +8,14 @@ import { statSync } from "node:fs";
 import { registerCommands } from "./commands.js";
 import { MeshGuards } from "./guards.js";
 import { MeshHud } from "./hud.js";
-import { attachClientListeners } from "./attach.js";
+import { attachClientListeners, updateSessionName } from "./attach.js";
+import { startAliasReclaim } from "./reclaim.js";
+import { batchDetails, buildBatchMessage } from "./batcher.js";
+import { InjectionGuard } from "./injection-guard.js";
 import { injectInbound } from "./inbound.js";
 import { renderLiveEntry, renderMeshInbound, renderVerdictEntry } from "./renderer.js";
 import type { PersistedIdentity } from "../shared/identity-store.js";
-import { identityFromClient, MeshIdentity } from "../shared/identity-store.js";
+import { chooseInitialIdentity, identityFromClient, MeshIdentity, saveIdentityOf } from "../shared/identity-store.js";
 import { MeshLedger } from "./ledger.js";
 import type { ExtensionAPI } from "./pi-types.js";
 import { findConflict } from "../shared/reservations.js";
@@ -85,9 +88,11 @@ export default function meshExtension(pi: ExtensionAPI): void {
   }
 
 
-  /** Persist the current client state as this session's identity. */
+  /** Persist the current client state as this session's identity — single
+  *  write path: preferredAlias (the chosen name, survives a fallback) and the
+  *  identityKey (named slot) always travel with it. */
   const saveIdentity = (rt: MeshRuntime): void => {
-    rt.identity.save(identityFromClient(rt.sessionId, rt.client));
+    saveIdentityOf(rt.identity, rt);
   };
   /** Live HUD accessor (the module-level `hud` variable is reassigned). */
   const getHudRef = (): MeshHud | null => hud;
@@ -101,21 +106,30 @@ export default function meshExtension(pi: ExtensionAPI): void {
   // mesh identity when the extension is reloaded.
     const sessionId = ctx.sessionManager?.getSessionId() ?? "";
     const identity = new MeshIdentity(sDir);
+  // named agent slot (config identityKey / MESH_IDENTITY_KEY): alias+rooms
+  // persist per SLOT, so a new/restarted session keeps the agent's identity.
+    const identityKey = config.identityKey;
+  // The parent session FILE (present in the in-memory header even before the
+  // first message is persisted) binds an identity handoff to its intended
+  // child — a sibling session starting in the same stateDir cannot steal it.
+    const parentSessionFile = ctx.sessionManager?.getHeader?.()?.parentSession;
   // /mesh new handoff — the staged identity (alias/rooms/reservations
   // and optionally the history) is consumed by the next session_start.
-    let persisted: PersistedIdentity | null = identity.load(sessionId);
+    let persisted: PersistedIdentity | null = identity.load(sessionId, identityKey);
     let pendingHistory: string[] | undefined;
     if (persisted === null) {
-      const pending = identity.consumePending();
+      const pending = identity.consumePending({ parentFile: parentSessionFile });
       if (pending !== null) {
         persisted = pending.identity;
         pendingHistory = pending.history;
       }
     }
+  // Alias precedence: explicit config pin → persisted PREFERRED alias (this is
+  // what makes a conflict fallback self-heal) → persisted alias → random.
+    const choice = chooseInitialIdentity(config, persisted);
     const client = new MeshClient({
-  // explicit config.alias always wins; then the persisted alias; else random
-      alias: config.alias ?? persisted?.alias,
-      rooms: persisted !== null && persisted.rooms.length > 0 ? persisted.rooms : config.rooms,
+      alias: choice.alias,
+      rooms: choice.rooms,
       initialReservations: persisted?.reservations,
       runtimeDir: rDir,
       config,
@@ -133,16 +147,53 @@ export default function meshExtension(pi: ExtensionAPI): void {
       runtimeDir: rDir,
       sessionId,
       identity,
+      preferredAlias: choice.preferredAlias ?? client.alias,
+      ...(identityKey !== undefined ? { identityKey } : {}),
       pendingHistory,
       startedAt: Date.now(),
       ledgerFailures: 0,
       transcriptFailures: 0,
       injectionFailures: 0,
+      redeliveredBatches: 0,
       appendEntry: (type, data) => pi.appendEntry(type, data),
       interruptReceipts: config.interruptReceipts !== false,
       interruptCount: 0,
     };
     const rt = runtime;
+
+    // ---- injection guard (D47) ---------------------------------------------
+    // pi's TUI abort path (ESC → restoreQueuedMessagesToEditor →
+    // session.clearQueue → agent.clearAllQueues) purges the followUp/steer
+    // queues — exactly where a batch injected while a run was streaming
+    // lands (sendCustomMessage → agent.followUp). The broker already acked
+    // delivered and the mesh-live preview is on screen, yet the message
+    // silently never reaches the LLM context. The guard re-delivers it via
+    // deliverAs:"nextTurn" — a pi queue the abort purge does NOT touch.
+    const injectionGuard = new InjectionGuard();
+    rt.injectionGuard = injectionGuard;
+    rt.noteBatchSent = (frames, deliverAs, busyAtSend) => {
+      injectionGuard.note(frames, deliverAs, busyAtSend);
+    };
+    rt.resendBatch = (frames, _originalDeliverAs, tries) => {
+      const batch = buildBatchMessage(frames);
+      rt.redeliveredBatches += 1;
+      const marker = tries > 1 ? " [mesh re-delivery]" : "";
+      try {
+        pi.sendMessage(
+          {
+            customType: "mesh-inbound",
+            content: `${batch.content}${marker}`,
+            display: true,
+            details: batchDetails(frames),
+          },
+  // nextTurn is appended to the NEXT run's messages — immune to the
+  // abort purge; triggerTurn still wakes an idle session.
+          { triggerTurn: true, deliverAs: "nextTurn" },
+        );
+      } catch {
+        rt.injectionFailures += 1; // stale ctx — counted, never fatal
+      }
+    };
 
     // ---- context watchdog (M1) ---------------------------------------------
     // Detects degenerate turns (hundreds of rejected duplicate tool calls —
@@ -196,6 +247,26 @@ export default function meshExtension(pi: ExtensionAPI): void {
 
     attachClientListeners(pi, rt, getHudRef, ctx, client, saveIdentity);
 
+  // Pi parity (OpenCode parity): reclaim the PREFERRED alias as soon as its
+  // holder disconnects — a conflict fallback recovers the chosen name without
+  // a reload. Gated on idle + no pending mission (a rename detaches the
+  // socket and cancels awaitReply missions).
+    const reclaim = startAliasReclaim({
+      client,
+      preferredAlias: () => rt.preferredAlias,
+      isBusy: () => rt.ctx?.isIdle?.() === false,
+      onReclaimed: (alias) => {
+        saveIdentity(rt);
+        updateSessionName(pi, rt);
+        try {
+          ctx.ui.notify(`mesh: alias @${alias} reclaimed`, { level: "info" });
+        } catch {
+  // best effort — the alias is already reclaimed
+        }
+      },
+    });
+    rt.stopReclaim = reclaim.stop;
+
   // Phase 3: announce turn state to the mesh — busy on the first tool
   // call of a turn, idle when the whole run settles. Only on CHANGE
   // (2 frames per turn, never spams the room).
@@ -245,6 +316,13 @@ export default function meshExtension(pi: ExtensionAPI): void {
       // rejecting turns must stay flagged so senders stop reminding; it
       // flips back to idle once a settle happens WITHOUT a fresh error.
       if (Date.now() - lastErrorAt > ERROR_COOLDOWN_MS) announce("idle");
+      // D47: the session went idle with a batch still unconfirmed → the
+      // run that should have consumed it is over (abort purge victim).
+      // Re-deliver via nextTurn; a fresh run picks it up.
+      if (injectionGuard.onSettled() === "resend") {
+        const entry = injectionGuard.takeForResend();
+        if (entry !== null) rt.resendBatch?.(entry.frames, entry.deliverAs, entry.tries);
+      }
     });
     // provider error detection. The GROUND TRUTH is the failed assistant
     // turn (turn_end carries stopReason "error" + errorMessage) — the SDK
@@ -255,6 +333,18 @@ export default function meshExtension(pi: ExtensionAPI): void {
       const msg = (event as { message?: { stopReason?: string; errorMessage?: string }; toolResults?: unknown[] }).message;
       // M1 watchdog runs FIRST — independent of provider-error detection.
       runWatchdog(msg, (event as { toolResults?: unknown[] }).toolResults ?? []);
+      // D47 injection guard: an aborted/errored turn may have purged the
+      // agent queue holding our last injected batch (ESC → clearQueue).
+      // Let the settle complete first, then re-deliver bounded times.
+      const stop = msg?.stopReason;
+      const guardDecision = injectionGuard.onTurnEnd(stop);
+      if (guardDecision === "resend") {
+        const t = setTimeout(() => {
+          const entry = injectionGuard.takeForResend();
+          if (entry !== null) rt.resendBatch?.(entry.frames, entry.deliverAs, entry.tries);
+        }, 250);
+        t.unref();
+      }
       if (msg === undefined || msg.stopReason !== "error") return;
       const state = providerErrorStateFromMessage(msg.errorMessage ?? "");
       if (state === undefined) return;
@@ -341,7 +431,13 @@ export default function meshExtension(pi: ExtensionAPI): void {
     const rt = runtime;
     if (rt === null) return;
     try {
-      rt.identity.savePending(identityFromClient(rt.sessionId, rt.client));
+  // Bind the handoff to THIS session's file: the forked child (header
+  // parentSession) is the only session allowed to consume it.
+      rt.identity.savePending(
+        identityFromClient(rt.sessionId, rt.client, rt.preferredAlias),
+        undefined,
+        { forParent: ctx.sessionManager?.getSessionFile?.() },
+      );
     } catch {
   // best effort
     }
@@ -353,12 +449,16 @@ export default function meshExtension(pi: ExtensionAPI): void {
     const h = hud;
     hud = null;
     h?.detach(); // clears BOTH widget and status
+  // D47: drop the injection guard — the runtime is going away, a pending
+  // re-delivery must never touch the stale pi object.
+    rt?.injectionGuard?.clear();
   // D41: flip the client-handler guard BEFORE anything else — frames still
   // in flight on the old socket must never touch the (about-to-be-stale)
   // pi/ctx. This is the fix for the "extension ctx is stale" crash.
     try {
       rt?.markDetached?.();
       rt?.stopHold?.();
+      rt?.stopReclaim?.();
     } catch {
       // best effort
     }

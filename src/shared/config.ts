@@ -1,6 +1,7 @@
 // shared/config.ts — ALL named numeric bounds + config.json/env loading.
 // Every bound in the system is a named constant here or derived from MeshConfig.
 import { readFileSync } from "node:fs";
+import { IDENTITY_KEY_REGEX } from "./identity-store.js";
 import { configPath } from "./paths.js";
 
 // ---- Framing) ----
@@ -171,6 +172,15 @@ export function parseEndpoint(url: string): MeshEndpoint | null {
 export interface MeshConfig {
   alias?: string;
   rooms: string[];
+  /** Explicit room PIN (config.json "roomsPinned": true or $MESH_ROOMS):
+  *  the pinned list wins over the rooms persisted in a session identity —
+  *  a launcher can place an agent in a room for good. Without a pin the
+  *  persisted (live) membership wins, so /mesh join|leave survive reloads. */
+  roomsPinned?: boolean;
+  /** Named agent-slot identity (config.json "identityKey" / $MESH_IDENTITY_KEY):
+   *  alias+rooms+reservations persist per SLOT instead of per pi session, so
+   *  a restarted/new session keeps the agent's name and rooms. */
+  identityKey?: string;
   maxFrameBytes: number;
   heartbeatMs: number;
   brokerSilenceMs: number;
@@ -291,6 +301,7 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
       Array.isArray(fileCfg.rooms) && fileCfg.rooms.every((r) => typeof r === "string")
         ? [...fileCfg.rooms]
         : [...DEFAULT_CONFIG.rooms],
+    ...(fileCfg.roomsPinned === true ? { roomsPinned: true } : {}),
     maxFrameBytes: clampFrameBytes(positiveInt(fileCfg.maxFrameBytes, DEFAULT_CONFIG.maxFrameBytes)),
     heartbeatMs: positiveInt(fileCfg.heartbeatMs, DEFAULT_CONFIG.heartbeatMs),
     brokerSilenceMs: positiveInt(fileCfg.brokerSilenceMs, DEFAULT_CONFIG.brokerSilenceMs),
@@ -335,6 +346,9 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
     ),
   };
   if (typeof fileCfg.alias === "string" && fileCfg.alias.trim() !== "") cfg.alias = fileCfg.alias;
+  if (typeof fileCfg.identityKey === "string" && IDENTITY_KEY_REGEX.test(fileCfg.identityKey.trim())) {
+    cfg.identityKey = fileCfg.identityKey.trim();
+  }
   if (typeof fileCfg.listen === "string" && parseEndpoint(fileCfg.listen) !== null) cfg.listen = fileCfg.listen;
   if (typeof fileCfg.brokerUrl === "string" && parseEndpoint(fileCfg.brokerUrl) !== null) cfg.brokerUrl = fileCfg.brokerUrl;
   if (typeof fileCfg.brokerToken === "string" && fileCfg.brokerToken.trim() !== "") cfg.brokerToken = fileCfg.brokerToken;
@@ -360,12 +374,19 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
   if (env.MESH_TLS_INSECURE === "1" || env.MESH_TLS_INSECURE === "true") cfg.tlsInsecure = true;
   const envAlias = env.MESH_ALIAS;
   if (envAlias && envAlias.trim() !== "") cfg.alias = envAlias;
+  const envIdentityKey = env.MESH_IDENTITY_KEY;
+  if (envIdentityKey !== undefined && IDENTITY_KEY_REGEX.test(envIdentityKey.trim())) {
+    cfg.identityKey = envIdentityKey.trim();
+  }
   const envRooms = env.MESH_ROOMS;
   if (envRooms && envRooms.trim() !== "") {
     cfg.rooms = envRooms
       .split(",")
       .map((r) => r.trim())
       .filter((r) => r.length > 0);
+    // $MESH_ROOMS is a per-process PIN (a launcher placing an agent in a
+    // room) — it must not be silently overridden by a stale identity file.
+    cfg.roomsPinned = true;
   }
   const envFrame = envInt(env, "MESH_MAX_FRAME_BYTES");
   if (envFrame !== undefined) cfg.maxFrameBytes = clampFrameBytes(envFrame);

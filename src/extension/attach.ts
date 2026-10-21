@@ -173,6 +173,11 @@ export function attachClientListeners(
     const batch = buildBatchMessage(frames, (f) =>
       formatOptsFor(f, client.contextVerbosity === "full", client.homeRoom),
     );
+  // D47: a send while a run is in flight lands in pi's agent queue — which
+  // the TUI PURGES on ESC aborts (clearQueue). Note it so index.ts can
+  // re-deliver via the abort-safe nextTurn queue when the turn ends
+  // aborted/errored (measured incident: azo-8 2026-10-18, answers lost).
+    rt.noteBatchSent?.(frames, batch.deliverAs as "followUp" | "steer", rt.ctx?.isIdle?.() === false);
     guarded(() => {
       pi.sendMessage(
         {
@@ -405,17 +410,22 @@ export function attachClientListeners(
     });
   });
   client.on("renamed", () => {
+    // a successful rename (user /mesh alias, /mesh join … as …, or the
+    // reclaim loop) becomes the name to keep — persist it with the identity.
+    rt.preferredAlias = client.alias;
     guarded(() => exposeAlias(pi, client.alias, client.rooms));
     guarded(() => updateSessionName(pi, rt));
     saveIdentity(rt); // disk-only
   });
   client.on("alias_fallback", ({ from, to }: { from: string; to: string }) => {
   // Another live peer holds our persisted alias (e.g. crashed session) —
-  // we took a random one; persist it so the next reload does not fight
-  // for the same alias again.
-    saveIdentity(rt); // disk-only
+  // we took a random one. The CHOSEN alias is KEPT as preferredAlias, so the
+  // next attach retries it and the reclaim loop takes it back as soon as the
+  // holder disconnects (persisting only the fallback was the churn bug).
+    saveIdentity(rt); // disk-only — alias=<fallback>, preferredAlias=<from>
     guarded(() => {
-      ctx.ui.notify(`mesh: alias @${from} taken — now connected as @${to}`, { level: "warning" });
+      const retry = rt.preferredAlias === from ? ` (@${from} is retried automatically)` : "";
+      ctx.ui.notify(`mesh: alias @${from} taken — now connected as @${to}${retry}`, { level: "warning" });
     });
   });
   client.on("closed", () => getHud()?.onClosed());

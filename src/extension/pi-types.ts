@@ -77,6 +77,10 @@ export interface SessionContext {
   sessionManager?: {
     getSessionId(): string;
     getSessionFile?(): string;
+    /** Session header (in-memory before the first message is persisted).
+     *  `parentSession` is the parent session FILE — used to bind a mesh
+     *  identity handoff (/mesh new, fork) to the intended child session. */
+    getHeader?(): { id?: string; parentSession?: string } | null;
   };
   /** Pi command actions — newSession lets /mesh new open a fresh session.
   *  Direct method on the command context (not under actions). Post-replacement

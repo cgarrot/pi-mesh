@@ -24,8 +24,12 @@ import { isValidReservations, type FileReservation } from "../protocol/envelope.
 
 export const IDENTITY_FILE_NAME = "identity.json"; // legacy single-file name
 export const IDENTITY_PREFIX = "identity-";
+/** Named agent-slot identity: identity-key-<key>.json (see MeshConfig.identityKey). */
+export const IDENTITY_KEY_PREFIX = "identity-key-";
 export const IDENTITY_PENDING_NAME = "identity-pending.json";
 export const IDENTITY_VERSION = 1;
+/** A slot key becomes a filename component — strict charset, no traversal. */
+export const IDENTITY_KEY_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 /** Persisted reservations older than this are NOT re-declared at hello. */
 export const RESERVATION_TTL_MS = 86_400_000; // 24 h
 /** a /mesh new handoff is only valid for this long. */
@@ -48,7 +52,14 @@ export interface PersistedIdentity {
   updatedAt: string;
 }
 
-/** Snapshot the current client state into a persistable identity. */
+/** Snapshot the current client state into a persistable identity.
+ *
+ * `preferredAlias` is the alias the user CHOSE. It must survive a conflict
+ * fallback: `alias` becomes the random fallback (what we are connected as),
+ * `preferredAlias` stays the chosen name so the next attach can retry it.
+ * Omitting it here was the Pi-side write/read asymmetry — every save wiped
+ * the field the loader was taught to preserve, so a fallback permanently
+ * destroyed the chosen name (the "my agent changed name" bug). */
 export function identityFromClient(
   sessionId: string,
   client: {
@@ -56,15 +67,93 @@ export function identityFromClient(
     rooms: readonly string[];
     reservations: readonly FileReservation[];
   },
+  preferredAlias?: string,
 ): PersistedIdentity {
+  const preferred =
+    preferredAlias !== undefined && preferredAlias !== "" ? preferredAlias : undefined;
   return {
     version: IDENTITY_VERSION,
     sessionId,
     alias: client.alias,
+    ...(preferred !== undefined ? { preferredAlias: preferred } : {}),
     rooms: [...client.rooms],
     reservations: client.reservations.map((r) => ({ ...r })),
     updatedAt: nowIso(),
   };
+}
+
+/** How the initial alias/rooms were chosen — surfaced by /mesh broker and
+ *  used by tests (no guessing in the integration assertions). */
+export type IdentityChoiceReason = "config-alias" | "preferred" | "persisted" | "fresh";
+
+export interface IdentityChoice {
+  /** Alias requested at hello (undefined → the client picks a random one). */
+  alias: string | undefined;
+  /** The alias this session should keep reclaiming. */
+  preferredAlias: string | undefined;
+  rooms: string[];
+  reason: IdentityChoiceReason;
+}
+
+/**
+ * Decide the alias/rooms a session starts with.
+ *
+ * Alias precedence: explicit config (config.json alias / MESH_ALIAS, a pin)
+ * → the persisted PREFERRED alias (self-heals a conflict fallback) → the
+ * persisted alias → undefined (random). Rooms: an explicitly PINNED room
+ * list (config.json "roomsPinned" / MESH_ROOMS, a launcher pin) → the
+ * persisted rooms (live membership must survive reloads) → config rooms.
+ *
+ * Pure + exported so the Pi adapter and the tests agree on the contract.
+ */
+export function chooseInitialIdentity(
+  config: { alias?: string; rooms: readonly string[]; roomsPinned?: boolean },
+  persisted: PersistedIdentity | null,
+): IdentityChoice {
+  const pinnedAlias = config.alias !== undefined && config.alias !== "" ? config.alias : undefined;
+  const preferredAlias = pinnedAlias ?? persisted?.preferredAlias ?? persisted?.alias;
+  const reason: IdentityChoiceReason =
+    pinnedAlias !== undefined
+      ? "config-alias"
+      : persisted === null
+        ? "fresh"
+        : persisted.preferredAlias !== undefined
+          ? "preferred"
+          : "persisted";
+  const configured = config.rooms.filter((r) => typeof r === "string" && r.trim() !== "");
+  let rooms: string[];
+  if (config.roomsPinned === true && configured.length > 0) {
+    rooms = configured; // explicit launcher/config pin wins over stale disk state
+  } else if (persisted !== null && persisted.rooms.length > 0) {
+    rooms = [...persisted.rooms];
+  } else {
+    rooms = configured.length > 0 ? configured : ["default"];
+  }
+  return { alias: preferredAlias, preferredAlias, rooms, reason };
+}
+
+/**
+ * Persist a runtime's identity — THE single write path for the adapters.
+ *
+ * Every save MUST carry preferredAlias and, when configured, the slot key:
+ * scattered `identity.save(identityFromClient(...))` calls were the exact
+ * place where the chosen alias got dropped (reserve/release/auto-release
+ * wiped it silently, so a later conflict re-randomized the name).
+ */
+export function saveIdentityOf(
+  store: MeshIdentity,
+  owner: {
+    sessionId: string;
+    client: { alias: string; rooms: readonly string[]; reservations: readonly FileReservation[] };
+    preferredAlias?: string;
+    identityKey?: string;
+  },
+): void {
+  try {
+    store.save(identityFromClient(owner.sessionId, owner.client, owner.preferredAlias), owner.identityKey);
+  } catch {
+  // best effort — identity persistence never breaks a session
+  }
 }
 
 /** Drop reservations whose `since` is older than the TTL (stale claims). */
@@ -80,9 +169,23 @@ function freshReservations(list: FileReservation[], now: number = Date.now()): F
 export class MeshIdentity {
   constructor(private readonly stateDir: string) {}
 
-  /** Per-session file: <stateDir>/identity-<sessionId>.json */
-  private pathFor(sessionId: string): string {
+  /** Identity file for a session — or for a NAMED agent slot when `key` is set
+   *  (identity-key-<key>.json: one slot, many sessions/restarts). */
+  private pathFor(sessionId: string, key?: string): string {
+    if (key !== undefined && key !== "") {
+      if (!IDENTITY_KEY_REGEX.test(key)) throw new Error("invalid_identity_key");
+      return path.join(this.stateDir, `${IDENTITY_KEY_PREFIX}${key}.json`);
+    }
     return path.join(this.stateDir, `${IDENTITY_PREFIX}${sessionId}.json`);
+  }
+
+  /** Path a session's identity lives at (diagnostics: /mesh broker). */
+  fileFor(sessionId: string, key?: string): string {
+    try {
+      return this.pathFor(sessionId, key);
+    } catch {
+      return this.pathFor(sessionId);
+    }
   }
 
   private get legacyPath(): string {
@@ -125,11 +228,22 @@ export class MeshIdentity {
   }
 
   /**
-  * Load the identity belonging to `sessionId`. Returns null when absent,
-  * from another session, malformed, or on an older version — callers then
-  * start fresh (random alias, default rooms, no reservations).
+  * Load the identity belonging to `sessionId` (or to the named slot `key`).
+  * Returns null when absent, from another session, malformed, or on an older
+  * version — callers then start fresh (random alias, default rooms).
   */
-  load(sessionId: string): PersistedIdentity | null {
+  load(sessionId: string, key?: string): PersistedIdentity | null {
+    if (key !== undefined && key !== "") {
+      // A slot is shared by several sessions/restarts: the stored sessionId is
+      // the LAST writer, never this session — accept it and rebind below.
+      let raw: string;
+      try {
+        raw = readFileSync(this.pathFor(sessionId, key), "utf8");
+      } catch {
+        return null;
+      }
+      return this.parse(raw, sessionId, true);
+    }
     if (sessionId === "") return null;
     try {
       const raw = readFileSync(this.pathFor(sessionId), "utf8");
@@ -155,11 +269,19 @@ export class MeshIdentity {
   }
 
   /**
-  * factory-reset this session's identity — /mesh reset behaves like
-  * /new (fresh alias, default rooms, no reservations) while staying in the
-  * same pi session. Best effort — never throws.
+  * factory-reset this session's identity (or the named slot's) — /mesh reset
+  * behaves like /new (fresh alias, default rooms, no reservations) while
+  * staying in the same pi session. Best effort — never throws.
   */
-  reset(sessionId: string): void {
+  reset(sessionId: string, key?: string): void {
+    if (key !== undefined && key !== "") {
+      try {
+        unlinkSync(this.pathFor(sessionId, key));
+      } catch {
+  // already gone
+      }
+      return;
+    }
     if (sessionId === "") return;
     try {
       unlinkSync(this.pathFor(sessionId));
@@ -175,17 +297,26 @@ export class MeshIdentity {
   }
 
   /**
-  * Stage the current identity for the NEXT session (created by /mesh new)
-  * alias + rooms + reservations (and optionally a compact history) travel
-  * through identity-pending.json, consumed by the next session_start.
+  * Stage the current identity for the NEXT session (created by /mesh new or
+  * a pi fork): alias + rooms + reservations (and optionally a compact
+  * history) travel through identity-pending.json and are consumed by the
+  * next session_start.
+  *
+  * `forParent` (a session FILE path) BINDS the handoff to the intended
+  * child: every session shares the same stateDir, so an unbound file was
+  * consumable by ANY new session in the directory — another agent could
+  * steal the alias AND the room list (identity-pending was the last global
+  * mutable slot in an otherwise per-session store).
   */
   savePending(
     identity: PersistedIdentity,
     history?: string[],
+    opts: { forParent?: string } = {},
   ): void {
     try {
       mkdirSync(this.stateDir, { recursive: true });
-      const payload = { ...identity, history };
+      const forParent = opts.forParent !== undefined && opts.forParent !== "" ? opts.forParent : undefined;
+      const payload = { ...identity, history, ...(forParent !== undefined ? { handoffFor: forParent } : {}) };
       const tmp = this.pendingPath + ".tmp";
       writeFileSync(tmp, JSON.stringify(payload, null, 2) + "\n", "utf8");
       renameSync(tmp, this.pendingPath);
@@ -194,12 +325,28 @@ export class MeshIdentity {
     }
   }
 
+  /** Drop a staged handoff (the direct-write path already delivered it). */
+  clearPending(): void {
+    try {
+      unlinkSync(this.pendingPath);
+    } catch {
+  // already gone
+    }
+  }
+
   /**
   * Take the staged identity (if fresh enough) and clear the file.
   * Returns { identity, history } or null. The history is the compact
-  * transferred conversation --history flag).
+  * transferred conversation (--history flag).
+  *
+  * `opts.parentFile` is the new session's header.parentSession: when the
+  * handoff was bound with savePending({forParent}), a DIFFERENT session
+  * (or a session with no parent, i.e. a brand-new conversation) leaves the
+  * file staged and gets null. Unbound (legacy) handoffs keep the old
+  * single-consumer behavior.
   */
-  consumePending(now: number = Date.now()): { identity: PersistedIdentity; history?: string[] } | null {
+  consumePending(opts: { parentFile?: string; now?: number } = {}): { identity: PersistedIdentity; history?: string[] } | null {
+    const now = opts.now ?? Date.now();
     let raw: string;
     try {
       raw = readFileSync(this.pendingPath, "utf8");
@@ -220,6 +367,14 @@ export class MeshIdentity {
         }
         return null;
       }
+      // Bound handoff: only the intended child may take it. A mismatch
+      // (another agent's new session) leaves the file staged for the real
+      // child — the difference between an isolated handoff and a race.
+      const forParent = typeof p.handoffFor === "string" && p.handoffFor !== "" ? p.handoffFor : undefined;
+      if (forParent !== undefined) {
+        const consumer = opts.parentFile;
+        if (consumer === undefined || consumer !== forParent) return null;
+      }
       const parsed = this.parse(raw, "", true); // pending carries the OLD sessionId
       if (parsed === null) return null;
       const history = Array.isArray(p.history)
@@ -233,10 +388,10 @@ export class MeshIdentity {
   }
 
   /** Persist atomically (tmp + rename). Best effort — never throws. */
-  save(identity: PersistedIdentity): void {
+  save(identity: PersistedIdentity, key?: string): void {
     try {
       mkdirSync(this.stateDir, { recursive: true });
-      const target = this.pathFor(identity.sessionId);
+      const target = this.pathFor(identity.sessionId, key);
       const tmp = target + ".tmp";
       writeFileSync(tmp, JSON.stringify(identity, null, 2) + "\n", "utf8");
       renameSync(tmp, target);
@@ -260,6 +415,7 @@ export class MeshIdentity {
     }
     for (const name of names) {
       if (!name.startsWith(IDENTITY_PREFIX) || !name.endsWith(".json")) continue;
+      if (name.startsWith(IDENTITY_KEY_PREFIX)) continue; // named slots: not session-adoptable
       const sessionId = name.slice(IDENTITY_PREFIX.length, -".json".length);
       if (sessionId === "" || sessionId === "pending") continue; // legacy single file / handoff staging
       try {

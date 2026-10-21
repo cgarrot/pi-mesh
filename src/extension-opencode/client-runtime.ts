@@ -11,7 +11,7 @@ import { writeFile } from "node:fs/promises";
 import { dirname, join as joinPath } from "node:path";
 import { loadConfig, type MeshConfig } from "../shared/config.js";
 import { runtimeDir, stateDir } from "../shared/paths.js";
-import { identityFromClient, MeshIdentity, type PersistedIdentity } from "../shared/identity-store.js";
+import { identityFromClient, MeshIdentity, saveIdentityOf, type PersistedIdentity } from "../shared/identity-store.js";
 import { InboundBatcher, bypassesBatch } from "../extension/batcher.js";
 import { DeferredInbox } from "../extension/deferred-inbox.js";
 import { classifyInbound } from "../extension/inbound-policy.js";
@@ -54,6 +54,9 @@ export interface MeshSessionRuntime {
   /** The alias the user chose explicitly — retried at every attach even
    *  after a conflict forced a random fallback (self-healing identity). */
   preferredAlias: string;
+  /** Named agent-slot identity key (config identityKey) — alias+rooms survive
+   *  brand-new sessions instead of only reloads. */
+  identityKey?: string;
   /** Alias after connect (random until then). */
   readonly alias: string;
   /** Rooms this session has joined. */
@@ -251,8 +254,7 @@ const lastIdentity = new WeakMap<MeshSessionRuntime, string>();
  *  chose is retried at the next attach. */
 export function persistIdentity(runtime: MeshSessionRuntime): void {
   try {
-    const identity = identityFromClient(runtime.sessionId, runtime.client);
-    identity.preferredAlias = runtime.preferredAlias;
+    const identity = identityFromClient(runtime.sessionId, runtime.client, runtime.preferredAlias);
     const key = JSON.stringify({
       alias: identity.alias,
       preferredAlias: identity.preferredAlias,
@@ -261,7 +263,8 @@ export function persistIdentity(runtime: MeshSessionRuntime): void {
     });
     if (lastIdentity.get(runtime) === key) return;
     lastIdentity.set(runtime, key);
-    new MeshIdentity(runtime.stateDir).save(identity);
+    // single write path: preferredAlias + identityKey always travel together
+    saveIdentityOf(new MeshIdentity(runtime.stateDir), runtime);
   } catch {
     // identity persistence is best effort — never break a session
   }
@@ -373,6 +376,8 @@ export function configureRooms(rooms: readonly string[] | undefined): void {
 /** Rooms at session start — Pi semantics: the persisted identity wins; the
  *  configured defaults (config.json ∪ plugin options) apply on first start. */
 function initialRooms(cfg: MeshConfig, stored: PersistedIdentity | null): string[] {
+  // an explicit room PIN (roomsPinned / MESH_ROOMS) wins over stale disk state
+  if (cfg.roomsPinned === true && cfg.rooms.length > 0) return [...cfg.rooms];
   if (stored !== null && stored.rooms.length > 0) return [...stored.rooms];
   const out: string[] = [];
   for (const room of [...cfg.rooms, ...configuredRooms]) {
@@ -429,7 +434,7 @@ export async function createSessionRuntime(
   const dir = stateDir();
   const rtDir = runtimeDir();
   const identity = new MeshIdentity(dir);
-  const stored = identity.load(sessionId);
+  const stored = identity.load(sessionId, cfg.identityKey);
 
   const clientOpts: MeshClientOpts = {
     runtimeDir: rtDir,
@@ -508,6 +513,7 @@ export async function createSessionRuntime(
     stateDir: dir,
     sessionId,
     preferredAlias: stored?.preferredAlias ?? stored?.alias ?? client.alias,
+    ...(cfg.identityKey !== undefined ? { identityKey: cfg.identityKey } : {}),
     // Live views: join/leave/rename reach every consumer immediately
     // (`/mesh status` used to show the rooms snapshot taken at creation).
     get alias(): string {

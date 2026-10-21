@@ -203,12 +203,20 @@ const HANDLED_REPLY_WINDOW_MS = 1_800_000;
  *  that resolved BEFORE wait_all was called must still appear in it. */
 const RECENT_ANSWER_WINDOW_MS = 300_000; // 5 min
 
+/** cap of the per-peer "last inbound" activity map (wait_all evidence). */
+const LAST_INBOUND_CAP = 64;
+
 export interface WaitAllSummary {
   status: "complete" | "timeout" | "cancelled";
   total: number;
   answered: number;
   elapsedMs: number;
-  missing: { msgId: string; to: string }[];
+  /** lastActivity: an inbound frame from the target AFTER the mission was
+  *  sent that did NOT settle it (a plain msg / an uncorrelated reply —
+  *  measured incident: an external relay answering missions via fresh
+  *  sends, so the answer visibly arrived yet the verdict said NOT ANSWERED).
+  *  Surfaced so the agent checks mesh_history instead of re-sending. */
+  missing: { msgId: string; to: string; lastActivity?: { msgId: string; at: string; type: string } }[];
   answers: { msgId: string; to: string; response: string }[];
 }
 
@@ -287,8 +295,16 @@ export class MeshClient extends EventEmitter {
       answered: boolean;
       response?: string;
       at?: string;
+      /** ms epoch when the mission was sent — anchors the wait_all
+      *  "uncorrelated activity" evidence window. */
+      sentAt?: number;
     }
   >();
+  /** Last inbound frame per peer (msg/mailbox/reply, receipts excluded) —
+  *  evidence for wait_all NOT ANSWERED lines: when the target talked to us
+  *  after the mission was sent WITHOUT a correlated mesh_reply (external
+  *  relays answer via fresh sends), say so instead of a bare "missing". */
+  private readonly lastInboundFrom = new Map<string, { msgId: string; at: string; type: string }>();
   /** missions already reported by a wait_all verdict — never re-listed
   *  by a later wait_all (each batch is summarized once). */
   private readonly reportedMissions = new Set<string>();
@@ -413,6 +429,35 @@ export class MeshClient extends EventEmitter {
     }
   }
 
+  /** Remember an inbound frame as the peer's latest activity (called from
+  *  onFrame for msg/mailbox/reply — NOT receipts: machine meta-noise). */
+  private noteInboundFrom(frame: MeshFrame): void {
+    const from = frame.from;
+    if (from === undefined || from === this.alias) return;
+    this.lastInboundFrom.set(from, { msgId: frame.id ?? "", at: frame.ts, type: frame.type });
+    while (this.lastInboundFrom.size > LAST_INBOUND_CAP) {
+      const oldest = this.lastInboundFrom.keys().next().value;
+      if (oldest === undefined) break;
+      this.lastInboundFrom.delete(oldest);
+    }
+  }
+
+  /** The peer's last inbound frame AFTER sinceMs (ms epoch), or undefined.
+  *  Read-side of noteInboundFrom — wait_all annotates its NOT ANSWERED
+  *  lines with it ("the target DID talk to us, but uncorrelated"). */
+  lastInboundSince(
+    alias: string,
+    sinceMs: number,
+    now: number = Date.now(),
+  ): { msgId: string; at: string; type: string } | undefined {
+    const last = this.lastInboundFrom.get(normalizeAlias(alias));
+    if (last === undefined) return undefined;
+    const t = Date.parse(last.at);
+    if (Number.isNaN(t)) return undefined;
+    if (t < sinceMs || t > now + 5_000) return undefined; // future skew guard
+    return last;
+  }
+
   /** Missions sent with awaitReply and their answer state: status is
   *  honest — waiting/answered/expired/failed). */
   missionStatus(): { msgId: string; to: string; answered: boolean; status: string }[] {
@@ -504,14 +549,23 @@ export class MeshClient extends EventEmitter {
     targets: string[],
   ): WaitAllSummary {
     const answers: { msgId: string; to: string; response: string }[] = [];
-    const missing: { msgId: string; to: string }[] = [];
+    const missing: { msgId: string; to: string; lastActivity?: { msgId: string; at: string; type: string } }[] = [];
     for (const msgId of targets) {
       const m = this.awaitedMissions.get(msgId);
       if (m === undefined) continue;
       if (m.answered && m.response !== undefined) {
         answers.push({ msgId, to: m.to, response: m.response });
       } else {
-        missing.push({ msgId, to: m.to });
+  // NOT ANSWERED — but if the target sent us ANYTHING since the mission
+  // went out (a plain msg, an uncorrelated reply — the external-relay
+  // failure mode), attach it: the answer may be sitting in mesh_history
+  // while the mission legitimately stays "not answered". The tool layer
+  // renders it as an explicit ⚠ line instead of a bare "missing".
+        missing.push({
+          msgId,
+          to: m.to,
+          lastActivity: this.lastInboundSince(m.to, m.sentAt ?? 0),
+        });
       }
     }
     return {
@@ -998,6 +1052,7 @@ export class MeshClient extends EventEmitter {
           this.inbox.set(frame.id, frame);
           this.pruneInbox();
         }
+        this.noteInboundFrom(frame);
         this.emit("inbound", frame);
         break;
       case "reserve": {
@@ -1026,6 +1081,8 @@ export class MeshClient extends EventEmitter {
           this.emit("inbound", frame, { matchedReply: false });
           break;
         }
+  // receipts are machine meta — they are NOT the peer "talking to us".
+        this.noteInboundFrom(frame);
   // wake-on-answer: consult the launch flag BEFORE handleReply consumes it
         const wake = replyTo !== undefined && this.pending.isLaunch(replyTo) && this.waitAllInFlight === 0;
         const matched = replyTo !== undefined ? this.pending.handleReply(frame) : false;
@@ -1289,7 +1346,7 @@ export class MeshClient extends EventEmitter {
     let pendingPromise: Promise<import("./pending.js").PendingResolution> | null = null;
     if (opts.awaitReply) {
       this.awaitTargets.set(frame.id, { to: to ?? "*", room });
-      this.awaitedMissions.set(frame.id, { to: to ?? "*", room, status: "waiting", answered: false });
+      this.awaitedMissions.set(frame.id, { to: to ?? "*", room, status: "waiting", answered: false, sentAt: Date.now() });
       this.pruneAwaitedMissions();
       pendingPromise = this.pending.register(frame.id, Date.now() + timeoutMs, launch);
     }

@@ -19,7 +19,7 @@ import { MESH_VERSION } from "../shared/version.js";
 import type { DeferredInbox } from "./deferred-inbox.js";
 import type { MeshGuards } from "./guards.js";
 import { LOOP_GUARD_WARNING, REPLY_REPEAT_WARNING } from "./guards.js";
-import { identityFromClient, type MeshIdentity } from "../shared/identity-store.js";
+import { saveIdentityOf, type MeshIdentity } from "../shared/identity-store.js";
 import type { MeshLedger } from "./ledger.js";
 import type { ExtensionAPI, SessionContext, ToolResult } from "./pi-types.js";
 import { textResult } from "./pi-types.js";
@@ -36,12 +36,34 @@ export interface MeshRuntime {
   runtimeDir: string;
   /** Pi session id — stable across /reload (identity key). */
   sessionId: string;
+  /** The alias this session CHOSE (config pin, /mesh alias, /mesh join … as).
+   *  A conflict fallback may change client.alias, but the preferred alias is
+   *  persisted and retried at the next attach and by the reclaim loop — the
+   *  chosen name survives a conflict instead of being replaced by a random
+   *  one (the "my agent changed name" bug). */
+  preferredAlias: string;
+  /** Named agent-slot identity key (config identityKey) — undefined for the
+   *  default per-session identity. */
+  identityKey?: string;
+  /** Stop the alias reclaim timer (session_shutdown). */
+  stopReclaim?: () => void;
   /** Identity persistence (alias/rooms/reservations survive reloads). */
   identity: MeshIdentity;
   /** transferred history from a /mesh new handoff (injected at ready). */
   pendingHistory?: string[];
   /** inbound batching (flush remaining frames on shutdown). */
   batcher?: { flushNow(): void };
+  /** D47: bounded re-delivery of batches injected while a run was in
+  *  flight — pi purges the agent followUp queue on ESC aborts
+  *  (restoreQueuedMessagesToEditor → clearQueue), silently dropping them. */
+  injectionGuard?: import("./injection-guard.js").InjectionGuard;
+  /** Called by attach.ts after a batch send; returns the busy-at-send flag
+  *  so index.ts can arm the guard. */
+  noteBatchSent?: (frames: import("../protocol/envelope.js").MeshFrame[], deliverAs: import("./pi-types.js").DeliverAs, busyAtSend: boolean) => void;
+  /** Re-deliver a batch through the abort-safe nextTurn queue. */
+  resendBatch?: (frames: import("../protocol/envelope.js").MeshFrame[], originalDeliverAs: import("./pi-types.js").DeliverAs, tries: number) => void;
+  /** MEMORY-ONLY counter: batches re-delivered after an abort purge. */
+  redeliveredBatches: number;
   /** Unaddressed broadcasts held separately from immediate traffic. */
   deferredInbox?: DeferredInbox;
   /** Display-only entry outside the LLM context (mesh-verdict colors). */
@@ -627,6 +649,10 @@ async function execMeshStatus(
       `interrupts handled: ${rt.interruptCount ?? 0}${rt.lastInterruptOutcome !== undefined ? ` · last: ${rt.lastInterruptOutcome} at ${rt.lastInterruptAt ?? "?"}` : ""}`,
     );
   }
+  // D47: batches re-delivered after an abort purge (memory only)
+  if ((rt.redeliveredBatches ?? 0) > 0) {
+    lines.push(`batches re-delivered (abort purge recovery): ${rt.redeliveredBatches ?? 0}`);
+  }
   // M2: broker counters — relayed/refused/mailbox at a glance
   if (snap.stats !== undefined) {
     const s = snap.stats;
@@ -802,15 +828,22 @@ async function execMeshWaitAll(
   for (const m of res.missing) {
     const act = rt.client.activityOf(m.to)?.state;
     const busyMs = rt.client.busyForMs(m.to);
-    const reason =
-      busyMs !== undefined && busyMs > 60_000
-        ? ` — still busy (${formatElapsed(busyMs)})`
-        : act === "rate_limited"
-          ? " — rate-limited, retry later"
-          : act === "blocked"
-            ? " — blocked (provider error, needs intervention)"
-            : "";
-    lines.push(`  ✗ @${m.to}: NOT ANSWERED (${m.msgId.slice(0, 18)})${reason}`);
+    // ⚔ FIRST: the target DID talk to us since the mission went out, but
+    // uncorrelated (a plain msg / a reply to another msgId — measured:
+    // external relays answer missions via fresh sends). The answer may be
+    // sitting in mesh_history while the mission is legitimately NOT
+    // answered — the most actionable hint goes before busy/rate-limit.
+    const uncorrelated =
+      m.lastActivity !== undefined
+        ? ` — ⚠ uncorrelated ${m.lastActivity.type} from @${m.to} at ${localTime(m.lastActivity.at)} (${m.lastActivity.msgId.slice(0, 18)}): a plain message does NOT settle a mission; a mesh_reply correlated to (${m.msgId.slice(0, 18)}) is still expected — check mesh_history before re-sending`
+        : busyMs !== undefined && busyMs > 60_000
+          ? ` — still busy (${formatElapsed(busyMs)})`
+          : act === "rate_limited"
+            ? " — rate-limited, retry later"
+            : act === "blocked"
+              ? " — blocked (provider error, needs intervention)"
+              : "";
+    lines.push(`  ✗ @${m.to}: NOT ANSWERED (${m.msgId.slice(0, 18)})${uncorrelated}`);
   }
   if (res.total === 0) lines.push("  (no awaited missions — send with awaitReply: true first)");
   // display the colored verdict entry (agent colors + agent-color backgrounds)
@@ -914,11 +947,7 @@ function armReserveTimers(rt: MeshRuntime, patterns: string[], ms: number): void
     const t = setTimeout(() => {
       rt.reserveTimers?.delete(pattern);
       void rt.client.release([pattern]).catch(() => {}); // best effort
-      try {
-        rt.identity.save(identityFromClient(rt.sessionId, rt.client));
-      } catch {
-  // best effort
-      }
+      saveIdentityOf(rt.identity, rt);
     }, ms);
     t.unref();
     rt.reserveTimers.set(pattern, t);
@@ -957,8 +986,9 @@ async function execMeshReserve(
   if (res.status === "delivered") {
     safeLedger(rt, { event: "reserved", id: res.msgId, from: rt.client.alias, refs: rawPaths, code: reason });
     if (autoReleaseMs !== undefined) armReserveTimers(rt, rawPaths, autoReleaseMs);
-  // reservations must survive /reload → persist identity now.
-    rt.identity.save(identityFromClient(rt.sessionId, rt.client));
+  // reservations must survive /reload → persist identity now (single write
+  // path: preferredAlias + identityKey travel with it).
+    saveIdentityOf(rt.identity, rt);
     const auto = autoReleaseMs !== undefined ? ` — auto-release in ${formatElapsed(autoReleaseMs)}` : "";
     return textResult(`reserved ${rawPaths.length} path(s) — peers notified${auto}`, sendDetails({ status: "delivered", paths: rawPaths, reason, autoReleaseMs }));
   }
@@ -994,7 +1024,7 @@ async function execMeshRelease(
   if (res.status === "delivered") {
     safeLedger(rt, { event: "released", from: rt.client.alias, refs: res.released.length > 0 ? res.released : undefined });
   // persist the reduced reservation set before returning.
-    rt.identity.save(identityFromClient(rt.sessionId, rt.client));
+    saveIdentityOf(rt.identity, rt);
     return textResult(
       res.released.length > 0
         ? `released: ${res.released.join(", ")}`
@@ -1029,6 +1059,9 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
       "An 'expired' awaitReply is NOT a lost message: late replies are " +
       "delivered and injected automatically — do not re-send the request, " +
       "check mesh_history first. " +
+      "RECIPIENTS ANSWER WITH mesh_reply(msgId) — a plain mesh_send back to " +
+      "you does NOT settle the mission (external relay peers often do this); " +
+      "wait_all flags it as '⚠ uncorrelated msg'. " +
       "replyTo: [aliases] designates who receives the reply instead of you " +
       "(include yourself to also get the answer, e.g. with awaitReply).",
     parameters: MESH_SEND_PARAMETERS,
@@ -1085,6 +1118,13 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
       "(or timeout), then return the group summary — who answered, who is missing. " +
       "The honest alternative to sleep-while-waiting: no wasted tokens, no polling.",
     promptSnippet: "Wait for all pending mission replies and get the summary.",
+    promptGuidelines:
+      "Only a mesh_reply correlated to the mission msgId settles a mission. " +
+      "A NOT ANSWERED line carrying '⚠ uncorrelated msg from @X' means X DID " +
+      "send you something after the mission went out, but as a plain message " +
+      "(no correlation) — read it with mesh_history BEFORE re-sending the " +
+      "mission; it is often the answer, or a progress note announcing the real " +
+      "reply. Do NOT press-re-send on a ⚠ line without checking mesh_history.",
     parameters: MESH_WAIT_ALL_PARAMETERS,
     execute: (_toolCallId, params, signal, _onUpdate, _ctx) => execMeshWaitAll(getRuntime, params, signal),
   });
