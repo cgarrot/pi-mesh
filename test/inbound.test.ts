@@ -3,7 +3,7 @@
 // carrying the exact msgId so the receiving model knows HOW to answer.
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { formatInboundContent, handleInboundFrame, localTime } from "../src/extension/inbound.js";
+import { formatInboundContent, handleInboundFrame, localTime, sendReadReceipt } from "../src/extension/inbound.js";
 import { buildFrame, type MeshFrame } from "../src/protocol/envelope.js";
 
 const msgFrame = (): MeshFrame =>
@@ -246,5 +246,26 @@ describe("handleInboundFrame: injection retry (a silent drop is the worst outcom
     handleInboundFrame(pi as never, null, frame(), deps as never);
     await sleep(30);
     assert.ok(ledgerEvents.includes("inbound"));
+  });
+});
+
+describe("sendReadReceipt (D34): only new messages echo", () => {
+  it("msg/mailbox send a receipt with id+from; reply/remind do not", () => {
+    const calls: string[] = [];
+    const read = (id: string, from: string): void => { calls.push(`${id}<-${from}`); };
+    const msg = buildFrame({ type: "msg", from: "alice", to: "bob", body: "x" });
+    sendReadReceipt(msg, read);
+    const box = buildFrame({ type: "mailbox", from: "carol", to: "bob", body: "y" });
+    sendReadReceipt(box, read);
+    const reply = buildFrame({ type: "reply", from: "dave", to: "bob", replyTo: "m1", body: "z" });
+    sendReadReceipt(reply, read);
+    const remind = buildFrame({ type: "remind", from: "erin", to: "bob", replyTo: "m1" });
+    sendReadReceipt(remind, read);
+    assert.deepEqual(calls, [`${msg.id}<-alice`, `${box.id}<-carol`]);
+  });
+
+  it("a throwing read never breaks the handler", () => {
+    const msg = buildFrame({ type: "msg", from: "alice", to: "bob", body: "x" });
+    assert.doesNotThrow(() => sendReadReceipt(msg, () => { throw new Error("offline"); }));
   });
 });

@@ -324,8 +324,8 @@ export interface InboundDeps {
 }
 
 /**
- * Side effects that ALWAYS run per frame (never batched): transcript,
- * ledger, read receipt, replyChain tagging..
+ * Side effects that ALWAYS run per frame (never batched): replyChain tagging.
+ * (Injection, read receipts, transcript and ledger happen downstream.)
  */
 export function handleInboundSideEffects(frame: MeshFrame, deps: InboundDeps): void {
   const replyChain =
@@ -333,6 +333,26 @@ export function handleInboundSideEffects(frame: MeshFrame, deps: InboundDeps): v
     frame.replyTo !== undefined &&
     deps.isReplyToReply?.(frame.replyTo) === true;
   (frame as unknown as { __replyChain?: boolean }).__replyChain = replyChain;
+}
+
+/**
+ * D34: read = the frame reached the session queue, not necessarily that the
+ * model saw it (an abort/ESC-cleared turn can still purge a queued frame).
+ * Send for new messages only (msg/mailbox); replies and reminds must not echo.
+ * Best effort: a failed receipt must never break the injection path.
+ */
+export function sendReadReceipt(
+  frame: MeshFrame,
+  read: (msgId: string, from: string) => void,
+): void {
+  if ((frame.type !== "msg" && frame.type !== "mailbox") || frame.id === undefined || frame.from === undefined) {
+    return;
+  }
+  try {
+    read(frame.id, frame.from);
+  } catch {
+    // best effort — a failed receipt must never break the handler
+  }
 }
 
 export function handleInboundFrame(
@@ -367,14 +387,8 @@ export function handleInboundFrame(
   }
   // the message reached the session → honest read receipt back to the
   // sender (msg/mailbox only — replies and reminds are not 'new' messages).
-  if (deps.read !== undefined && (frame.type === "msg" || frame.type === "mailbox")) {
-    if (frame.id !== undefined && frame.from !== undefined) {
-      try {
-        deps.read(frame.id, frame.from);
-      } catch {
-  // best effort — a failed receipt must never break the handler
-      }
-    }
+  if (deps.read !== undefined) {
+    sendReadReceipt(frame, deps.read);
   }
   try {
     deps.transcript.record("in", frame);

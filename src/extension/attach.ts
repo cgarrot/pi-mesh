@@ -8,7 +8,7 @@ import { buildBatchMessage, bypassesBatch, batchDetails, InboundBatcher } from "
 import { DeferredInbox } from "./deferred-inbox.js";
 import { classifyInbound } from "./inbound-policy.js";
 import type { MeshHud } from "./hud.js";
-import { handleInboundSideEffects, injectInbound, type FormatOpts, type InjectOpts } from "./inbound.js";
+import { handleInboundSideEffects, injectInbound, sendReadReceipt, type FormatOpts, type InjectOpts } from "./inbound.js";
 import { ReplyHintTracker } from "./reply-hints.js";
 import type { ExtensionAPI, InboundMessage, SessionContext } from "./pi-types.js";
 import type { MeshRuntime } from "./tools.js";
@@ -158,8 +158,13 @@ export function attachClientListeners(
     read: (msgId: string, from: string) => client.sendRead(msgId, from),
     isReplyToReply: (replyTo: string) => client.isReplyToReply(replyTo),
   };
+  /** D34: read receipt = the frame actually reached this session. */
+  const readFrame = (frame: MeshFrame): void => {
+    sendReadReceipt(frame, (msgId, from) => client.sendRead(msgId, from));
+  };
   // batch inbound messages over a short window → ONE injection (one
-  // turn) for a burst; force/remind bypass the batcher (immediate delivery).
+  // turn) for a burst; force/remind always bypass, urgent bypasses only
+  // while busy (idle bursts coalesce instead of spending one turn per message).
   const batcher = new InboundBatcher(
     client.inboundBatchMs,
     client.inboundBatchMaxHoldMs,
@@ -178,14 +183,19 @@ export function attachClientListeners(
         },
         { triggerTurn: true, deliverAs: batch.deliverAs },
       );
+      // D34: the batch reached the session → read each new message
+      for (const frame of frames) readFrame(frame);
     });
   },
   );
-  const deferredInbox = new DeferredInbox(pi, (frame) =>
-    formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom),
-  (count) => guarded(() => {
-    if (ctx.mode === "tui") ctx.ui.setStatus("mesh-inbox", count > 0 ? `mesh:deferred ${count}` : undefined);
-  }));
+  const deferredInbox = new DeferredInbox(
+    pi,
+    (frame) => formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom),
+    (count) => guarded(() => {
+      if (ctx.mode === "tui") ctx.ui.setStatus("mesh-inbox", count > 0 ? `mesh:deferred ${count}` : undefined);
+    }),
+    (frames) => frames.forEach(readFrame),
+  );
   rt.deferredInbox = deferredInbox;
   pi.on("input", (_event, inputCtx) => {
     if (!detached && inputCtx.isIdle?.() !== false) guarded(() => deferredInbox.queueForPrompt());
@@ -197,6 +207,8 @@ export function attachClientListeners(
   // rate-limited hold: while the provider rejects turns (429), inbound
   // frames are NOT injected — every injection would burn another failed
   // turn. They are queued and delivered when the hold expires.
+  // NOTE: this holds EVERY priority, including urgent — urgent is not a
+  // delivery guarantee while the provider is rate-limited/blocked.
   const heldFrames: { frame: MeshFrame; matchedReply: boolean }[] = [];
   const deliver = (frame: MeshFrame, matchedReply: boolean): void => {
     handleInboundSideEffects(frame, deps);
@@ -208,7 +220,7 @@ export function attachClientListeners(
     const opts: FormatOpts = {
       ...formatOptsFor(frame, client.contextVerbosity === "full", client.homeRoom),
     };
-    if (bypassesBatch(frame) || client.inboundBatchMs <= 0) {
+    if (bypassesBatch(frame, rt.ctx?.isIdle?.() === false) || client.inboundBatchMs <= 0) {
       batcher.flushNow(); // deliver any pending batch first (ordering)
       const injectOpts: InjectOpts = {
         ...opts,
@@ -241,6 +253,8 @@ export function attachClientListeners(
       }
       guarded(() => {
         injectInbound(pi, rt.ctx, frame, injectOpts);
+        // the session accepted it; "read" means reached the session, not "model saw it".
+        readFrame(frame);
       });
       return;
     }
