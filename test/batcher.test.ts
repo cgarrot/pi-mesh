@@ -99,10 +99,23 @@ describe("InboundBatcher (D40)", () => {
     assert.equal(flushes, 1, "max-hold safety cap flushes despite busy");
   });
 
-  it("bypassesBatch: force and remind are immediate; normal/reply are batched", () => {
-    assert.equal(bypassesBatch(buildFrame({ type: "msg", from: "x", priority: "force", id: "m1" })), true);
-    assert.equal(bypassesBatch(buildFrame({ type: "remind", from: "x", replyTo: "m1", id: "m2" })), true);
-    assert.equal(bypassesBatch(msg()), false);
-    assert.equal(bypassesBatch(reply()), false);
+  it("bypassesBatch: force/remind always; urgent only while busy; normal/reply batched", () => {
+    const urgent = buildFrame({ type: "msg", from: "x", priority: "urgent", id: "m3" });
+    assert.equal(bypassesBatch(buildFrame({ type: "msg", from: "x", priority: "force", id: "m1" }), true), true);
+    assert.equal(bypassesBatch(buildFrame({ type: "remind", from: "x", replyTo: "m1", id: "m2" }), false), true);
+    assert.equal(bypassesBatch(urgent, false), false, "idle urgent coalesces in the window");
+    assert.equal(bypassesBatch(urgent, true), true, "busy urgent must not wait for max-hold");
+    assert.equal(bypassesBatch(msg(), true), false);
+    assert.equal(bypassesBatch(reply(), true), false);
+  });
+
+  it("flushes a batch containing urgent at the window even while busy", async () => {
+    let flushes = 0;
+    const b = new InboundBatcher(20, 5000, () => true, () => {
+      flushes += 1;
+    });
+    b.push(buildFrame({ type: "msg", from: "x", priority: "urgent", id: "u1" }));
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(flushes, 1, "urgent must not wait for max-hold when the agent turns busy");
   });
 });

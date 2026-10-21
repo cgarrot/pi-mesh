@@ -47,6 +47,8 @@ export function buildBatchMessage(frames: MeshFrame[], formatFor: FormatFor = ()
   );
   const hasUrgent = frames.some((f) => f.priority === "urgent");
   const hasReply = frames.some((f) => f.type === "reply");
+  // idle-arrived urgent may be batched (bypass is busy-gated); the batch
+  // rides as a steer so the instruction still lands at the next boundary.
   const deliverAs: DeliverAs = hasUrgent || hasReply ? "steer" : "followUp";
   return { content: parts.join("\n"), deliverAs };
 }
@@ -59,9 +61,14 @@ export function batchDetails(frames: MeshFrame[]): Record<string, unknown> {
   };
 }
 
-/** Returns true when the frame must be injected IMMEDIATELY (never batched). */
-export function bypassesBatch(frame: MeshFrame): boolean {
-  return frame.priority === "force" || frame.type === "remind";
+/**
+ * Returns true when the frame must bypass the batcher.
+ * force/remind always do. urgent only while the agent is busy: when idle the
+ * 250ms window coalesces a burst instead of spending one turn per message.
+ */
+export function bypassesBatch(frame: MeshFrame, busy = false): boolean {
+  if (frame.priority === "force" || frame.type === "remind") return true;
+  return frame.priority === "urgent" && busy;
 }
 
 /** Build a single (non-batched) inbound message — used when batchMs = 0. */
@@ -110,11 +117,15 @@ export class InboundBatcher {
 
   /** The short window elapsed: flush only when the agent is NOT busy —
   *  otherwise hold (a long tool call is running; more messages may come)
-  *  and arm a max-hold fallback so nothing is retained forever. */
+  *  and arm a max-hold fallback so nothing is retained forever.
+  *  EXCEPTION: a batch containing urgent flushes immediately — an urgent
+  *  instruction must not wait for the max-hold just because the agent turned
+  *  busy inside the window. */
   private onWindow(): void {
     this.timer = null;
     if (this.frames.length === 0) return;
-    if (this.isBusy()) {
+    const hasUrgent = this.frames.some((f) => f.priority === "urgent");
+    if (this.isBusy() && !hasUrgent) {
       if (this.maxTimer === null) {
         this.maxTimer = setTimeout(() => this.flushNow(), this.maxHoldMs);
         this.maxTimer.unref();

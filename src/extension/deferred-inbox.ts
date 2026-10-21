@@ -16,6 +16,7 @@ export class DeferredInbox {
     private readonly pi: Pick<ExtensionAPI, "sendMessage">,
     private readonly formatFor: (frame: MeshFrame) => FormatOpts,
     private readonly changed: (count: number) => void,
+    private readonly onSent?: (frames: MeshFrame[]) => void,
   ) {}
 
   get count(): number {
@@ -66,16 +67,20 @@ export class DeferredInbox {
   agentStarting(): void {
     if (!this.draining) return;
     this.draining = false;
+    const delivered = this.queued;
     this.queued = [];
     this.changed(this.count);
+    if (delivered.length > 0) this.onSent?.(delivered);
   }
 
   flush(): number {
-    const count = this.pending.length;
+    const frames = this.pending;
+    const count = frames.length;
     if (count === 0) return 0;
-    this.send(this.pending, true);
+    this.send(frames, true);
     this.pending = [];
     this.changed(this.count);
+    this.onSent?.(frames);
     return count;
   }
 
