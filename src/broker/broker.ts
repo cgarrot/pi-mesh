@@ -27,6 +27,7 @@ import {
   LOCK_VERIFY_WAIT_MS,
   PROTO_VERSION,
   DEFAULT_LEASE_TTL_MS,
+  CTL_PENDING_TTL_MS,
   loadConfig,
   type MeshConfig,
 } from "../shared/config.js";
@@ -113,6 +114,9 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
   const { config, policy } = options;
   const sockPath = options.socketPath ?? brokerSocketPath();
   const state = new BrokerState();
+  /** ctl id -> expected (sender, target): an ack without a pending ctl is
+   *  dropped, so a peer cannot forge a ctl_ack for someone else's mission. */
+  const pendingCtl = new Map<string, { from: string; to: string; action: string; at: number }>();
   const brokerStateDir = options.stateDir ?? stateDir();
   const leases = new LeaseTable(nextEpoch(brokerStateDir));
   const tcp = options.tcpListen;
@@ -616,6 +620,71 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
   // reminds to offline targets: dropped silently
   };
 
+  /** C: route a control frame to an ONLINE peer. No mailbox: a destructive
+   *  action queued for later is a surprise, and the sender must know. */
+  const handleCtl = (from: PeerRecord, frame: MeshFrame): void => {
+    const to = frame.to;
+    if (to === undefined) {
+      sendError(from.socket, "invalid_alias", frame.id);
+      return;
+    }
+    const target = state.peers.get(to);
+    if (target === undefined || !target.helloDone || target.socket.destroyed) {
+      sendError(from.socket, "unreachable", frame.id);
+      return;
+    }
+    const force = frame.action === "abort" || frame.action === "redirect";
+    const priority = force ? "force" : "normal";
+    const decision = evaluatePolicy(policy, { from: from.alias, to, room: frame.room ?? DEFAULT_ROOM, priority });
+    // A control action cannot be "downgraded": forceDowngrade turns a force
+    // MESSAGE into urgent, but an abort/redirect either is authorized or is
+    // refused. Requiring allow here closes the downgrade bypass.
+    if (decision.action !== "allow") {
+      state.stats.refused += 1;
+      sendError(from.socket, "policy_denied", frame.id);
+      return;
+    }
+    const kind: RateKind = force ? "force" : "msg";
+    if (!checkRate(state, from.alias, kind, policy.rateLimits)) {
+      state.stats.refused += 1;
+      sendError(from.socket, "rate_limited", frame.id);
+      return;
+    }
+    const now = Date.now();
+    for (const [id, pending] of pendingCtl) {
+      if (now - pending.at > CTL_PENDING_TTL_MS) pendingCtl.delete(id);
+    }
+    pendingCtl.set(frame.id, { from: from.alias, to, action: frame.action ?? "", at: now });
+    writeFrame(target.socket, frame, config.maxFrameBytes, (ok) => {
+      if (!ok) {
+        pendingCtl.delete(frame.id);
+        if (state.peers.get(target.alias) === target) closePeer(state, target.alias, "write_failure");
+        sendError(from.socket, "unreachable", frame.id);
+        return;
+      }
+      state.stats.relayed += 1;
+    });
+  };
+
+  /** C: relay a ctl_ack back to the original sender, but ONLY when it matches
+   *  a pending ctl (same pair, same id). Stale/forged acks are dropped. */
+  const handleCtlAck = (from: PeerRecord, frame: MeshFrame): void => {
+    const replyTo = frame.replyTo;
+    if (replyTo === undefined) return;
+    const pending = pendingCtl.get(replyTo);
+    if (pending === undefined) return;
+    if (pending.to !== from.alias || pending.from !== frame.to) return;
+    // The ack must answer the SAME action: a target cannot turn an abort into
+    // a "stopped" (or vice versa) and have the sender believe it.
+    if (pending.action !== (frame.action ?? "")) return;
+    pendingCtl.delete(replyTo);
+    const target = frame.to !== undefined ? state.peers.get(frame.to) : undefined;
+    if (target === undefined || !target.helloDone || target.socket.destroyed) return;
+    writeFrame(target.socket, frame, config.maxFrameBytes, (ok) => {
+      if (ok) state.stats.relayed += 1;
+    });
+  };
+
   const dispatch = (socket: Socket, frame: MeshFrame): void => {
     const peer = frame.from !== undefined ? state.peers.get(frame.from) : undefined;
     const authed = peer !== undefined && peer.socket === socket && peer.helloDone;
@@ -672,6 +741,12 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
   // read receipt → routed to the ORIGINAL sender of the msgId,
   // online-only and silent (never acked, never mailboxed).
         routeRead(peer, frame);
+        break;
+      case "ctl":
+        handleCtl(peer, frame);
+        break;
+      case "ctl_ack":
+        handleCtlAck(peer, frame);
         break;
       case "activity": {
   // Phase 3: the peer announces its turn state — stored, then shared

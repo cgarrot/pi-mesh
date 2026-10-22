@@ -10,9 +10,11 @@ import {
   MAX_REFS,
   MAX_REF_CHARS,
   MAX_REPLY_TARGETS,
+  MAX_CTL_TARGET_CHARS,
   MAX_TASK_PATHS,
   PROTO_VERSION,
   ROOM_REGEX,
+  CTL_TARGET_REGEX,
   normalizeCaps,
   SHA256_HEX_REGEX,
 } from "../shared/config.js";
@@ -20,6 +22,35 @@ import { makeMsgId, nowIso, sha256 } from "./frames.js";
 import { capTargetName, validateTaskPackage, type MeshTaskPackage } from "./task-package.js";
 
 export type MeshPriority = "normal" | "urgent" | "force";
+
+/** Closed control actions. `abort`/`redirect` act on a peer TURN; `job_*`
+ *  and `run_*` are dispatched to the target's local extensions. */
+export const CTL_ACTIONS = ["abort", "redirect", "job_stop", "job_pause", "job_resume", "run_stop", "run_steer"] as const;
+export type CtlAction = (typeof CTL_ACTIONS)[number];
+
+/** Honest ctl_ack statuses. */
+export const CTL_STATUSES = [
+  "aborted",
+  "redirected",
+  "stopped",
+  "paused",
+  "resumed",
+  "steered",
+  "not_busy",
+  "still_busy",
+  "abort_unavailable",
+  "not_found",
+  "not_pausable",
+  "not_paused",
+  "not_running",
+  "not_supported",
+  "unsupported",
+  "not_authorized",
+  "identity_mismatch",
+  "timeout",
+  "error",
+] as const;
+export type CtlStatus = (typeof CTL_STATUSES)[number];
 export type MeshRole = "member" | "observer";
 
 export interface FileReservation {
@@ -80,7 +111,13 @@ export interface MeshFrame {
   fence?: number;
   epoch?: number;
   owner?: string;
-  reasonHash?: string; // force only
+  reasonHash?: string; // force only (and abort/redirect ctl)
+  /** C: closed control action (ctl / ctl_ack). */
+  action?: string;
+  /** C: jobId / runId the action targets (never a shell string). */
+  target?: string;
+  /** C: the target turn settled (ctl_ack). */
+  settled?: boolean;
   expiresAt?: string;
   code?: string;
   status?: string;
@@ -141,6 +178,8 @@ export const FRAME_TYPES = [
   "release",
   "lease",
   "lease_status",
+  "ctl",
+  "ctl_ack",
   "error",
 ] as const;
 export type MeshFrameType = (typeof FRAME_TYPES)[number];
@@ -165,6 +204,8 @@ export const ERROR_CODES = [
   "lease_not_held",
   "lease_stale",
   "force_requires_reason",
+  "unreachable",
+  "unsupported",
   "hash_mismatch",
   "reply_without_target",
   "timeout",
@@ -267,6 +308,12 @@ export interface BuildFrameOpts {
   body?: string;
   refs?: string[];
   reasonHash?: string;
+  /** C: closed control action (ctl / ctl_ack). */
+  action?: string;
+  /** C: jobId / runId target. */
+  target?: string;
+  /** C: turn settled (ctl_ack). */
+  settled?: boolean;
   expiresAt?: string;
   code?: MeshErrorCode;
   status?: string;
@@ -328,6 +375,9 @@ export function buildFrame(opts: BuildFrameOpts): MeshFrame {
   }
   if (opts.refs !== undefined) frame.refs = [...opts.refs];
   if (opts.reasonHash !== undefined) frame.reasonHash = opts.reasonHash;
+  if (opts.action !== undefined) frame.action = opts.action;
+  if (opts.target !== undefined) frame.target = opts.target;
+  if (opts.settled !== undefined) frame.settled = opts.settled;
   if (opts.expiresAt !== undefined) frame.expiresAt = opts.expiresAt;
   if (opts.code !== undefined) frame.code = opts.code;
   if (opts.status !== undefined) frame.status = opts.status;
@@ -621,6 +671,53 @@ export function validateFrame(value: unknown, opts: ValidateOpts = {}): Validati
       if (p.proto !== undefined && !isValidProto(p.proto)) {
         return { ok: false, code: "invalid_frame", detail: "bad peer proto" };
       }
+    }
+  }
+
+  // C: control frames — closed action, bounded opaque target, honest ack status.
+  if (value.action !== undefined) {
+    if (typeof value.action !== "string" || !(CTL_ACTIONS as readonly string[]).includes(value.action)) {
+      return { ok: false, code: "invalid_frame", detail: "bad action" };
+    }
+  }
+  if (value.target !== undefined) {
+    if (
+      typeof value.target !== "string" ||
+      value.target.length === 0 ||
+      value.target.length > MAX_CTL_TARGET_CHARS ||
+      !CTL_TARGET_REGEX.test(value.target)
+    ) {
+      return { ok: false, code: "invalid_frame", detail: "bad target" };
+    }
+  }
+  if (value.settled !== undefined && typeof value.settled !== "boolean") {
+    return { ok: false, code: "invalid_frame", detail: "bad settled" };
+  }
+  if (value.type === "ctl") {
+    if (value.action === undefined) return { ok: false, code: "invalid_frame", detail: "ctl requires action" };
+    const action = value.action as CtlAction;
+    if ((action === "job_stop" || action === "job_pause" || action === "job_resume" || action === "run_stop" || action === "run_steer") && value.target === undefined) {
+      return { ok: false, code: "invalid_frame", detail: "ctl requires target" };
+    }
+    if (action === "abort" || action === "redirect") {
+      if (typeof value.reasonHash !== "string" || !SHA256_HEX_REGEX.test(value.reasonHash)) {
+        return { ok: false, code: "invalid_frame", detail: "ctl abort/redirect requires reasonHash" };
+      }
+    }
+    if (value.to !== undefined && typeof value.to === "string" && capTargetName(value.to) !== undefined) {
+      return { ok: false, code: "invalid_alias", detail: "ctl target must be an alias, not a cap route" };
+    }
+    if (action === "redirect" && (typeof value.body !== "string" || value.body.trim() === "")) {
+      return { ok: false, code: "invalid_frame", detail: "redirect requires a body" };
+    }
+    if (action === "run_steer" && (typeof value.body !== "string" || value.body.trim() === "")) {
+      return { ok: false, code: "invalid_frame", detail: "run_steer requires a body" };
+    }
+  }
+  if (value.type === "ctl_ack") {
+    if (value.replyTo === undefined) return { ok: false, code: "invalid_frame", detail: "ctl_ack requires replyTo" };
+    if (typeof value.status !== "string" || !(CTL_STATUSES as readonly string[]).includes(value.status)) {
+      return { ok: false, code: "invalid_frame", detail: "bad ctl_ack status" };
     }
   }
 

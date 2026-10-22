@@ -89,5 +89,10 @@ describe("client: legacy (protocol 1) broker", () => {
     // A plain alias send is protocol-1 compatible and must not be blocked.
     const plain = await alice.send({ to: "bob", message: "hi" });
     assert.equal(plain.status, "delivered");
+
+    // The control plane is protocol-2 only: fail fast, not a 15 s timeout.
+    const ctl = await alice.control({ to: "bob", action: "job_stop", target: "j_1", timeoutMs: 2_000 });
+    assert.equal(ctl.status, "error");
+    if (ctl.status === "error") assert.match(ctl.reason, /broker_too_old/);
   });
 });

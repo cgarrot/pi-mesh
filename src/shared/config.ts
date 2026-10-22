@@ -149,6 +149,23 @@ export const MIN_LEASE_TTL_MS = 1_000;
 export const MAX_LEASE_TTL_MS = 24 * 60 * 60 * 1_000;
 export const DEFAULT_LEASE_TTL_MS = 6 * 60 * 60 * 1_000;
 
+// ---- Control plane (ctl frames) ----
+/** How long a sender waits for a ctl_ack before reporting an honest timeout
+ *  (the target may still have acted — never auto-retry a destructive ctl). */
+export const CTL_ACK_TIMEOUT_MS = 15_000;
+/** How long the local dispatcher waits for another extension's handler.
+ *  Must exceed the jobd worst case (STOP_GRACE 5 s + KILL_SETTLE 1 s + margin)
+ *  while staying below the sender's CTL_ACK_TIMEOUT_MS (15 s): a slow local
+ *  handler must not produce a false "unsupported". */
+export const CTL_LOCAL_TIMEOUT_MS = 12_000;
+/** How long the broker remembers a ctl id to bind its ack (replay/fake guard). */
+export const CTL_PENDING_TTL_MS = 60_000;
+/** How long a redirect waits for the aborted turn to settle locally. */
+export const CTL_SETTLE_TIMEOUT_MS = 10_000;
+/** Target bound (jobId / runId). */
+export const MAX_CTL_TARGET_CHARS = 128;
+export const CTL_TARGET_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
 /** Lowercase, de-dupe, validate and bound a capability list. Invalid
  *  entries are dropped (a bad MESH_CAPS value must not break the hello). */
 export function normalizeCaps(input: readonly string[] | undefined): string[] {

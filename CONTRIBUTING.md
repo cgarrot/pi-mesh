@@ -28,6 +28,11 @@ README first, then these guidelines.
 - **Interrupt wording is honest by construction**: the extension reports
   `turn aborted` / `still busy` — never "process killed" (not observable
   from inside), and receipts never settle an awaited mission.
+- **Control (`ctl`) is online-only and never retried**: an offline target is
+  `unreachable`, a missing ack is `timeout` (the target may have acted), and
+  a `ctl_ack` is relayed only to the sender of the pending `ctl` (forged or
+  stale acks are dropped). `abort`/`redirect` are force-class and require a
+  reason.
 
 ## CLI rules (`pimesh`)
 

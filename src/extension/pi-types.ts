@@ -185,7 +185,12 @@ export type ToolCallHandler = (
 /** The subset of the Pi ExtensionAPI used by the mesh extension. */
 export interface ExtensionAPI {
   /** Shared process-local event bus (optional on older hosts). */
-  events?: { emit(event: string, data: unknown): void };
+  events?: {
+    emit(event: string, data: unknown): void;
+    /** Cross-extension request/response (used by the ctl dispatcher). */
+    on?(event: string, handler: (data: unknown) => void): void;
+    off?(event: string, handler: (data: unknown) => void): void;
+  };
   on(event: "tool_call", handler: ToolCallHandler): void;
   on(event: SessionEventName, handler: SessionHookHandler): void;
   registerTool(tool: ToolDefinition): void;

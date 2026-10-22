@@ -1,7 +1,7 @@
 // extension/tools.ts — the mesh tools (send/reply/status/history/wait_all/
 // ledger/reserve/release). Plain JSON Schema parameters (zero-dependency).
 // Honest statuses: delivered ≠ read ≠ answered. Offline → blocked.
-import { computePeerStatus, MeshClient, type LeaseResult, type SendResult } from "../client/client.js";
+import { computePeerStatus, MeshClient, type CtlResult, type LeaseResult, type SendResult } from "../client/client.js";
 import type { MeshPriority } from "../protocol/envelope.js";
 import { buildFrame, normalizeAlias } from "../protocol/envelope.js";
 import { capTargetName, checkCapSend, validateTaskPackage, type MeshTaskPackage } from "../protocol/task-package.js";
@@ -149,6 +149,29 @@ function safeLedger(rt: MeshRuntime, input: Parameters<MeshLedger["append"]>[0])
   } catch {
   // fail-closed throw is for forbidden keys; our records never contain them
   }
+}
+
+/** C: the SENDER also records the control it ordered (hash-only, like the
+ *  target side). An abort must leave a trace on both ends. */
+function recordCtl(
+  rt: MeshRuntime,
+  res: CtlResult,
+  to: string,
+  action: string,
+  target: string | undefined,
+  reason?: string,
+): void {
+  if (res.ctlId === undefined) return;
+  safeLedger(rt, {
+    event: "ctl",
+    id: res.ctlId,
+    from: rt.client.alias,
+    to,
+    code: res.status,
+    action,
+    ...(target !== undefined ? { target } : {}),
+    ...(reason !== undefined ? { reasonHash: sha256(reason) } : {}),
+  });
 }
 
 // ---------------------------------------------------------------- send guards
@@ -1187,6 +1210,179 @@ async function execMeshRelease(
   return textResult(`blocked: ${resReason}`, sendDetails({ status: "blocked", reason: resReason }));
 }
 
+// ---------------------------------------------------------------- control plane
+
+const CTL_RESULT_SCHEMA = "mesh.ctl-result.v1";
+
+function ctlDetails(partial: Record<string, unknown>): Record<string, unknown> {
+  return { schema: CTL_RESULT_SCHEMA, bodyStored: false, ...partial };
+}
+
+function timeoutParam(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isInteger(v) && v >= 1000 && v <= 600_000 ? v : undefined;
+}
+
+function ctlText(res: CtlResult, to: string, action: string, target?: string): string {
+  const t = target !== undefined ? ` ${target}` : "";
+  switch (res.status) {
+    case "aborted":
+      return `aborted @${to} (settled=${res.settled === true})`;
+    case "redirected":
+      return `redirected @${to} (settled=${res.settled === true})`;
+    case "stopped":
+      return `stopped${t} on @${to}`;
+    case "paused":
+      return `paused${t} on @${to}`;
+    case "resumed":
+      return `resumed${t} on @${to}`;
+    case "steered":
+      return `steered${t} on @${to}`;
+    case "not_busy":
+      return `not_busy @${to} (nothing to abort)`;
+    case "still_busy":
+      return `still_busy @${to} (the turn did not settle${action === "redirect" ? "; instruction NOT injected" : ""})`;
+    case "abort_unavailable":
+      return `abort_unavailable @${to} (host has no abort surface)`;
+    case "not_found":
+      return `not_found${t} on @${to}`;
+    case "not_pausable":
+      return `not_pausable${t} (the job was not started with pausable:true)`;
+    case "not_paused":
+      return `not_paused${t} (the job is not paused)`;
+    case "not_running":
+      return `not_running${t} (the job is not running)`;
+    case "not_supported":
+      return `not_supported${t} (win32 has no pause/resume)`;
+    case "unsupported":
+      return `unsupported @${to} (no local handler for ${action})`;
+    case "not_authorized":
+      return `blocked: policy_denied for ${action} → @${to}`;
+    case "identity_mismatch":
+      return `identity_mismatch${t}: the target refused to signal an unproven pid`;
+    case "unreachable":
+      return `unreachable @${to}: peer offline (ctl is never queued)`;
+    case "timeout":
+      return `timeout: ${res.reason} — NOT retried`;
+    case "error":
+      return `error: ${res.reason}`;
+  }
+}
+
+const MESH_ABORT_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  required: ["to", "reason"],
+  properties: {
+    to: { type: "string", description: "Peer alias whose current turn should be aborted." },
+    reason: { type: "string", description: "Why (required; hashed, never persisted)." },
+    timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 },
+  },
+};
+
+const MESH_REDIRECT_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  required: ["to", "message", "reason"],
+  properties: {
+    to: { type: "string", description: "Peer alias to redirect." },
+    message: { type: "string", description: "New instruction injected after the turn settles (1..32 KiB)." },
+    reason: { type: "string", description: "Why (required; hashed, never persisted)." },
+    timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 },
+  },
+};
+
+const MESH_JOB_CONTROL_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  required: ["to", "jobId", "action"],
+  properties: {
+    to: { type: "string", description: "Peer alias that owns the detached job." },
+    jobId: { type: "string", description: "Opaque job id from that peer's job_run." },
+    action: { type: "string", enum: ["stop", "pause", "resume"] },
+    timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 },
+  },
+};
+
+const MESH_RUN_CONTROL_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  required: ["to", "runId", "action"],
+  properties: {
+    to: { type: "string", description: "Peer alias that owns the RPC worker." },
+    runId: { type: "string", description: "Opaque run id from that peer's rpc_start." },
+    action: { type: "string", enum: ["stop", "steer"] },
+    message: { type: "string", description: "steer: instruction to inject into the worker." },
+    timeoutMs: { type: "integer", minimum: 1000, maximum: 600000 },
+  },
+};
+
+async function execMeshAbort(getRuntime: GetRuntime, params: Record<string, unknown>): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return textResult("blocked: session_not_started", ctlDetails({ status: "blocked", reason: "session_not_started" }));
+  const toRaw = str(params.to);
+  const reason = str(params.reason);
+  if (toRaw === undefined || reason === undefined) {
+    return textResult("error: to and reason are required", ctlDetails({ status: "error", reason: "invalid_request" }));
+  }
+  const to = normalizeAlias(toRaw);
+  const res = await rt.client.control({ to, action: "abort", reason, ...(timeoutParam(params.timeoutMs) !== undefined ? { timeoutMs: timeoutParam(params.timeoutMs) } : {}) });
+  recordCtl(rt, res, to, "abort", undefined, reason);
+  return textResult(ctlText(res, to, "abort"), ctlDetails({ status: res.status, to, action: "abort", settled: "settled" in res ? res.settled : undefined }));
+}
+
+async function execMeshRedirect(getRuntime: GetRuntime, params: Record<string, unknown>): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return textResult("blocked: session_not_started", ctlDetails({ status: "blocked", reason: "session_not_started" }));
+  const toRaw = str(params.to);
+  const message = str(params.message);
+  const reason = str(params.reason);
+  if (toRaw === undefined || message === undefined || reason === undefined) {
+    return textResult("error: to, message and reason are required", ctlDetails({ status: "error", reason: "invalid_request" }));
+  }
+  const to = normalizeAlias(toRaw);
+  const res = await rt.client.control({ to, action: "redirect", message, reason, ...(timeoutParam(params.timeoutMs) !== undefined ? { timeoutMs: timeoutParam(params.timeoutMs) } : {}) });
+  recordCtl(rt, res, to, "redirect", undefined, reason);
+  return textResult(ctlText(res, to, "redirect"), ctlDetails({ status: res.status, to, action: "redirect", settled: "settled" in res ? res.settled : undefined }));
+}
+
+async function execMeshJobControl(getRuntime: GetRuntime, params: Record<string, unknown>): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return textResult("blocked: session_not_started", ctlDetails({ status: "blocked", reason: "session_not_started" }));
+  const toRaw = str(params.to);
+  const jobId = str(params.jobId);
+  const action = params.action;
+  if (toRaw === undefined || jobId === undefined || (action !== "stop" && action !== "pause" && action !== "resume")) {
+    return textResult("error: to, jobId and action=stop|pause|resume are required", ctlDetails({ status: "error", reason: "invalid_request" }));
+  }
+  const ctlAction = `job_${action}` as "job_stop" | "job_pause" | "job_resume";
+  const to = normalizeAlias(toRaw);
+  const res = await rt.client.control({ to, action: ctlAction, target: jobId, ...(timeoutParam(params.timeoutMs) !== undefined ? { timeoutMs: timeoutParam(params.timeoutMs) } : {}) });
+  recordCtl(rt, res, to, ctlAction, jobId);
+  return textResult(ctlText(res, to, ctlAction, jobId), ctlDetails({ status: res.status, to, action: ctlAction, target: jobId }));
+}
+
+async function execMeshRunControl(getRuntime: GetRuntime, params: Record<string, unknown>): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return textResult("blocked: session_not_started", ctlDetails({ status: "blocked", reason: "session_not_started" }));
+  const toRaw = str(params.to);
+  const runId = str(params.runId);
+  const action = params.action;
+  if (toRaw === undefined || runId === undefined || (action !== "stop" && action !== "steer")) {
+    return textResult("error: to, runId and action=stop|steer are required", ctlDetails({ status: "error", reason: "invalid_request" }));
+  }
+  const message = str(params.message);
+  if (action === "steer" && message === undefined) {
+    return textResult("error: steer requires a message", ctlDetails({ status: "error", reason: "invalid_request" }));
+  }
+  const ctlAction = action === "stop" ? "run_stop" : "run_steer";
+  const to = normalizeAlias(toRaw);
+  const res = await rt.client.control({
+    to,
+    action: ctlAction,
+    target: runId,
+    ...(message !== undefined ? { message } : {}),
+    ...(timeoutParam(params.timeoutMs) !== undefined ? { timeoutMs: timeoutParam(params.timeoutMs) } : {}),
+  });
+  recordCtl(rt, res, to, ctlAction, runId);
+  return textResult(ctlText(res, to, ctlAction, runId), ctlDetails({ status: res.status, to, action: ctlAction, target: runId }));
+}
+
 // ---------------------------------------------------------------- registration
 
 export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
@@ -1331,6 +1527,52 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
     promptSnippet: "Release claimed files or a task lease.",
     parameters: MESH_RELEASE_PARAMETERS,
     execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshRelease(getRuntime, params),
+  });
+
+  pi.registerTool({
+    name: "mesh_abort",
+    label: "Mesh Abort",
+    description:
+      "Abort another peer's CURRENT TURN (force-class: needs policy force authorization and a reason). " +
+      "Honest statuses: aborted / not_busy / still_busy / abort_unavailable. " +
+      "Control is online-only and never queued.",
+    promptSnippet: "Abort a peer's running turn (force-class, reason required).",
+    parameters: MESH_ABORT_PARAMETERS,
+    execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshAbort(getRuntime, params),
+  });
+
+  pi.registerTool({
+    name: "mesh_redirect",
+    label: "Mesh Redirect",
+    description:
+      "Atomically change a peer's plan: abort its turn (if busy), wait for settlement, then inject " +
+      "the new instruction as a steer. If the turn does not settle, the instruction is NOT sent.",
+    promptSnippet: "Redirect a peer: abort its turn, settle, then inject the new plan.",
+    parameters: MESH_REDIRECT_PARAMETERS,
+    execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshRedirect(getRuntime, params),
+  });
+
+  pi.registerTool({
+    name: "mesh_job_control",
+    label: "Mesh Job Control",
+    description:
+      "Stop/pause/resume a peer's detached job through its local pi-jobd. " +
+      "The wire carries an opaque jobId + a closed action, never a shell string. " +
+      "Windows pause is not_supported; a lost job is identity_mismatch.",
+    promptSnippet: "Stop/pause/resume a peer's detached job.",
+    parameters: MESH_JOB_CONTROL_PARAMETERS,
+    execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshJobControl(getRuntime, params),
+  });
+
+  pi.registerTool({
+    name: "mesh_run_control",
+    label: "Mesh Run Control",
+    description:
+      "Stop or steer a peer's controller-owned RPC worker through its local pi-subagents. " +
+      "Opaque runId; no prompt is ever interpolated into a shell.",
+    promptSnippet: "Stop or steer a peer's RPC worker.",
+    parameters: MESH_RUN_CONTROL_PARAMETERS,
+    execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshRunControl(getRuntime, params),
   });
 }
 

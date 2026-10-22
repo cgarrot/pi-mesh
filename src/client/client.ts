@@ -18,8 +18,10 @@ import {
   type MeshPeerInfo,
   type MeshPriority,
   type MeshRole,
+  type CtlAction,
+  type MeshErrorCode,
 } from "../protocol/envelope.js";
-import { encodeFrame, FrameDecoder, sha256 } from "../protocol/frames.js";
+import { encodeFrame, FrameDecoder, makeMsgId, sha256 } from "../protocol/frames.js";
 import {
   ACK_TIMEOUT_MS,
   ALIAS_RAND_CHARS,
@@ -35,6 +37,9 @@ import {
   MIN_AWAIT_REPLY_TIMEOUT_MS,
   OUTBOX_FLUSH_CAP,
   PROTO_VERSION,
+  CTL_ACK_TIMEOUT_MS,
+  CTL_TARGET_REGEX,
+  MAX_CTL_TARGET_CHARS,
   STATUS_REQ_TIMEOUT_MS,
   TRANSCRIPT_RING_SIZE,
   type MeshConfig,
@@ -126,6 +131,79 @@ export type LeaseResult =
   | { status: "held"; holder: string }
   | { status: "not_held" }
   | { status: "error"; reason: string };
+
+type CtlBase =
+  | { status: "aborted" | "redirected"; settled?: boolean; target?: string }
+  | { status: "stopped" | "paused" | "resumed" | "steered"; target?: string; settled?: boolean }
+  | {
+      status:
+        | "not_busy"
+        | "still_busy"
+        | "abort_unavailable"
+        | "not_found"
+        | "not_pausable"
+        | "not_paused"
+        | "not_running"
+        | "not_supported"
+        | "unsupported"
+        | "not_authorized"
+        | "identity_mismatch";
+      reason?: string;
+      target?: string;
+      settled?: boolean;
+    }
+  | { status: "unreachable" | "timeout" | "error"; reason: string; target?: string };
+
+export type CtlResult = CtlBase & { /** ctl frame id (audit correlation). */ ctlId?: string };
+
+function mapCtlReply(frame: MeshFrame, target: string | undefined): CtlResult {
+  const targetValue = frame.target ?? target;
+  const ctlId = frame.replyTo ?? frame.id;
+  if (frame.type === "error") {
+    const code = frame.code ?? "error";
+    if (code === "unreachable") return { status: "unreachable", reason: "peer is offline (ctl is never queued)", target: targetValue, ctlId };
+    if (code === "policy_denied") return { status: "not_authorized", reason: "policy_denied", target: targetValue, ctlId };
+    return { status: "error", reason: code, target: targetValue, ctlId };
+  }
+  const status = frame.status ?? "error";
+  if (status === "aborted" || status === "redirected") {
+    return { status, settled: frame.settled, target: targetValue, ctlId };
+  }
+  if (status === "stopped" || status === "paused" || status === "resumed" || status === "steered") {
+    return { status, target: targetValue, ctlId };
+  }
+  if (status === "timeout") {
+    return { status: "timeout", reason: "target-side timeout: the action may still be running", target: targetValue, ctlId };
+  }
+  if (
+    status === "not_busy" ||
+    status === "still_busy" ||
+    status === "abort_unavailable" ||
+    status === "not_found" ||
+    status === "not_pausable" ||
+    status === "not_paused" ||
+    status === "not_running" ||
+    status === "not_supported" ||
+    status === "unsupported" ||
+    status === "not_authorized" ||
+    status === "identity_mismatch"
+  ) {
+    return { status, target: targetValue, settled: frame.settled, ctlId };
+  }
+  return { status: "error", reason: `unknown ctl_ack status: ${status}`, target: targetValue, ctlId };
+}
+
+export interface ControlOpts {
+  to: string;
+  action: CtlAction;
+  /** jobId / runId for job_* and run_* actions. */
+  target?: string;
+  /** redirect / run_steer body. */
+  message?: string;
+  /** Required for abort/redirect (force-class action). */
+  reason?: string;
+  timeoutMs?: number;
+}
 
 export type SendResult =
   | { status: "delivered"; msgId: string; deliveredCount?: number; totalCount?: number; routedTo?: string }
@@ -305,6 +383,8 @@ export class MeshClient extends EventEmitter {
   /** msgIds we sent that have been READ by peers (read receipts). */
   private readonly readBy = new Map<string, { alias: string; at: string }>();
   private readonly leaseWaiters = new Map<string, { resolve: (frame: MeshFrame) => void; timer: NodeJS.Timeout }>();
+  /** ctl id -> ack waiter. */
+  private readonly ctlWaiters = new Map<string, { resolve: (frame: MeshFrame) => void; timer: NodeJS.Timeout }>();
   /** ids of replies WE sent — used to tag reply-à-reply chains. */
   private readonly sentReplies = new Set<string>();
   /** missions sent with awaitReply — who answered (for mesh_wait_all).
@@ -1056,6 +1136,19 @@ export class MeshClient extends EventEmitter {
         }
         break;
       }
+      case "ctl_ack": {
+        const key = frame.replyTo;
+        if (key !== undefined) {
+          const waiter = this.ctlWaiters.get(key);
+          if (waiter !== undefined) {
+            this.ctlWaiters.delete(key);
+            clearTimeout(waiter.timer);
+            waiter.resolve(frame);
+            break;
+          }
+        }
+        break;
+      }
       case "ack": {
         const w = this.ackWaiters.get(frame.id);
         if (w) {
@@ -1218,6 +1311,12 @@ export class MeshClient extends EventEmitter {
           this.statusWaiters.delete(frame.id);
           clearTimeout(sw.timer);
           sw.resolve(frame);
+        }
+        const cw = this.ctlWaiters.get(frame.id);
+        if (cw) {
+          this.ctlWaiters.delete(frame.id);
+          clearTimeout(cw.timer);
+          cw.resolve(frame);
         }
         this.emit("frame", frame);
         return; // skip double-emit below
@@ -1954,6 +2053,115 @@ export class MeshClient extends EventEmitter {
       });
     }
     this.emit("closed");
+  }
+
+  // ---- C: control plane ----
+
+  /**
+   * Send a control request to a peer and wait for its ctl_ack. Destructive
+   * actions are never retried: a timeout says the target MAY have acted.
+   */
+  async control(opts: ControlOpts): Promise<CtlResult> {
+    const to = normalizeAlias(opts.to);
+    if (!isValidAlias(to)) return { status: "error", reason: "invalid_alias" };
+    if (to === this.alias) return { status: "error", reason: "self_control" };
+    const force = opts.action === "abort" || opts.action === "redirect";
+    if (force && (opts.reason === undefined || opts.reason.trim() === "")) {
+      return { status: "error", reason: "force_requires_reason" };
+    }
+    if (opts.action === "redirect" && (opts.message === undefined || opts.message.trim() === "")) {
+      return { status: "error", reason: "redirect_requires_message" };
+    }
+    if (opts.action === "run_steer" && (opts.message === undefined || opts.message.trim() === "")) {
+      return { status: "error", reason: "run_steer_requires_message" };
+    }
+    const needsTarget =
+      opts.action === "job_stop" || opts.action === "job_pause" || opts.action === "job_resume" || opts.action === "run_stop" || opts.action === "run_steer";
+    if (needsTarget) {
+      if (
+        opts.target === undefined ||
+        opts.target.length === 0 ||
+        opts.target.length > MAX_CTL_TARGET_CHARS ||
+        !CTL_TARGET_REGEX.test(opts.target)
+      ) {
+        return { status: "error", reason: "invalid_target" };
+      }
+    }
+    if (opts.message !== undefined && Buffer.byteLength(opts.message, "utf8") > MAX_BODY_BYTES) {
+      return { status: "error", reason: "invalid_frame: body too large" };
+    }
+    if (!this.online || this.socket === null || this.socket.destroyed) {
+      return { status: "error", reason: "broker_unavailable" };
+    }
+    // The control plane is protocol-2 only. A long-lived pre-0.8 broker does
+    // not know ctl; fail fast instead of waiting for a 15 s timeout.
+    if (this.brokerProtoValue < 2) {
+      return { status: "error", reason: "broker_too_old (restart the broker to enable the control plane)", target: opts.target };
+    }
+    const frame = buildFrame({
+      type: "ctl",
+      from: this.alias,
+      to,
+      room: this.homeRoom,
+      action: opts.action,
+      ...(opts.target !== undefined ? { target: opts.target } : {}),
+      ...(opts.message !== undefined ? { body: opts.message } : {}),
+      ...(opts.reason !== undefined ? { reasonHash: sha256(opts.reason) } : {}),
+    });
+    const timeoutMs = opts.timeoutMs ?? CTL_ACK_TIMEOUT_MS;
+    return new Promise<CtlResult>((resolve) => {
+      const timer = setTimeout(() => {
+        this.ctlWaiters.delete(frame.id);
+        // Honest: the target may have acted before its ack was lost.
+        resolve({ status: "timeout", reason: `no ctl_ack within ${timeoutMs}ms — the target may have acted`, target: opts.target, ctlId: frame.id });
+      }, timeoutMs);
+      timer.unref();
+      this.ctlWaiters.set(frame.id, {
+        timer,
+        resolve: (reply) => resolve(mapCtlReply(reply, opts.target)),
+      });
+      try {
+        this.socket!.write(encodeFrame(frame, this.config.maxFrameBytes), (err) => {
+          if (err === null || err === undefined) return;
+          this.ctlWaiters.delete(frame.id);
+          clearTimeout(timer);
+          resolve({ status: "error", reason: `write_failed: ${err.message}`, target: opts.target, ctlId: frame.id });
+        });
+      } catch (err) {
+        this.ctlWaiters.delete(frame.id);
+        clearTimeout(timer);
+        resolve({ status: "error", reason: err instanceof Error ? err.message : String(err), target: opts.target, ctlId: frame.id });
+      }
+    });
+  }
+
+  /** Reply to an inbound ctl (the target side). Online-only: an ack is never
+   *  mailboxed, so a stale ack can never arrive days later. */
+  sendCtlAck(ack: {
+    replyTo: string;
+    to: string;
+    status: string;
+    action?: string;
+    settled?: boolean;
+    code?: MeshErrorCode;
+  }): void {
+    if (!this.online || this.socket === null || this.socket.destroyed) return;
+    const frame = buildFrame({
+      type: "ctl_ack",
+      id: makeMsgId(),
+      replyTo: ack.replyTo,
+      from: this.alias,
+      to: ack.to,
+      status: ack.status,
+      ...(ack.action !== undefined ? { action: ack.action } : {}),
+      ...(ack.settled !== undefined ? { settled: ack.settled } : {}),
+      ...(ack.code !== undefined ? { code: ack.code } : {}),
+    });
+    try {
+      this.socket.write(encodeFrame(frame, this.config.maxFrameBytes));
+    } catch {
+      // best effort: the sender will report an honest timeout
+    }
   }
 
   // ---- B: task leases ----

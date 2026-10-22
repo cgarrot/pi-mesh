@@ -144,6 +144,10 @@ on version skew in `mesh_status`.
 | `mesh_history` | `limit?`, `withBodies?` | local **memory ring** (debug — never the ledger) |
 | `mesh_reserve` | `paths`, `reason?`, `autoReleaseMs?` | reserve files/dirs — peers' `edit`/`write` get blocked on them; claims expire for conflict checks after `reservationTtlMs` (default 6 h, re-reserve to renew) and can self-release (`autoReleaseMs`) |
 | `mesh_release` | `paths?` (omit = all) | release reservations, peers notified immediately |
+| `mesh_abort` | `to`, `reason`, `timeoutMs?` | abort the peer's current TURN (force-class + reason) — honest `aborted` / `not_busy` / `still_busy` / `abort_unavailable` |
+| `mesh_redirect` | `to`, `message`, `reason`, `timeoutMs?` | abort → settle → inject the new instruction (atomic; not sent if the turn does not settle) |
+| `mesh_job_control` | `to`, `jobId`, `action: stop\|pause\|resume`, `timeoutMs?` | stop/pause/resume a peer's detached job (via its local pi-jobd; opaque id, never a shell string) |
+| `mesh_run_control` | `to`, `runId`, `action: stop\|steer`, `message?`, `timeoutMs?` | stop/steer a peer's controller-owned RPC worker (via its local pi-subagents) |
 
 **The orchestrator pattern** (injected in every session's identity context
 and in the bundled skill):
@@ -301,6 +305,21 @@ mesh_send({ "to": "cap:deploy", "priority": "urgent",
   broker is down). CLI: `pimesh lease verify …` (0 current / 5 stale / 1 down).
 
 Full guide: `docs/capability-routing.md`.
+
+## Control plane (`ctl`)
+
+`mesh_abort` / `mesh_redirect` / `mesh_job_control` / `mesh_run_control` let an
+authorized peer act on another agent's **turn** or on work it owns (a detached
+job, an RPC worker). pi-mesh only transports and authorizes: the target's
+extension acts locally. `ctl` is **online-only** (offline = `unreachable`,
+never queued), `abort`/`redirect` are **force-class** (policy +
+`reasonHash`), and an ack is relayed only to the peer that sent the pending
+`ctl` (forged/stale acks are dropped). A timeout means the target **may have
+acted** and is never retried.
+
+Job control is dispatched over the local `pi.events` bus to pi-jobd; run
+control to pi-subagents. No package imports and no shell string cross the
+mesh. Full contract: `docs/control-plane.md`.
 
 ## Unblocking a stuck agent (force + interrupt)
 
@@ -765,6 +784,21 @@ Limitations accepted for now (they are documented in code, see
 - Aliases are unique mesh-wide by convention (prefix per machine) — no
   cross-machine collision detection beyond the broker's live check.
 - The broker is a single process — no clustering or failover.
+
+## Real end-to-end tests (need a model)
+
+The unit suites use fake clients; these scripts drive **real pi sessions** and
+real processes:
+
+```bash
+npm run real:ctl     # TWO real pi sessions + isolated broker:
+                     # idle abort, busy abort, redirect mid-tool (file proof),
+                     # remote job stop, policy deny, offline, timeout, self
+```
+
+It is hermetic: it deletes `MESH_BROKER_URL`/`MESH_BROKER_TOKEN` inherited from
+the surrounding session, uses a temp runtime/state dir and a temp policy, and
+kills its broker/daemon on exit. No mocks on the wire.
 
 ## Development
 

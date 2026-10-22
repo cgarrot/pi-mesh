@@ -22,7 +22,8 @@ export type LedgerEventName =
   | "inbound"
   | "reserved"
   | "released"
-  | "dropped_offline";
+  | "dropped_offline"
+  | "ctl";
 
 export interface LedgerRecord {
   schema: typeof LEDGER_SCHEMA;
@@ -36,6 +37,9 @@ export interface LedgerRecord {
   reasonHash?: string;
   refs?: string[];
   code?: string;
+  /** C: control action / opaque target (never a body). */
+  action?: string;
+  target?: string;
   ts: string;
   bodyStored: false;
 }

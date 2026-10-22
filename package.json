@@ -67,7 +67,8 @@
     "test": "npm run build && node scripts/run-tests.mjs",
     "smoke": "node scripts/mesh-smoke.mjs",
     "ci": "npm run build && node scripts/run-tests.mjs && npm run smoke",
-    "prepublishOnly": "npm test"
+    "prepublishOnly": "npm test",
+    "real:ctl": "node scripts/real-ctl-e2e.mjs"
   },
   "devDependencies": {
     "@mariozechner/pi-tui": "^0.73.1",

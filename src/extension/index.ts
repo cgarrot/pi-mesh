@@ -13,6 +13,7 @@ import { startAliasReclaim } from "./reclaim.js";
 import { batchDetails, buildBatchMessage } from "./batcher.js";
 import { InjectionGuard } from "./injection-guard.js";
 import { injectInbound } from "./inbound.js";
+import { handleCtlFrame } from "./ctl.js";
 import { renderLiveEntry, renderMeshInbound, renderVerdictEntry } from "./renderer.js";
 import type { PersistedIdentity } from "../shared/identity-store.js";
 import { chooseInitialIdentity, identityFromClient, MeshIdentity, saveIdentityOf } from "../shared/identity-store.js";
@@ -160,6 +161,21 @@ export default function meshExtension(pi: ExtensionAPI): void {
       interruptCount: 0,
     };
     const rt = runtime;
+    // Control plane (C): a ctl frame addressed to THIS session is handled by
+    // the local turn (abort/redirect) or dispatched to a local extension
+    // (job_*/run_*) over the event bus. The ack goes back over the mesh.
+    client.on("frame", (frame: MeshFrame) => {
+      if (frame.type !== "ctl" || frame.to !== client.alias) return;
+      void handleCtlFrame(rt, frame, pi).catch(() => {
+        // never let a ctl handler take the session down
+      });
+    });
+    // Shared with other extensions (pi-jobd) so a job's owner is the MESH
+    // alias, not the OS user. Renames keep it current.
+    process.env.PI_MESH_ALIAS = client.alias;
+    client.on("renamed", (info: { to?: string }) => {
+      if (info.to !== undefined) process.env.PI_MESH_ALIAS = info.to;
+    });
 
     // ---- injection guard (D47) ---------------------------------------------
     // pi's TUI abort path (ESC → restoreQueuedMessagesToEditor →
