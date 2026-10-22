@@ -51,6 +51,7 @@ export function makeTempDirs(prefix = "mesh-test-"): TempDirs {
 export interface BrokerOverrides {
   config?: Partial<MeshConfig>;
   policy?: Partial<MeshPolicy>;
+  stateDir?: string;
 }
 
 /** Start a REAL broker on a unix socket inside runtimeDir (mkdtemp). */
@@ -67,7 +68,7 @@ export async function startTestBroker(
     ...overrides.policy,
     rateLimits: { ...DEFAULT_POLICY.rateLimits, ...overrides.policy?.rateLimits },
   };
-  return createBroker({ config, policy, socketPath });
+  return createBroker({ config, policy, socketPath, stateDir: overrides.stateDir });
 }
 
 export function brokerSocketPathOf(runtimeDir: string): string {
@@ -180,8 +181,14 @@ export class RawClient {
     return waitFor(() => (this.closed ? true : undefined), timeoutMs);
   }
 
-  hello(alias: string, rooms?: string[], role?: "member" | "observer"): void {
-    this.send({ type: "hello", from: alias, rooms, role });
+  hello(
+    alias: string,
+    rooms?: string[],
+    role?: "member" | "observer",
+    caps?: string[],
+    proto?: number,
+  ): void {
+    this.send({ type: "hello", from: alias, rooms, role, caps, proto });
   }
 
   close(): void {

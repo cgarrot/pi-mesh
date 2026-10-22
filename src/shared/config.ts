@@ -138,6 +138,31 @@ export type InboundBroadcastPolicy = "immediate" | "deferred";
 
 export type ContextVerbosity = "compact" | "full";
 
+// ---- Capabilities (B: routing hints, never authorization) ----
+export const PROTO_VERSION = 2;
+export const MAX_CAPS = 16;
+export const MAX_CAP_CHARS = 32;
+export const CAP_REGEX = /^[a-z0-9][a-z0-9._-]*$/;
+export const MAX_TASK_PACKAGE_BYTES = 4_096;
+export const MAX_TASK_PATHS = 32;
+export const MIN_LEASE_TTL_MS = 1_000;
+export const MAX_LEASE_TTL_MS = 24 * 60 * 60 * 1_000;
+export const DEFAULT_LEASE_TTL_MS = 6 * 60 * 60 * 1_000;
+
+/** Lowercase, de-dupe, validate and bound a capability list. Invalid
+ *  entries are dropped (a bad MESH_CAPS value must not break the hello). */
+export function normalizeCaps(input: readonly string[] | undefined): string[] {
+  if (input === undefined) return [];
+  const out: string[] = [];
+  for (const raw of input) {
+    const cap = raw.trim().toLowerCase();
+    if (cap.length === 0 || cap.length > MAX_CAP_CHARS || !CAP_REGEX.test(cap)) continue;
+    if (!out.includes(cap)) out.push(cap);
+    if (out.length >= MAX_CAPS) break;
+  }
+  return out;
+}
+
 // ---- Identity defaults ----
 export const ALIAS_RAND_CHARS = 6;
 export const MSG_ID_RAND_CHARS = 8;
@@ -181,6 +206,9 @@ export interface MeshConfig {
    *  alias+rooms+reservations persist per SLOT instead of per pi session, so
    *  a restarted/new session keeps the agent's name and rooms. */
   identityKey?: string;
+  /** advertised capabilities (config.json "caps" / $MESH_CAPS, csv) —
+  *  routing hints only; authorization still comes from policy. */
+  caps?: string[];
   maxFrameBytes: number;
   heartbeatMs: number;
   brokerSilenceMs: number;
@@ -238,6 +266,7 @@ export interface MeshConfig {
 
 export const DEFAULT_CONFIG: MeshConfig = {
   rooms: [DEFAULT_ROOM],
+  caps: [],
   maxFrameBytes: DEFAULT_MAX_FRAME_BYTES,
   heartbeatMs: DEFAULT_HEARTBEAT_MS,
   brokerSilenceMs: DEFAULT_BROKER_SILENCE_MS,
@@ -302,6 +331,7 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
         ? [...fileCfg.rooms]
         : [...DEFAULT_CONFIG.rooms],
     ...(fileCfg.roomsPinned === true ? { roomsPinned: true } : {}),
+    caps: normalizeCaps(Array.isArray(fileCfg.caps) ? fileCfg.caps : undefined),
     maxFrameBytes: clampFrameBytes(positiveInt(fileCfg.maxFrameBytes, DEFAULT_CONFIG.maxFrameBytes)),
     heartbeatMs: positiveInt(fileCfg.heartbeatMs, DEFAULT_CONFIG.heartbeatMs),
     brokerSilenceMs: positiveInt(fileCfg.brokerSilenceMs, DEFAULT_CONFIG.brokerSilenceMs),
@@ -387,6 +417,10 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
     // $MESH_ROOMS is a per-process PIN (a launcher placing an agent in a
     // room) — it must not be silently overridden by a stale identity file.
     cfg.roomsPinned = true;
+  }
+  const envCaps = env.MESH_CAPS;
+  if (envCaps !== undefined) {
+    cfg.caps = normalizeCaps(envCaps.split(","));
   }
   const envFrame = envInt(env, "MESH_MAX_FRAME_BYTES");
   if (envFrame !== undefined) cfg.maxFrameBytes = clampFrameBytes(envFrame);

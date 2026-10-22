@@ -34,6 +34,7 @@ import {
   MAX_REPLY_TARGETS,
   MIN_AWAIT_REPLY_TIMEOUT_MS,
   OUTBOX_FLUSH_CAP,
+  PROTO_VERSION,
   STATUS_REQ_TIMEOUT_MS,
   TRANSCRIPT_RING_SIZE,
   type MeshConfig,
@@ -41,6 +42,7 @@ import {
 import { runtimeDir, stateDir } from "../shared/paths.js";
 import { MESH_VERSION } from "../shared/version.js";
 import { PendingReplies } from "./pending.js";
+import { capTargetName, type MeshTaskPackage } from "../protocol/task-package.js";
 import { backoffMs, ensureBroker } from "./reconnect.js";
 
 export interface WelcomeInfo {
@@ -71,6 +73,8 @@ export interface SendOpts {
   block?: boolean;
   timeoutMs?: number;
   refs?: string[];
+  /** B: five-field assignment contract (required for `cap:` targets). */
+  taskPackage?: MeshTaskPackage;
   /** fan out to every room member (room required, to must be absent). */
   broadcast?: boolean;
   /** aliases that should receive the reply instead of the sender
@@ -105,9 +109,27 @@ export interface ReplyOpts {
   room?: string;
 }
 
+export interface LeaseInfo {
+  leaseId: string;
+  task: string;
+  owner: string;
+  paths: string[];
+  fence: number;
+  epoch: number;
+  expiresAt: string;
+}
+
+export type LeaseResult =
+  | { status: "granted"; lease: LeaseInfo }
+  | { status: "current"; lease: LeaseInfo }
+  | { status: "released"; lease: LeaseInfo }
+  | { status: "held"; holder: string }
+  | { status: "not_held" }
+  | { status: "error"; reason: string };
+
 export type SendResult =
-  | { status: "delivered"; msgId: string; deliveredCount?: number; totalCount?: number }
-  | { status: "queued_offline"; msgId: string; deliveredCount?: number; totalCount?: number }
+  | { status: "delivered"; msgId: string; deliveredCount?: number; totalCount?: number; routedTo?: string }
+  | { status: "queued_offline"; msgId: string; deliveredCount?: number; totalCount?: number; routedTo?: string }
   | { status: "reply"; msgId: string; response: string; outputHash: string }
   | { status: "expired" | "blocked" | "error"; msgId?: string; reason: string };
 
@@ -244,6 +266,8 @@ export class MeshClient extends EventEmitter {
 
   private socket: Socket | null = null;
   private online = false;
+  /** B: broker protocol version from the last welcome (absent = legacy 1). */
+  private brokerProtoValue = 1;
   private intentionallyClosed = false;
   /** Set by close() ONLY (not the rename detach): an in-flight connect
    *  must abort instead of resurrecting a closed client. Cleared by an
@@ -280,6 +304,7 @@ export class MeshClient extends EventEmitter {
   private ownReservations: FileReservation[] = [];
   /** msgIds we sent that have been READ by peers (read receipts). */
   private readonly readBy = new Map<string, { alias: string; at: string }>();
+  private readonly leaseWaiters = new Map<string, { resolve: (frame: MeshFrame) => void; timer: NodeJS.Timeout }>();
   /** ids of replies WE sent — used to tag reply-à-reply chains. */
   private readonly sentReplies = new Set<string>();
   /** missions sent with awaitReply — who answered (for mesh_wait_all).
@@ -350,6 +375,11 @@ export class MeshClient extends EventEmitter {
 
   get alias(): string {
     return this.aliasInternal;
+  }
+
+  /** B: broker protocol version (1 = legacy, cap routing unsupported). */
+  get brokerProto(): number {
+    return this.brokerProtoValue;
   }
 
   /** All rooms this client is a member of (re-declared at every hello). */
@@ -887,6 +917,8 @@ export class MeshClient extends EventEmitter {
           reservations: this.ownReservations.length > 0 ? [...this.ownReservations] : undefined,
           token: this.config.brokerToken !== undefined ? sha256(this.config.brokerToken) : undefined,
           clientVersion: MESH_VERSION, // M1: peers see each other's version
+          caps: this.config.caps ?? [], // B: routing hints (proto 2)
+          proto: PROTO_VERSION,
         });
         socket.write(encodeFrame(hello, this.config.maxFrameBytes));
       });
@@ -908,6 +940,7 @@ export class MeshClient extends EventEmitter {
               settled = true;
               clearTimeout(this.helloTimer ?? undefined);
               this.online = true;
+              this.brokerProtoValue = typeof frame.proto === "number" ? frame.proto : 1;
               this.reconnectAttempt = 0;
               this.attachSocket(socket, decoder);
   // seed the peer reservation cache from the welcome snapshot
@@ -1013,6 +1046,16 @@ export class MeshClient extends EventEmitter {
   private onFrame(frame: MeshFrame): void {
     this.ring(frame);
     switch (frame.type) {
+      case "lease": {
+        const key = frame.replyTo ?? frame.id;
+        const waiter = this.leaseWaiters.get(key);
+        if (waiter !== undefined) {
+          this.leaseWaiters.delete(key);
+          clearTimeout(waiter.timer);
+          waiter.resolve(frame);
+        }
+        break;
+      }
       case "ack": {
         const w = this.ackWaiters.get(frame.id);
         if (w) {
@@ -1261,12 +1304,19 @@ export class MeshClient extends EventEmitter {
 
   async send(opts: SendOpts): Promise<SendResult> {
     const broadcast = opts.broadcast === true;
-    const to = opts.to !== undefined ? normalizeAlias(opts.to) : undefined;
+    const cap = !broadcast && opts.to !== undefined ? capTargetName(opts.to.trim()) : undefined;
+    const to = cap !== undefined
+      ? `cap:${cap}`
+      : opts.to !== undefined
+        ? normalizeAlias(opts.to)
+        : undefined;
     if (broadcast) {
   // broadcast needs a room and must NOT carry a target
       if (to !== undefined) return { status: "error", reason: "broadcast_with_to" };
     } else {
-      if (to === undefined || !isValidAlias(to)) return { status: "error", reason: "invalid_alias" };
+      if (to === undefined || (cap === undefined && !isValidAlias(to))) {
+        return { status: "error", reason: "invalid_alias" };
+      }
       if (to === this.alias) return { status: "blocked", reason: "self_send" };
     }
   // Room resolution: explicit room wins; otherwise prefer "default" when
@@ -1335,6 +1385,7 @@ export class MeshClient extends EventEmitter {
       priority,
       body: opts.message,
       refs: opts.refs,
+      taskPackage: opts.taskPackage,
       broadcast: broadcast ? true : undefined,
       replyTargets,
       reasonHash: priority === "force" ? sha256(opts.reason ?? "") : undefined,
@@ -1379,6 +1430,7 @@ export class MeshClient extends EventEmitter {
           msgId: frame.id,
           deliveredCount: ack.deliveredCount,
           totalCount: ack.totalCount,
+          routedTo: ack.routedTo,
         };
       }
       if (ack.status === "queued_offline") {
@@ -1387,6 +1439,7 @@ export class MeshClient extends EventEmitter {
           msgId: frame.id,
           deliveredCount: ack.deliveredCount,
           totalCount: ack.totalCount,
+          routedTo: ack.routedTo,
         };
       }
   // an unknown/unexpected ack status (e.g. dropped_offline on a msg)
@@ -1896,4 +1949,79 @@ export class MeshClient extends EventEmitter {
     }
     this.emit("closed");
   }
+
+  // ---- B: task leases ----
+
+  /** Claim (or reuse) a task lease. The broker owns the single-holder rule;
+   *  `reused` claims keep the same leaseId/fence so retries are idempotent. */
+  claim(opts: { task: string; paths: string[]; ttlMs?: number; timeoutMs?: number }): Promise<LeaseResult> {
+    const frame = buildFrame({
+      type: "claim",
+      from: this.alias,
+      room: this.homeRoom,
+      task: opts.task,
+      paths: opts.paths,
+      ttlMs: opts.ttlMs,
+    });
+    return this.requestLease(frame, opts.timeoutMs ?? 5_000);
+  }
+
+  /** Release a held lease; the fence stays in the broker's history so a late
+   *  worker cannot resurrect it. */
+  releaseLease(opts: { task: string; leaseId: string; timeoutMs?: number }): Promise<LeaseResult> {
+    const frame = buildFrame({
+      type: "release",
+      from: this.alias,
+      room: this.homeRoom,
+      task: opts.task,
+      leaseId: opts.leaseId,
+    });
+    return this.requestLease(frame, opts.timeoutMs ?? 5_000);
+  }
+
+  /** Read-only: is this task leased, and by which epoch:fence? Used by the
+   *  commit-msg hook — a query must never create or extend a lease. */
+  leaseStatus(task: string, timeoutMs?: number): Promise<LeaseResult> {
+    const frame = buildFrame({ type: "lease_status", from: this.alias, room: this.homeRoom, task });
+    return this.requestLease(frame, timeoutMs ?? 5_000);
+  }
+
+  private requestLease(frame: MeshFrame, timeoutMs: number): Promise<LeaseResult> {
+    if (!this.online || this.socket === null || this.socket.destroyed) {
+      return Promise.resolve({ status: "error", reason: "broker_unavailable" });
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.leaseWaiters.delete(frame.id);
+        resolve({ status: "error", reason: "timeout" });
+      }, timeoutMs);
+      timer.unref();
+      this.leaseWaiters.set(frame.id, {
+        timer,
+        resolve: (reply) => resolve(leaseResult(reply)),
+      });
+      this.writeOrQueue(frame);
+    });
+  }
+}
+
+function leaseResult(frame: MeshFrame): LeaseResult {
+  const status = frame.status;
+  if (status === "granted" || status === "released" || status === "current") {
+    return {
+      status,
+      lease: {
+        leaseId: frame.leaseId ?? "",
+        task: frame.task ?? "",
+        owner: frame.owner ?? "",
+        paths: frame.paths ?? [],
+        fence: frame.fence ?? 0,
+        epoch: frame.epoch ?? 0,
+        expiresAt: frame.expiresAt ?? "",
+      },
+    };
+  }
+  if (status === "held") return { status: "held", holder: frame.owner ?? "?" };
+  if (status === "not_held") return { status: "not_held" };
+  return { status: "error", reason: frame.body ?? status ?? "lease_failed" };
 }

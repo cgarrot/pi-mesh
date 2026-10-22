@@ -3,6 +3,7 @@
 // remind frames re-inject as reminder text. presence frames NEVER inject a turn
 // (they are handled via pi.appendEntry in index.ts).
 import type { MeshFrame, MeshPriority } from "../protocol/envelope.js";
+import { taskPackageSummary } from "../protocol/task-package.js";
 import { INJECTION_RETRY_MS, INTERRUPT_IDLE_MAX_MS, INTERRUPT_REABORT_AFTER_MS, INTERRUPT_REABORT_MAX } from "../shared/config.js";
 import type {
   DeliverAs,
@@ -92,6 +93,7 @@ export function formatInboundContent(frame: MeshFrame, opts: FormatOpts = {}): s
   }
   return (
     `${prefix} ${frame.body ?? ""}` +
+    (frame.taskPackage !== undefined ? `\n${taskPackageSummary(frame.taskPackage)}` : "") +
     `\n↩ reply with the mesh_reply tool using msgId "${frame.id}"` +
     (frame.replyTargets !== undefined && frame.replyTargets.length > 0
       ? ` (reply goes to @${frame.replyTargets.join(", @")} — the sender designated these targets)`
@@ -150,6 +152,7 @@ function formatCompact(
     `[mesh] @${frame.from ?? "?"}${roomTag}${prioTag} ${meta.time} ${frame.body ?? ""} (${id})`;
   return (
     head +
+    (frame.taskPackage !== undefined ? `\n${taskPackageSummary(frame.taskPackage)}` : "") +
     replyTargets +
     bcast +
     (showHint ? `\n↩ reply with the mesh_reply tool using msgId "${id}"` : "")
@@ -172,6 +175,7 @@ export function inboundDetails(frame: MeshFrame): Record<string, unknown> {
     priority: frame.priority ?? "normal",
   };
   if (frame.bodyHash !== undefined) details.bodyHash = frame.bodyHash;
+  if (frame.taskPackage !== undefined) details.taskPackage = frame.taskPackage;
   if (frame.replyTo !== undefined) details.replyTo = frame.replyTo;
   return details;
 }

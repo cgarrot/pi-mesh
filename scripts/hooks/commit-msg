@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# commit-msg hook — reject commits whose Mesh-Lease trailer is stale.
+# Install: cp scripts/hooks/commit-msg .git/hooks/commit-msg && chmod +x $_
+#
+# Policy (spec package 2026-10-20_add-capability-routing):
+#   - no Mesh-Lease trailer  -> allow (not every commit is a task commit)
+#   - trailer matches broker -> allow
+#   - trailer stale          -> REJECT (exit 1); re-claim with mesh_claim
+#   - broker/pimesh missing  -> fail-open with a loud warning
+set -u
+msg_file="${1:-}"
+[ -n "$msg_file" ] && [ -f "$msg_file" ] || exit 0
+
+line="$(grep -m1 '^Mesh-Lease:' "$msg_file" || true)"
+[ -z "$line" ] && exit 0
+
+ref="${line#Mesh-Lease:}"
+task="$(printf '%s' "$ref" | cut -d'#' -f1 | tr -d ' \t')"
+lease_id="$(printf '%s' "$ref" | cut -d'#' -f2 | tr -d ' \t')"
+rest="$(printf '%s' "$ref" | cut -d'#' -f3 | tr -d ' \t')"
+epoch="${rest%%:*}"
+fence="${rest##*:}"
+
+if [ -z "$task" ] || [ -z "$lease_id" ] || [ -z "$epoch" ] || [ -z "$fence" ]; then
+  echo "✗ mesh: malformed Mesh-Lease trailer: $line" >&2
+  exit 1
+fi
+
+if ! command -v pimesh >/dev/null 2>&1; then
+  echo "⚠ mesh: pimesh not on PATH — Mesh-Lease NOT verified (fail-open)" >&2
+  exit 0
+fi
+
+pimesh lease verify --task "$task" --lease-id "$lease_id" --epoch "$epoch" --fence "$fence"
+code=$?
+case "$code" in
+  0) exit 0 ;;
+  5) echo "✗ mesh: stale Mesh-Lease ($epoch:$fence) for task $task — re-claim with mesh_claim and amend the trailer" >&2
+     exit 1 ;;
+  *) echo "⚠ mesh: broker unavailable (exit $code) — Mesh-Lease NOT verified (fail-open)" >&2
+     exit 0 ;;
+esac

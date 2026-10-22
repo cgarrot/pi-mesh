@@ -1,9 +1,10 @@
 // extension/tools.ts — the mesh tools (send/reply/status/history/wait_all/
 // ledger/reserve/release). Plain JSON Schema parameters (zero-dependency).
 // Honest statuses: delivered ≠ read ≠ answered. Offline → blocked.
-import { computePeerStatus, MeshClient, type SendResult } from "../client/client.js";
+import { computePeerStatus, MeshClient, type LeaseResult, type SendResult } from "../client/client.js";
 import type { MeshPriority } from "../protocol/envelope.js";
 import { buildFrame, normalizeAlias } from "../protocol/envelope.js";
+import { capTargetName, checkCapSend, validateTaskPackage, type MeshTaskPackage } from "../protocol/task-package.js";
 import { sha256 } from "../protocol/frames.js";
 import {
   DEFAULT_AWAIT_REPLY_TIMEOUT_MS,
@@ -12,6 +13,7 @@ import {
   MAX_BODY_BYTES,
   MAX_REFS,
   MAX_REPLY_TARGETS,
+  MAX_TASK_PATHS,
   MIN_AWAIT_REPLY_TIMEOUT_MS,
   TRANSCRIPT_RING_SIZE,
 } from "../shared/config.js";
@@ -112,16 +114,20 @@ function str(v: unknown): string | undefined {
 
 function resultText(res: SendResult): string {
   switch (res.status) {
-    case "delivered":
+    case "delivered": {
+      const routed = res.routedTo !== undefined ? ` → @${res.routedTo}` : "";
       if (res.deliveredCount !== undefined && res.totalCount !== undefined) {
-        return `delivered ${res.msgId} (${res.deliveredCount}/${res.totalCount} online)`;
+        return `delivered ${res.msgId}${routed} (${res.deliveredCount}/${res.totalCount} online)`;
       }
-      return `delivered ${res.msgId}`;
-    case "queued_offline":
+      return `delivered ${res.msgId}${routed}`;
+    }
+    case "queued_offline": {
+      const routed = res.routedTo !== undefined ? ` → @${res.routedTo}` : "";
       if (res.deliveredCount !== undefined && res.totalCount !== undefined) {
-        return `queued_offline ${res.msgId} (${res.totalCount} targets offline)`;
+        return `queued_offline ${res.msgId}${routed} (${res.totalCount} targets offline)`;
       }
-      return `queued_offline ${res.msgId}`;
+      return `queued_offline ${res.msgId}${routed}`;
+    }
     case "reply":
       return `reply ${res.msgId}: ${res.response}`;
     case "expired":
@@ -214,7 +220,7 @@ export function busyTargetWarning(
 const MESH_SEND_PARAMETERS: Record<string, unknown> = {
   type: "object",
   properties: {
-    to: { type: "string", description: "Target alias ('@' tolerated, case-insensitive). OMIT when broadcast: true." },
+    to: { type: "string", description: "Target alias ('@' tolerated, case-insensitive) or 'cap:<name>' (requires taskPackage). OMIT when broadcast: true." },
     message: { type: "string", description: "Message body (1..32 KiB)." },
     room: {
       type: "string",
@@ -265,6 +271,44 @@ const MESH_SEND_PARAMETERS: Record<string, unknown> = {
       maxItems: MAX_REFS,
       description: "Repo-relative reference paths (≤ 8).",
     },
+    taskPackage: {
+      type: "object",
+      additionalProperties: false,
+      required: ["task", "goalAcceptance", "paths", "branchBase", "reply"],
+      description:
+        "B: five-field assignment contract. REQUIRED for to:'cap:<name>'; " +
+        "the lane has no access to your session, so this must be self-contained.",
+      properties: {
+        task: { type: "string", description: "Stable task id (used by lease + evidence)." },
+        goalAcceptance: { type: "string", description: "Testable goal + acceptance criteria." },
+        paths: {
+          type: "array",
+          minItems: 1,
+          maxItems: MAX_TASK_PATHS,
+          items: { type: "string" },
+          description: "Writable repo-relative paths.",
+        },
+        branchBase: {
+          type: "object",
+          additionalProperties: false,
+          required: ["branch", "base"],
+          properties: {
+            branch: { type: "string", description: "Worktree branch, e.g. agent/<alias>/<task>." },
+            base: { type: "string", description: "Base branch/commit." },
+          },
+        },
+        reply: {
+          type: "object",
+          additionalProperties: false,
+          required: ["to", "deadline", "format"],
+          properties: {
+            to: { type: "string", description: "Who receives the reply." },
+            deadline: { type: "string", description: "ISO date-time." },
+            format: { type: "string", description: "What to report (commit/tests/blockers)." },
+          },
+        },
+      },
+    },
     replyTo: {
       type: "array",
       items: { type: "string" },
@@ -297,10 +341,46 @@ async function execMeshSend(
   if (broadcast && toRaw !== undefined) {
     return textResult("error: broadcast_with_to (omit 'to' when broadcasting)", sendDetails({ status: "error", reason: "broadcast_with_to" }));
   }
+  // B: cap targets are not aliases; the broker routes by capability later.
+  // The five-field package is mandatory for cap sends — a bare "capable and
+  // idle" peer without the contract is exactly the wrong worker.
+  const capName = !broadcast && toRaw !== undefined ? capTargetName(toRaw) : undefined;
+  if (!broadcast && toRaw !== undefined && toRaw.trim().toLowerCase().startsWith("cap:") && capName === undefined) {
+    return textResult(
+      "error: invalid_target (cap:<name> is not a valid capability)",
+      sendDetails({ status: "error", reason: "invalid_target" }),
+    );
+  }
+  let taskPackage: MeshTaskPackage | undefined;
+  if (capName !== undefined && toRaw !== undefined) {
+    const gate = checkCapSend(toRaw, params.taskPackage);
+    if (!gate.ok) {
+      return textResult(
+        `error: ${gate.reason} — to:'cap:<name>' needs a valid five-field taskPackage`,
+        sendDetails({ status: "error", reason: gate.reason, to: toRaw }),
+      );
+    }
+    taskPackage = gate.value;
+  } else if (params.taskPackage !== undefined) {
+    const pkg = validateTaskPackage(params.taskPackage);
+    if (!pkg.ok) {
+      return textResult(
+        `error: invalid_task_package — ${pkg.reason}`,
+        sendDetails({ status: "error", reason: "invalid_task_package", to: toRaw }),
+      );
+    }
+    taskPackage = pkg.value;
+  }
   // A8: ledger records + tool details store the CANONICAL alias ('@Bob' → 'bob')
   // so ledger predicates are insensitive to how the model typed the alias.
   // Guards (checkSend) and client.send normalize idempotently; result text unchanged.
-  const to = toRaw !== undefined ? normalizeAlias(toRaw) : "*"; // '*' = broadcast target
+  const to = broadcast
+    ? "*"
+    : capName !== undefined
+      ? `cap:${capName}`
+      : toRaw !== undefined
+        ? normalizeAlias(toRaw)
+        : "*"; // '*' = broadcast target
   // Room resolution mirrors the client: explicit room wins; otherwise
   // "default" when still joined, else the FIRST joined room. A session
   // that left "default" (e.g. agent-master in cs-room only) must NOT
@@ -330,7 +410,7 @@ async function execMeshSend(
   // can ONLY come from an explicit to:"*" (broadcast sends skip this block
   // — they set to internally and never re-enter), so it is caught too.
   const sendWarnings: string[] = [];
-  if (!broadcast) {
+  if (!broadcast && capName === undefined) {
     const check = checkSendTarget(
       to,
       (a) => rt.client.knowsPeer(a),
@@ -346,10 +426,12 @@ async function execMeshSend(
       );
     }
     if (check.warning !== undefined) sendWarnings.push(check.warning);
+  } else if (!broadcast && capName !== undefined) {
+    sendWarnings.push(`cap:${capName} — broker picks an idle capable peer`);
   }
   // M2 busy-target warning: awaitReply toward a peer busy for longer than
   // the timeout is a near-certain expiry (measured: 6/6 in cs-room).
-  if (!broadcast && awaitReply) {
+  if (!broadcast && awaitReply && capName === undefined) {
     const busyWarn = busyTargetWarning(
       to,
       rt.client.busyForMs(to),
@@ -388,7 +470,7 @@ async function execMeshSend(
 
   const res = await rt.client.send({
     to: broadcast ? undefined : to,
-    message, room, priority, reason, interrupt, awaitReply, block, timeoutMs, refs, broadcast, replyTo,
+    message, room, priority, reason, interrupt, awaitReply, block, timeoutMs, refs, taskPackage, broadcast, replyTo,
     signal: !launch && signal !== undefined ? signal : undefined,
   });
 
@@ -397,13 +479,13 @@ async function execMeshSend(
   switch (res.status) {
     case "delivered":
       safeLedger(rt, {
-        event: "delivered", id: res.msgId, from: rt.client.alias, to, room, priority, bodyHash, reasonHash, refs,
+        event: "delivered", id: res.msgId, from: rt.client.alias, to: res.routedTo ?? to, room, priority, bodyHash, reasonHash, refs,
         code: broadcast ? `broadcast:${res.deliveredCount ?? 0}/${res.totalCount ?? 0}` : undefined,
       });
       break;
     case "queued_offline":
       safeLedger(rt, {
-        event: "queued_offline", id: res.msgId, from: rt.client.alias, to, room, priority, bodyHash, reasonHash, refs,
+        event: "queued_offline", id: res.msgId, from: rt.client.alias, to: res.routedTo ?? to, room, priority, bodyHash, reasonHash, refs,
         code: broadcast ? `broadcast:${res.deliveredCount ?? 0}/${res.totalCount ?? 0}` : undefined,
       });
       break;
@@ -425,6 +507,7 @@ async function execMeshSend(
     status: res.status,
     msgId: "msgId" in res ? res.msgId : undefined,
     to, room, priority, bodyHash,
+    routedTo: "routedTo" in res ? res.routedTo : undefined,
     broadcast: broadcast || undefined,
     deliveredCount: "deliveredCount" in res ? res.deliveredCount : undefined,
     totalCount: "totalCount" in res ? res.totalCount : undefined,
@@ -1007,8 +1090,63 @@ const MESH_RELEASE_PARAMETERS: Record<string, unknown> = {
       items: { type: "string" },
       description: "Specific patterns to release. Omit to release ALL reservations.",
     },
+    task: { type: "string", description: "B: task id (with leaseId) to release a lease instead of reservations." },
+    leaseId: { type: "string", description: "B: lease id returned by mesh_claim." },
   },
 };
+
+const MESH_CLAIM_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["task", "paths"],
+  properties: {
+    task: { type: "string", description: "Stable task id (the lease key)." },
+    paths: {
+      type: "array",
+      minItems: 1,
+      maxItems: MAX_TASK_PATHS,
+      items: { type: "string" },
+      description: "Writable repo-relative paths owned by this task.",
+    },
+    ttlMs: {
+      type: "integer",
+      minimum: 1000,
+      maximum: 86_400_000,
+      description: "Lease TTL (default 6 h).",
+    },
+  },
+};
+
+function leaseText(res: LeaseResult): string {
+  switch (res.status) {
+    case "granted":
+      return `lease granted ${res.lease.leaseId} task=${res.lease.task} fence=${res.lease.epoch}:${res.lease.fence} expires=${res.lease.expiresAt}`;
+    case "held":
+      return `lease held by @${res.holder}`;
+    case "current":
+      return `lease current ${res.lease.leaseId} task=${res.lease.task} fence=${res.lease.epoch}:${res.lease.fence} expires=${res.lease.expiresAt}`;
+    case "released":
+      return `lease released ${res.lease.leaseId} task=${res.lease.task}`;
+    case "not_held":
+      return "lease not held (wrong owner/leaseId, expired, or already released)";
+    case "error":
+      return `lease error: ${res.reason}`;
+  }
+}
+
+async function execMeshClaim(getRuntime: GetRuntime, params: Record<string, unknown>): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
+  const task = str(params.task);
+  const paths = Array.isArray(params.paths) ? params.paths.filter((p): p is string => typeof p === "string") : [];
+  const ttlMs = typeof params.ttlMs === "number" && Number.isInteger(params.ttlMs) ? params.ttlMs : undefined;
+  if (task === undefined || paths.length === 0) {
+    return textResult("error: task and paths are required", sendDetails({ status: "error", reason: "invalid_frame" }));
+  }
+  const res = await rt.client.claim({ task, paths, ttlMs });
+  const status = res.status === "granted" ? "delivered" : "blocked";
+  return textResult(leaseText(res), sendDetails({ status, task, ...("lease" in res ? { leaseId: res.lease.leaseId, fence: res.lease.fence, epoch: res.lease.epoch, expiresAt: res.lease.expiresAt } : {}), ...("holder" in res ? { holder: res.holder } : {}) }));
+}
 
 async function execMeshRelease(
   getRuntime: GetRuntime,
@@ -1016,6 +1154,16 @@ async function execMeshRelease(
 ): Promise<ToolResult> {
   const rt = getRuntime();
   if (rt === null) return textResult("blocked: session_not_started", sendDetails({ status: "blocked", reason: "session_not_started" }));
+  const leaseId = str(params.leaseId);
+  const leaseTask = str(params.task);
+  if (leaseId !== undefined || leaseTask !== undefined) {
+    if (leaseId === undefined || leaseTask === undefined) {
+      return textResult("error: task and leaseId are required to release a lease", sendDetails({ status: "error", reason: "invalid_frame" }));
+    }
+    const leaseRes = await rt.client.releaseLease({ task: leaseTask, leaseId });
+    const status = leaseRes.status === "released" ? "delivered" : "blocked";
+    return textResult(leaseText(leaseRes), sendDetails({ status, task: leaseTask, leaseId }));
+  }
   const rawPaths = Array.isArray(params.paths)
     ? params.paths.filter((p): p is string => typeof p === "string")
     : undefined;
@@ -1161,12 +1309,23 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
   });
 
   pi.registerTool({
+    name: "mesh_claim",
+    label: "Mesh Claim",
+    description:
+      "Claim a single-writer task lease (task + paths + ttlMs). Returns leaseId " +
+      "and epoch:fence. A second owner gets 'held'; the lease expires by TTL.",
+    promptSnippet: "Claim a task lease before editing (single writer).",
+    parameters: MESH_CLAIM_PARAMETERS,
+    execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshClaim(getRuntime, params),
+  });
+
+  pi.registerTool({
     name: "mesh_release",
     label: "Mesh Release",
     description:
-      "Release reservations. Omit paths to release all. " +
+      "Release reservations (omit paths = all) or a task lease (task + leaseId). " +
       "Peers are notified immediately.",
-    promptSnippet: "Release claimed files.",
+    promptSnippet: "Release claimed files or a task lease.",
     parameters: MESH_RELEASE_PARAMETERS,
     execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshRelease(getRuntime, params),
   });

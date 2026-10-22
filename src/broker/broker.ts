@@ -8,11 +8,14 @@ import tls from "node:tls";
 import { fileURLToPath } from "node:url";
 import {
   buildFrame,
+  effectiveCaps,
   parseFrameLine,
   type MeshErrorCode,
   type MeshFrame,
 } from "../protocol/envelope.js";
 import { encodeFrame, FrameDecoder, FrameSizeError, makeMsgId, sha256 } from "../protocol/frames.js";
+import { capTargetName } from "../protocol/task-package.js";
+import { LeaseTable, nextEpoch } from "./lease.js";
 import {
   DEFAULT_MAX_FRAME_BYTES,
   DEFAULT_ROOM,
@@ -22,6 +25,8 @@ import {
   SWEEP_INTERVAL_MS,
   WRITE_TIMEOUT_MS,
   LOCK_VERIFY_WAIT_MS,
+  PROTO_VERSION,
+  DEFAULT_LEASE_TTL_MS,
   loadConfig,
   type MeshConfig,
 } from "../shared/config.js";
@@ -50,6 +55,8 @@ export interface BrokerOptions {
   *  alongside TCP/TLS — local sessions keep working unchanged while
   *  remote machines join over the network. */
   alsoUnix?: boolean;
+  /** State dir for the persisted lease epoch (defaults to stateDir()). */
+  stateDir?: string;
 }
 
 export interface RunningBroker {
@@ -61,6 +68,8 @@ export interface RunningBroker {
    *  does the same every MAILBOX_PURGE_INTERVAL_MS; this hook makes the
    *  behavior testable/deterministic). */
   purgeMailboxExpired: (now?: number) => void;
+  /** B: task leases (in-memory; the epoch is persisted in stateDir). */
+  leases: LeaseTable;
 }
 
 type WriteCallback = (ok: boolean) => void;
@@ -104,14 +113,16 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
   const { config, policy } = options;
   const sockPath = options.socketPath ?? brokerSocketPath();
   const state = new BrokerState();
+  const brokerStateDir = options.stateDir ?? stateDir();
+  const leases = new LeaseTable(nextEpoch(brokerStateDir));
   const tcp = options.tcpListen;
   // D39: broker-side lifecycle debug (MESH_DEBUG=1) — destroys, write
   // failures, close reasons. NEVER bodies.
   const dbg = (line: string): void => {
     if (config.debug !== true) return;
     try {
-      mkdirSync(stateDir(), { recursive: true });
-      appendFileSync(`${stateDir()}/broker-debug.log`, `${new Date().toISOString()} ${line}\n`);
+      mkdirSync(brokerStateDir, { recursive: true });
+      appendFileSync(`${brokerStateDir}/broker-debug.log`, `${new Date().toISOString()} ${line}\n`);
     } catch {
       // best effort
     }
@@ -142,8 +153,9 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
     interruptStatus?: string,
     deliveredCount?: number,
     totalCount?: number,
+    routedTo?: string,
   ): void => {
-    sendTo(peer, buildFrame({ type: "ack", id, status, interruptStatus, deliveredCount, totalCount }));
+    sendTo(peer, buildFrame({ type: "ack", id, status, interruptStatus, deliveredCount, totalCount, routedTo }));
   };
 
   /** Honest drop receipts: tell each ORIGINAL sender (when online) that
@@ -283,6 +295,11 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
       via: tokenSockets.has(socket)
         ? `${tcp?.tls === true ? "tls" : "tcp"}:${(socket.remoteAddress ?? "?").replace(/^::ffff:/, "")}`
         : undefined,
+      // B: caps are routing hints only (authorization stays in policy);
+      // a legacy peer (proto<2) advertises none, so cap routing can never
+      // silently target it.
+      caps: effectiveCaps(frame.proto, frame.caps),
+      proto: frame.proto ?? 1,
     };
     state.peers.set(alias, peer);
     state.knownAliases.set(alias, Date.now()); // (re)stamp on every hello
@@ -318,6 +335,7 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
         rooms: [...peer.rooms.keys()],
         peers: peersSnapshot(state),
         mailboxCount: mailboxFrames.length,
+        proto: PROTO_VERSION,
       }),
     );
     for (const mf of mailboxFrames) sendTo(peer, mf); // mailbox frames right after welcome
@@ -415,6 +433,14 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
       sendError(from.socket, "observer_readonly", frame.id);
       return;
     }
+    // B: `cap:<name>` routes to an idle capable member of the room. The
+    // package is validated by the sender (extension/envelope); the broker
+    // only resolves the target and applies policy per candidate.
+    const cap = capTargetName(to);
+    if (cap !== undefined) {
+      routeCapMsg(from, frame, cap, room);
+      return;
+    }
     const target = state.peers.get(to);
     const knownOnline = target !== undefined && target.helloDone && !target.socket.destroyed;
     if (!knownOnline && !state.knownAliases.has(to)) {
@@ -479,6 +505,90 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
     }
   };
 
+  /** B: resolve `cap:<name>` to an online member of the room, idle-first.
+   *  v1 deliberately has no cap queue: no idle candidate -> honest error
+   *  (offline peers are still reachable by alias/mailbox). */
+  const routeCapMsg = (from: PeerRecord, frame: MeshFrame, cap: string, room: string): void => {
+    const priority = frame.priority ?? "normal";
+    const kind: RateKind = priority === "force" ? "force" : priority === "urgent" ? "urgent" : "msg";
+    if (!checkRate(state, from.alias, kind, policy.rateLimits)) {
+      state.stats.refused += 1;
+      sendError(from.socket, "rate_limited", frame.id);
+      return;
+    }
+    const members = state.rooms.get(room);
+    if (members === undefined) {
+      state.stats.refused += 1;
+      sendError(from.socket, "peer_not_found", frame.id);
+      return;
+    }
+    const busyScore = (peer: PeerRecord): number => {
+      const act = peer.activity;
+      if (act === undefined || act.state === "idle") return 0;
+      if (act.state === "busy") {
+        const at = Date.parse(act.at);
+        return Number.isFinite(at) ? Math.max(1, Date.now() - at) : 1;
+      }
+      return Number.MAX_SAFE_INTEGER / 2; // rate_limited / blocked
+    };
+    let sawOnline = false;
+    let sawAnyCaps = false;
+    let sawCap = false;
+    const candidates: { peer: PeerRecord; score: number }[] = [];
+    for (const alias of members) {
+      if (alias === from.alias) continue;
+      const peer = state.peers.get(alias);
+      if (peer === undefined || !peer.helloDone || peer.socket.destroyed) continue;
+      sawOnline = true;
+      if ((peer.caps ?? []).length > 0) sawAnyCaps = true;
+      if (peer.rooms.get(room) !== "member") continue;
+      if (!(peer.caps ?? []).includes(cap)) continue;
+      sawCap = true;
+      const decision = evaluatePolicy(policy, { from: from.alias, to: peer.alias, room, priority });
+      if (decision.action === "deny") continue;
+      candidates.push({ peer, score: busyScore(peer) });
+    }
+    if (candidates.length === 0) {
+      state.stats.refused += 1;
+      const code: MeshErrorCode = sawCap
+        ? "policy_denied"
+        : !sawOnline
+          ? "no_capable_peer"
+          : !sawAnyCaps
+            ? "caps_unsupported"
+            : "no_capable_peer";
+      sendError(from.socket, code, frame.id);
+      return;
+    }
+    candidates.sort((a, b) => a.score - b.score || a.peer.alias.localeCompare(b.peer.alias));
+    const chosen = candidates[0]!.peer;
+    const decision = evaluatePolicy(policy, { from: from.alias, to: chosen.alias, room, priority });
+    if (decision.action === "deny") {
+      state.stats.refused += 1;
+      sendError(from.socket, "policy_denied", frame.id);
+      return;
+    }
+    let routedFrame: MeshFrame = { ...frame, to: chosen.alias, routedCap: cap, routedTo: chosen.alias };
+    let interruptStatus: string | undefined;
+    if (decision.action === "downgrade") {
+      routedFrame = { ...routedFrame, priority: "urgent", interrupt: undefined };
+      interruptStatus = "force_downgraded";
+    } else if (priority === "force") {
+      interruptStatus = "force_accepted";
+    }
+    const target = chosen;
+    writeFrame(target.socket, routedFrame, config.maxFrameBytes, (ok) => {
+      if (ok) {
+        state.stats.relayed += 1;
+        sendAck(from, frame.id, "delivered", interruptStatus, undefined, undefined, target.alias);
+      } else {
+        if (state.peers.get(target.alias) === target) closePeer(state, target.alias, "write_failure");
+        notifyDropped(enqueueMailbox(state, config, target.alias, routedFrame));
+        sendAck(from, frame.id, "queued_offline", interruptStatus, undefined, undefined, target.alias);
+      }
+    });
+  };
+
   /** read receipt — deliver to the original message sender (frame.to). */
   const routeRead = (from: PeerRecord, frame: MeshFrame): void => {
     routeOnlineOnly(from, frame, true);
@@ -525,6 +635,15 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
     peer.lastSeenAt = Date.now();
 
     switch (frame.type) {
+      case "claim":
+        handleClaim(peer, frame);
+        break;
+      case "release":
+        handleRelease(peer, frame);
+        break;
+      case "lease_status":
+        handleLeaseStatus(peer, frame);
+        break;
       case "msg":
         routeMsg(peer, frame);
         break;
@@ -772,6 +891,84 @@ const onTcpConn = (socket: Socket): void => serverHandler(socket, true);
     MAILBOX_PURGE_INTERVAL_MS,
   );
   mailboxPurge.unref();
+  /** B: one reply shape for claim/release outcomes. */
+  const sendLease = (peer: PeerRecord, id: string, fields: Record<string, unknown>): void => {
+    sendTo(peer, buildFrame({ type: "lease", id, replyTo: id, ...fields }));
+  };
+  const handleClaim = (peer: PeerRecord, frame: MeshFrame): void => {
+    const room = frame.room ?? DEFAULT_ROOM;
+    if (!peer.rooms.has(room)) {
+      sendError(peer.socket, "not_member", frame.id);
+      return;
+    }
+    const outcome = leases.claim(
+      frame.task ?? "",
+      peer.alias,
+      frame.paths ?? [],
+      frame.ttlMs ?? DEFAULT_LEASE_TTL_MS,
+    );
+    if (outcome.status === "granted") {
+      const l = outcome.lease;
+      sendLease(peer, frame.id, {
+        status: "granted",
+        task: l.task,
+        owner: l.owner,
+        leaseId: l.leaseId,
+        fence: l.fence,
+        epoch: l.epoch,
+        paths: l.paths,
+        expiresAt: l.expiresAt,
+        body: outcome.reused ? "reused" : "granted",
+      });
+    } else if (outcome.status === "held") {
+      sendLease(peer, frame.id, { status: "held", task: frame.task, owner: outcome.holder, body: "held" });
+    } else {
+      sendLease(peer, frame.id, { status: "invalid", task: frame.task, body: outcome.reason });
+    }
+  };
+  const handleLeaseStatus = (peer: PeerRecord, frame: MeshFrame): void => {
+    const lease = leases.get(frame.task ?? "");
+    if (lease === undefined) {
+      sendLease(peer, frame.id, { status: "not_held", task: frame.task, body: "not_held" });
+      return;
+    }
+    sendLease(peer, frame.id, {
+      status: "current",
+      task: lease.task,
+      owner: lease.owner,
+      leaseId: lease.leaseId,
+      fence: lease.fence,
+      epoch: lease.epoch,
+      paths: lease.paths,
+      expiresAt: lease.expiresAt,
+      body: "current",
+    });
+  };
+  const handleRelease = (peer: PeerRecord, frame: MeshFrame): void => {
+    const room = frame.room ?? DEFAULT_ROOM;
+    if (!peer.rooms.has(room)) {
+      sendError(peer.socket, "not_member", frame.id);
+      return;
+    }
+    const outcome = leases.release(frame.task ?? "", peer.alias, frame.leaseId ?? "");
+    if (outcome.status === "released") {
+      const l = outcome.lease;
+      sendLease(peer, frame.id, {
+        status: "released",
+        task: l.task,
+        owner: l.owner,
+        leaseId: l.leaseId,
+        fence: l.fence,
+        epoch: l.epoch,
+        paths: l.paths,
+        expiresAt: l.expiresAt,
+        body: "released",
+      });
+    } else {
+      sendLease(peer, frame.id, { status: "not_held", task: frame.task, body: "not_held" });
+    }
+  };
+
   const purgeMailboxExpired = (now?: number): void => {
     notifyDropped(purgeAllExpired(state, config, now));
   };
@@ -801,6 +998,7 @@ const onTcpConn = (socket: Socket): void => serverHandler(socket, true);
         state,
         socketPath: unixServer !== undefined ? `${bound} + unix://${sockPath}` : bound,
         purgeMailboxExpired,
+        leases,
         close: () =>
           new Promise<void>((res) => {
             clearInterval(sweep);

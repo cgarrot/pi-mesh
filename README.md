@@ -270,6 +270,31 @@ streams frames live; bodies are NEVER shown, only `bodyHash` (text and
 The one-shot CLI is not a session: apart from interactive `attach`, it
 never emits read receipts.
 
+## Capability routing + task leases
+
+Route a task to an **idle peer that advertises the capability** instead of
+waiting for a busy teammate, and make task ownership auditable:
+
+```json
+mesh_send({ "to": "cap:deploy", "priority": "urgent",
+            "taskPackage": { "task": "...", "goalAcceptance": "...",
+                             "paths": ["..."], "branchBase": { "branch": "...", "base": "..." },
+                             "reply": { "to": "lead", "deadline": "...", "format": "..." } } })
+```
+
+- Advertise with `MESH_CAPS=deploy,git` (or `"caps"` in config.json). Caps are
+  routing hints; authorization stays in `policy.json`.
+- `cap:` sends REQUIRE the five-field task package (a lane cannot see your
+  session). Idle-first, busy fallback, honest errors (`caps_unsupported` /
+  `no_capable_peer` / `policy_denied`); v1 has no cap queue.
+- `mesh_claim({task, paths, ttlMs})` → single-writer lease with an
+  `epoch:fence` (persisted epoch — a broker restart invalidates old fences).
+  Commit trailer `Mesh-Lease: task#leaseId#epoch:fence` +
+  `scripts/hooks/commit-msg` rejects stale-fence commits (fail-open when the
+  broker is down). CLI: `pimesh lease verify …` (0 current / 5 stale / 1 down).
+
+Full guide: `docs/capability-routing.md`.
+
 ## Unblocking a stuck agent (force + interrupt)
 
 An agent can get stuck inside a long or hung command (`sleep 600`, an
