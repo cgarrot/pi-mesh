@@ -126,6 +126,12 @@ The broker **auto-spawns** on first use (lockfile in `$TMPDIR/mesh-<uid>/`).
 No daemon management needed. Try `npm run smoke` for a full headless demo
 (2 clients, mailbox, broker-kill recovery).
 
+**Upgrading from an older version** — the detached broker keeps running the
+old code after the package upgrade. Stop it once (`pimesh broker stop`; it
+respawns on the next use) so new protocol features (capability routing, task
+leases) are actually served by the new broker. Peers and clients show a `⚠`
+on version skew in `mesh_status`.
+
 ## Tools (Pi extension)
 
 | tool | params | returns (honest one-liner + `details`) |
@@ -251,7 +257,8 @@ pimesh doctor                            # endpoint/lock/config/version diagnost
 **Exit codes** — `0` success · `1` mesh failure (`blocked`/`error`) · `2`
 usage · `3` `expired`/timeout (a late reply is still delivered) · `4` honest
 partial (`queued_offline`, broadcast `N/M`, conflicts, wait timeout with
-answers).
+answers) · `5` stale task lease (the `commit-msg` hook turns this into a
+rejected commit).
 
 **Standalone peer (`attach`)** — use or create a mesh without a Pi session:
 receive messages WITH bodies (you are the recipient), send/reply/reserve

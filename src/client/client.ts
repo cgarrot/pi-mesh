@@ -1319,6 +1319,12 @@ export class MeshClient extends EventEmitter {
       }
       if (to === this.alias) return { status: "blocked", reason: "self_send" };
     }
+    // Honesty: a pre-v2 broker validates `cap:<name>` as a bad alias and knows
+    // no lease frames (they time out). Say what is actually wrong instead of
+    // pretending the target or the network failed.
+    if (cap !== undefined && this.online && this.brokerProtoValue < 2) {
+      return { status: "error", reason: "broker_too_old (restart the broker to enable cap routing)" };
+    }
   // Room resolution: explicit room wins; otherwise prefer "default" when
   // still joined, else the first joined room (the client may have left
   // "default" — sending into it would be refused as not_member).
@@ -1989,6 +1995,11 @@ export class MeshClient extends EventEmitter {
   private requestLease(frame: MeshFrame, timeoutMs: number): Promise<LeaseResult> {
     if (!this.online || this.socket === null || this.socket.destroyed) {
       return Promise.resolve({ status: "error", reason: "broker_unavailable" });
+    }
+    // A pre-v2 broker treats lease frames as unknown and never answers: an
+    // honest broker_too_old beats a 5 s timeout that looks like a network bug.
+    if (this.brokerProtoValue < 2) {
+      return Promise.resolve({ status: "error", reason: "broker_too_old (restart the broker to enable task leases)" });
     }
     return new Promise((resolve) => {
       const timer = setTimeout(() => {

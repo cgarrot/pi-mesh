@@ -698,6 +698,9 @@ async function execMeshStatus(
       const v = p.clientVersion !== undefined && p.clientVersion !== "" ? ` v${p.clientVersion}` : " v?";
       const skew = p.clientVersion !== undefined && p.clientVersion !== localVersion ? " ⚠" : "";
       const since = p.since !== undefined ? ` since=${p.since}` : "";
+      // capabilities are routing hints: without them visible, `cap:` sends are
+      // guesswork (you get no_capable_peer and cannot see who could take it).
+      const caps = p.caps !== undefined && p.caps.length > 0 ? ` caps=${p.caps.join(",")}` : "";
   // D40: remote-machine peers (tcp/tls to the broker) carry their origin
       const via = p.via !== undefined ? ` via=${p.via} ⟵ other machine` : "";
   // Phase 3: announced turn state wins; heuristic (lastSeenAt) as
@@ -710,11 +713,11 @@ async function execMeshStatus(
             : p.activity.state === "blocked"
               ? " ✖ blocked (needs intervention)"
               : ` ○ idle (since ${localTime(p.activity.at)})`;
-        return `  @${p.alias} rooms=${p.rooms.join(",")}${v}${skew}${since}${via}${tag}`;
+        return `  @${p.alias} rooms=${p.rooms.join(",")}${caps}${v}${skew}${since}${via}${tag}`;
       }
       const act = computePeerStatus(p.lastSeenAt, (p.reservations?.length ?? 0) > 0, rt.client.activityIdleMs, rt.client.activityStuckMs);
       const actTag = act.status === "active" ? "" : act.status === "stuck" ? ` ✕stuck ${act.idleFor}` : ` ○idle ${act.idleFor}`;
-      return `  @${p.alias} rooms=${p.rooms.join(",")}${v}${skew}${since}${via}${actTag}`;
+      return `  @${p.alias} rooms=${p.rooms.join(",")}${caps}${v}${skew}${since}${via}${actTag}`;
     }),
     `mesh rooms: ${snap.rooms.length > 0 ? snap.rooms.join(", ") : "(none)"}`,
   ];

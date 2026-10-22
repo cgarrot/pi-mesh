@@ -106,4 +106,9 @@ pimesh lease verify --task T --lease-id ID --epoch N --fence N
 - A provider rate-limit/block hold delays EVERY inbound priority, including
   urgent — urgent is not a delivery guarantee.
 - Lease state is broker memory: after a restart, re-claim before continuing
-  (the old fence is stale by design).
+  (the old fence is stale by design). Leases are **not broadcast** to the
+  room — a peer discovers a lease by claiming it (`lease held by @owner`),
+  so `mesh_claim` before editing is the convention that makes it work.
+- Cap routing and leases need a **protocol-2 broker**. After upgrading the
+  package, restart the long-lived broker once (`pimesh broker stop`); an old
+  broker answers `error: broker_too_old` instead of silently timing out.

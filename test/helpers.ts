@@ -61,7 +61,11 @@ export async function startTestBroker(
 ): Promise<RunningBroker> {
   mkdirSync(runtimeDir, { recursive: true });
   const socketPath = socketPathForDir(runtimeDir);
-  rmSync(socketPath, { force: true }); // stale socket from a previous broker
+  try {
+    rmSync(socketPath, { force: true }); // stale socket from a previous broker
+  } catch {
+    // Windows named pipes are kernel objects, not files (win32)
+  }
   const config: MeshConfig = { ...DEFAULT_CONFIG, ...overrides.config };
   const policy: MeshPolicy = {
     ...DEFAULT_POLICY,

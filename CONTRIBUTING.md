@@ -33,7 +33,7 @@ README first, then these guidelines.
 
 - **Zero runtime dependencies** — the CLI ships the same homemade arg
   parser and ANSI helpers as the rest of the package (no commander/chalk).
-- **Honest exit codes** (README): 0/1/2/3/4 — never inflate a status.
+- **Honest exit codes** (README): 0/1/2/3/4/5 — never inflate a status.
 - **Never print a body you were not addressed**: `watch` shows `bodyHash`
   only; `attach` (a recipient) may show bodies; `send --json` never echoes
   the body it sent.

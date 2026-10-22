@@ -51,7 +51,14 @@ async function stopSpawnedBroker(dirs: TempDirs): Promise<void> {
   } catch {
     // no lock — nothing to kill
   }
-  rmSync(brokerSocketPath(dirs.runtimeDir), { force: true });
+  // Windows named pipes are kernel objects, not files: rmSync on the pipe
+  // path fails with EINVAL ("The parameter is incorrect"). Cleanup is best
+  // effort — the broker unlinks its own unix socket on close.
+  try {
+    rmSync(brokerSocketPath(dirs.runtimeDir), { force: true });
+  } catch {
+    // named pipe (win32) — nothing on disk to remove
+  }
 }
 
 test("#8 (1) auto-spawn via $MESH_BROKER_EXEC_PATH + full msg/reply round-trip", async (t) => {
