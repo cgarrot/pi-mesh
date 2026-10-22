@@ -73,7 +73,11 @@ describe("Pi parity: alias reclaim loop", () => {
       // holder alive → blocked (never steals a live alias)
       assert.equal(await handle.tick(), "blocked");
       await holder.close();
-      await waitFor(() => (fallback.alias === "aso-77" ? true : undefined), 5_000);
+      // Wait for the EVENT, not for client.alias: rename() sets the alias
+      // optimistically before the re-hello ack and reverts it on
+      // alias_taken, so polling the alias can observe a rename that has not
+      // completed yet (onReclaimed not called).
+      await waitFor(() => (reclaimed.length === 1 ? true : undefined), 5_000);
       assert.equal(fallback.alias, "aso-77");
       assert.deepEqual(reclaimed, ["aso-77"], "onReclaimed fires exactly once for the rename");
     } finally {
