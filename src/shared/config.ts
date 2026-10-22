@@ -181,6 +181,9 @@ export interface MeshConfig {
    *  alias+rooms+reservations persist per SLOT instead of per pi session, so
    *  a restarted/new session keeps the agent's name and rooms. */
   identityKey?: string;
+  /** advertised capabilities (config.json "caps" / $MESH_CAPS, csv) —
+  *  routing hints only; authorization still comes from policy. */
+  caps?: string[];
   maxFrameBytes: number;
   heartbeatMs: number;
   brokerSilenceMs: number;

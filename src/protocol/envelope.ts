@@ -55,6 +55,9 @@ export interface MeshFrame {
   body?: string; // TRANSIENT — never persisted 
   bodyHash?: string;
   refs?: string[];
+  /** A: stop/pause/resume control plane (control/control_ack). */
+  action?: "stop" | "pause" | "resume";
+  target?: string;
   reasonHash?: string; // force only
   expiresAt?: string;
   code?: string;
@@ -108,6 +111,8 @@ export const FRAME_TYPES = [
   "ping",
   "pong",
   "activity",
+  "control",
+  "control_ack",
   "error",
 ] as const;
 export type MeshFrameType = (typeof FRAME_TYPES)[number];
@@ -249,6 +254,9 @@ export interface BuildFrameOpts {
   receipt?: boolean;
   /** M1: extension version (hello). */
   clientVersion?: string;
+  /** A: stop-only control plane. */
+  action?: "stop" | "pause" | "resume";
+  target?: string;
   /** M2: broker counters (status_res). */
   stats?: { relayed: number; refused: number; mailboxDelivered: number; mailboxDropped: number };
 }
@@ -292,6 +300,8 @@ export function buildFrame(opts: BuildFrameOpts): MeshFrame {
   if (opts.interrupt !== undefined) frame.interrupt = opts.interrupt;
   if (opts.receipt !== undefined) frame.receipt = opts.receipt;
   if (opts.clientVersion !== undefined) frame.clientVersion = opts.clientVersion;
+  if (opts.action !== undefined) frame.action = opts.action;
+  if (opts.target !== undefined) frame.target = opts.target;
   if (opts.stats !== undefined) frame.stats = { ...opts.stats };
   return frame;
 }
@@ -459,6 +469,33 @@ export function validateFrame(value: unknown, opts: ValidateOpts = {}): Validati
     }
   }
 
+  // the mesh: action is an enum, target is a job id.
+  if (value.action !== undefined && value.action !== "stop" && value.action !== "pause" && value.action !== "resume") {
+    return { ok: false, code: "invalid_frame", detail: "bad action" };
+  }
+  if (value.target !== undefined && (typeof value.target !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value.target))) {
+    return { ok: false, code: "invalid_frame", detail: "bad target" };
+  }
+  if (value.type === "control") {
+    if (value.action !== "stop" && value.action !== "pause" && value.action !== "resume") {
+      return { ok: false, code: "invalid_frame", detail: "control requires action=stop|pause|resume" };
+    }
+    if (value.target === undefined) return { ok: false, code: "invalid_frame", detail: "control without target" };
+    if (value.to === undefined) return { ok: false, code: "invalid_frame", detail: "control without to" };
+  }
+  if (value.type === "control_ack") {
+    if (
+      value.status !== "stopped" &&
+      value.status !== "paused" &&
+      value.status !== "resumed" &&
+      value.status !== "not_pausable" &&
+      value.status !== "not_found" &&
+      value.status !== "error"
+    ) {
+      return { ok: false, code: "invalid_frame", detail: "bad control_ack status" };
+    }
+    if (value.target === undefined) return { ok: false, code: "invalid_frame", detail: "control_ack without target" };
+  }
   // Rule 9: broadcast / replyAll fan-out
   if (value.broadcast !== undefined) {
     if (typeof value.broadcast !== "boolean") {

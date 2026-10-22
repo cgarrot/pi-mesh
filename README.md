@@ -270,6 +270,30 @@ streams frames live; bodies are NEVER shown, only `bodyHash` (text and
 The one-shot CLI is not a session: apart from interactive `attach`, it
 never emits read receipts.
 
+
+## Job runner + stop/pause/resume control plane
+
+Long work runs in a detached supervised job; a peer can stop/pause/resume it
+through the daemon without waiting for the target's LLM:
+
+```
+mesh_run({ command: "npm run render -- --long", cwd: "/repo", pausable: true })
+mesh_job({ jobId, action: "status" | "list" | "stop" | "pause" | "resume" })
+mesh_control({ to: "lead", jobId, action: "stop" | "pause" | "resume" })
+```
+
+- Each session owner gets its own daemon: 0600 socket
+  `<runtimeDir>/jobd-<owner>.sock`, alias `<owner>-jobd`; jobs run in their own
+  process group with logs/registry under `<stateDir>/jobs/`.
+- The control frame only carries `action=stop|pause|resume` + a job id — no
+  shell strings over the mesh. SIGSTOP is opt-in (`pausable: true`); a job
+  that did not opt in is never paused.
+- `stop` = SIGTERM to the group, bounded grace, then SIGKILL (a paused job is
+  SIGCONTed first). A daemon restart re-attaches what it can prove (pid +
+  /proc starttime); the rest is honestly lost.
+
+Full guide: `docs/job-runner.md`.
+
 ## Unblocking a stuck agent (force + interrupt)
 
 An agent can get stuck inside a long or hung command (`sleep 600`, an

@@ -105,6 +105,15 @@ export interface ReplyOpts {
   room?: string;
 }
 
+
+export type ControlResult =
+  | { status: "stopped"; target: string }
+  | { status: "paused"; target: string }
+  | { status: "resumed"; target: string }
+  | { status: "not_pausable"; target: string }
+  | { status: "not_found"; target: string }
+  | { status: "error"; target: string; reason: string };
+
 export type SendResult =
   | { status: "delivered"; msgId: string; deliveredCount?: number; totalCount?: number }
   | { status: "queued_offline"; msgId: string; deliveredCount?: number; totalCount?: number }
@@ -280,6 +289,16 @@ export class MeshClient extends EventEmitter {
   private ownReservations: FileReservation[] = [];
   /** msgIds we sent that have been READ by peers (read receipts). */
   private readonly readBy = new Map<string, { alias: string; at: string }>();
+  private readonly controlWaiters = new Map<
+    string,
+    {
+      timer: NodeJS.Timeout;
+      target: string;
+      to: string;
+      resolveFrame: (frame: MeshFrame) => void;
+      fail: (reason: string) => void;
+    }
+  >();
   /** ids of replies WE sent — used to tag reply-à-reply chains. */
   private readonly sentReplies = new Set<string>();
   /** missions sent with awaitReply — who answered (for mesh_wait_all).
@@ -1013,6 +1032,16 @@ export class MeshClient extends EventEmitter {
   private onFrame(frame: MeshFrame): void {
     this.ring(frame);
     switch (frame.type) {
+      case "control_ack": {
+        const key = frame.replyTo ?? frame.id;
+        const waiter = this.controlWaiters.get(key);
+        if (waiter !== undefined) {
+          this.controlWaiters.delete(key);
+          clearTimeout(waiter.timer);
+          waiter.resolveFrame(frame);
+        }
+        break;
+      }
       case "ack": {
         const w = this.ackWaiters.get(frame.id);
         if (w) {
@@ -1065,6 +1094,9 @@ export class MeshClient extends EventEmitter {
         break;
       }
       case "remind":
+        this.emit("inbound", frame);
+        break;
+      case "control":
         this.emit("inbound", frame);
         break;
       case "reply": {
@@ -1175,6 +1207,15 @@ export class MeshClient extends EventEmitter {
           this.statusWaiters.delete(frame.id);
           clearTimeout(sw.timer);
           sw.resolve(frame);
+        }
+        // A broker refusal of a control frame must settle its waiter with the
+        // real reason (peer_not_found/policy_denied/rate_limited), not a 5s
+        // timeout that hides the cause.
+        const cw = this.controlWaiters.get(frame.id);
+        if (cw !== undefined) {
+          this.controlWaiters.delete(frame.id);
+          clearTimeout(cw.timer);
+          cw.fail(frame.code ?? "error");
         }
         this.emit("frame", frame);
         return; // skip double-emit below
@@ -1896,4 +1937,82 @@ export class MeshClient extends EventEmitter {
     }
     this.emit("closed");
   }
+
+  /** A: stop/pause/resume control. The target daemon (alias `<owner>-jobd`) executes
+   *  immediately, without waking the target's LLM; the ack is the proof. */
+  control(opts: {
+    to: string;
+    target: string;
+    action?: "stop" | "pause" | "resume";
+    timeoutMs?: number;
+  }): Promise<ControlResult> {
+    const to = normalizeAlias(opts.to);
+    if (!isValidAlias(to)) {
+      return Promise.resolve({ status: "error", target: opts.target, reason: "invalid_alias" });
+    }
+    if (!this.online || this.socket === null || this.socket.destroyed) {
+      return Promise.resolve({ status: "error", target: opts.target, reason: "broker_unavailable" });
+    }
+    const frame = buildFrame({
+      type: "control",
+      from: this.alias,
+      to,
+      action: opts.action ?? "stop",
+      target: opts.target,
+    });
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.controlWaiters.delete(frame.id);
+        resolve({ status: "error", target: opts.target, reason: "timeout" });
+      }, opts.timeoutMs ?? 5_000);
+      timer.unref();
+      this.controlWaiters.set(frame.id, {
+        timer,
+        target: opts.target,
+        to,
+        resolveFrame: (reply) => {
+          // Harden against a room peer guessing the frame id: the ack must
+          // come from the daemon alias we addressed.
+          if (reply.from !== to) {
+            resolve({ status: "error", target: opts.target, reason: `unexpected_sender:${reply.from ?? "?"}` });
+            return;
+          }
+          resolve(controlOutcome(reply));
+        },
+        fail: (reason) => resolve({ status: "error", target: opts.target, reason }),
+      });
+      this.writeOrQueue(frame);
+    });
+  }
+
+  /** A: daemon → sender acknowledgement for a control frame. */
+  sendControlAck(opts: {
+    to: string;
+    replyTo: string;
+    target: string;
+    status: "stopped" | "paused" | "resumed" | "not_pausable" | "not_found" | "error";
+    detail?: string;
+  }): void {
+    const frame = buildFrame({
+      type: "control_ack",
+      from: this.alias,
+      to: normalizeAlias(opts.to),
+      replyTo: opts.replyTo,
+      status: opts.status,
+      target: opts.target,
+      body: opts.detail,
+    });
+    this.writeOrQueue(frame);
+  }
+
+}
+
+export function controlOutcome(frame: MeshFrame): ControlResult {
+  const target = frame.target ?? "";
+  if (frame.status === "stopped") return { status: "stopped", target };
+  if (frame.status === "paused") return { status: "paused", target };
+  if (frame.status === "resumed") return { status: "resumed", target };
+  if (frame.status === "not_pausable") return { status: "not_pausable", target };
+  if (frame.status === "not_found") return { status: "not_found", target };
+  return { status: "error", target, reason: frame.body ?? frame.status ?? "control_failed" };
 }

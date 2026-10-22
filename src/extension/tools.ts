@@ -1,7 +1,13 @@
 // extension/tools.ts — the mesh tools (send/reply/status/history/wait_all/
 // ledger/reserve/release). Plain JSON Schema parameters (zero-dependency).
 // Honest statuses: delivered ≠ read ≠ answered. Offline → blocked.
+import type { ControlResult } from "../client/client.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { computePeerStatus, MeshClient, type SendResult } from "../client/client.js";
+import type { JobdClient } from "../jobd/client.js";
+import { ensureJobd } from "../jobd/lifecycle.js";
+import type { JobRecord } from "../jobd/protocol.js";
 import type { MeshPriority } from "../protocol/envelope.js";
 import { buildFrame, normalizeAlias } from "../protocol/envelope.js";
 import { sha256 } from "../protocol/frames.js";
@@ -94,6 +100,10 @@ export interface MeshRuntime {
   ledgerFailures: number;
   transcriptFailures: number;
   injectionFailures: number;
+  /** A: job-daemon (jobd) client for mesh_run/mesh_job. When undefined the
+   *  tools resolve it via ensureJobd() on <runtimeDir>/jobd.sock (task_0003);
+   *  tests inject a fake factory instead of spawning a real daemon. */
+  jobdFactory?: () => Promise<JobdClient>;
 }
 
 export type GetRuntime = () => MeshRuntime | null;
@@ -1036,6 +1046,246 @@ async function execMeshRelease(
   return textResult(`blocked: ${resReason}`, sendDetails({ status: "blocked", reason: resReason }));
 }
 
+// ---------------------------------------------------------------- mesh_control
+
+const JOBD_RESULT_SCHEMA = "mesh.jobd.v1";
+
+const JOB_ACTIONS = ["status", "list", "stop", "pause", "resume"] as const;
+type JobAction = (typeof JOB_ACTIONS)[number];
+
+const MESH_RUN_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    command: { type: "string", description: "Shell command line to run detached (your user's privileges — same trust as the local bash tool)." },
+    cwd: { type: "string", description: "Working directory (default: the session cwd)." },
+    owner: { type: "string", description: "Job owner alias (default: your alias)." },
+    pausable: {
+      type: "boolean",
+      description: "Opt in to SIGSTOP/SIGCONT (pause/resume). Default false: never pause git/pip/network work implicitly.",
+    },
+  },
+  required: ["command"],
+};
+
+const MESH_JOB_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    jobId: { type: "string", description: "Job id from mesh_run." },
+    action: {
+      type: "string",
+      enum: ["status", "list", "stop", "pause", "resume"],
+      description:
+        "status = one job, list = this daemon's jobs, stop = SIGTERM to the process group (SIGKILL after the grace period), " +
+        "pause/resume = SIGSTOP/SIGCONT only for jobs started with pausable:true.",
+    },
+  },
+  required: ["jobId", "action"],
+};
+
+const MESH_CONTROL_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    to: {
+      type: "string",
+      description:
+        "Owner alias OR daemon alias: a value not ending in '-jobd' gets " +
+        "'-jobd' appended ('bob' → 'bob-jobd', '@Bob' → 'bob-jobd'). If " +
+        "<stateDir>/daemon.json exists, its actual alias wins (deterministic " +
+        "'-2' fallback after an alias collision).",
+    },
+    jobId: { type: "string", description: "Job id the target daemon must act on." },
+    action: {
+      type: "string",
+      enum: ["stop", "pause", "resume"],
+      description: "stop (default), pause/resume (only jobs started with pausable:true).",
+    },
+    timeoutMs: { type: "integer", minimum: 1_000, maximum: 60_000, description: "Ack timeout in ms (default 5000)." },
+  },
+  required: ["to", "jobId"],
+};
+
+/** jobd client resolution: injected factory first (tests, custom hosts),
+ *  else the real ensureJobd on the well-known runtime socket. */
+/** v2: one daemon per session owner, so two sessions never fight over one
+ *  socket/alias/job table. */
+export function jobdSocketPath(runtimeDir: string, owner: string): string {
+  return `${runtimeDir}/jobd-${owner}.sock`;
+}
+
+/** Per-owner daemon state (jobs/, pid, daemon.json). Without this, two owners
+ *  in the same cwd share a registry and one daemon marks the other's LIVE jobs
+ *  lost. */
+export function jobdStateDir(stateDir: string, owner: string): string {
+  return join(stateDir, "jobd", owner);
+}
+
+function jobdClientOf(rt: MeshRuntime): Promise<JobdClient> {
+  if (rt.jobdFactory !== undefined) return rt.jobdFactory();
+  return ensureJobd({
+    socketPath: jobdSocketPath(rt.runtimeDir, rt.client.alias),
+    stateDir: jobdStateDir(rt.stateDir, rt.client.alias),
+    owner: rt.client.alias,
+  });
+}
+
+function jobDetails(partial: Record<string, unknown>): Record<string, unknown> {
+  return { schema: JOBD_RESULT_SCHEMA, ...partial };
+}
+
+/** One-line job summary for status/list/stop text (log path included). */
+function jobLine(job: JobRecord): string {
+  const pid = job.pid !== undefined ? ` pid=${job.pid}` : "";
+  const tail =
+    job.exitCode !== undefined && job.exitCode !== null
+      ? ` exit=${job.exitCode}`
+      : job.signal !== undefined && job.signal !== null
+        ? ` signal=${job.signal}`
+        : "";
+  return `${job.jobId} ${job.state}${pid} owner=${job.owner}${tail} log=${job.logPath}`;
+}
+
+async function execMeshRun(getRuntime: GetRuntime, params: Record<string, unknown>): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return textResult("blocked: session_not_started", jobDetails({ status: "blocked", reason: "session_not_started" }));
+  const command = str(params.command);
+  if (command === undefined) {
+    return textResult("error: invalid_frame (command is required)", jobDetails({ status: "error", reason: "invalid_frame" }));
+  }
+  const cwd = str(params.cwd) ?? rt.ctx?.cwd ?? process.cwd();
+  const owner = str(params.owner) ?? rt.client.alias;
+  const pausable = params.pausable === true;
+  let job: JobRecord;
+  try {
+    const client = await jobdClientOf(rt);
+    job = await client.run({ command, cwd, owner, ...(pausable ? { pausable: true } : {}) });
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : "jobd_unavailable";
+    return textResult(`error: jobd run failed — ${reason}`, jobDetails({ status: "error", reason }));
+  }
+  const pid = job.pid;
+  return textResult(
+    `started ${job.jobId}${pid !== undefined ? ` pid=${pid}` : ""} log=${job.logPath}`,
+    jobDetails({ status: "delivered", jobId: job.jobId, pid, logPath: job.logPath, owner, cwd, command, pausable: job.pausable === true }),
+  );
+}
+
+async function execMeshJob(getRuntime: GetRuntime, params: Record<string, unknown>): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return textResult("blocked: session_not_started", jobDetails({ status: "blocked", reason: "session_not_started" }));
+  const jobId = str(params.jobId);
+  const action = str(params.action) as JobAction | undefined;
+  if (jobId === undefined) {
+    return textResult("error: invalid_frame (jobId is required)", jobDetails({ status: "error", reason: "invalid_frame" }));
+  }
+  if (action === undefined || !JOB_ACTIONS.includes(action)) {
+    return textResult("error: invalid_action (action must be status | list | stop | pause | resume)", jobDetails({ status: "error", reason: "invalid_action" }));
+  }
+  try {
+    const client = await jobdClientOf(rt);
+    if (action === "status") {
+      const job = await client.status(jobId);
+      if (job === undefined) {
+        return textResult(`not_found: no job ${jobId}`, jobDetails({ status: "not_found", action, jobId }));
+      }
+      return textResult(jobLine(job), jobDetails({ status: "delivered", action, jobId, job }));
+    }
+    if (action === "list") {
+      const jobs = await client.list();
+      const lines =
+        jobs.length > 0
+          ? [`jobs (${jobs.length}):`, ...jobs.map((j) => `  ${jobLine(j)}`)]
+          : ["jobs: none"];
+      return textResult(lines.join("\n"), jobDetails({ status: "delivered", action, count: jobs.length, jobs }));
+    }
+    if (action === "pause" || action === "resume") {
+      const out = action === "pause" ? await client.pause(jobId) : await client.resume(jobId);
+      if (out.job === undefined) {
+        return textResult(`not_found: no job ${jobId}`, jobDetails({ status: "not_found", action, jobId }));
+      }
+      if (out.status === "not_pausable") {
+        return textResult(
+          `not_pausable: ${jobId} was not started with pausable:true`,
+          jobDetails({ status: "not_pausable", action, jobId, job: out.job }),
+        );
+      }
+      return textResult(`${out.status}: ${jobLine(out.job)}`, jobDetails({ status: "delivered", action, jobId, job: out.job }));
+    }
+    const job = await client.stop(jobId);
+    if (job === undefined) {
+      return textResult(`not_found: no job ${jobId}`, jobDetails({ status: "not_found", action, jobId }));
+    }
+    return textResult(`stop sent: ${jobLine(job)}`, jobDetails({ status: "delivered", action, jobId, job }));
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : "jobd_unavailable";
+    return textResult(`error: jobd ${action} failed — ${reason}`, jobDetails({ status: "error", reason }));
+  }
+}
+
+async function execMeshControl(getRuntime: GetRuntime, params: Record<string, unknown>): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return textResult("blocked: session_not_started", jobDetails({ status: "blocked", reason: "session_not_started" }));
+  const to = str(params.to);
+  const jobId = str(params.jobId);
+  if (to === undefined || jobId === undefined) {
+    return textResult("error: invalid_frame (to and jobId are required)", jobDetails({ status: "error", reason: "invalid_frame" }));
+  }
+  const timeoutMs =
+    typeof params.timeoutMs === "number" && Number.isInteger(params.timeoutMs) ? params.timeoutMs : undefined;
+  const actionRaw = str(params.action) ?? "stop";
+  if (actionRaw !== "stop" && actionRaw !== "pause" && actionRaw !== "resume") {
+    return textResult("error: invalid_frame (action must be stop|pause|resume)", jobDetails({ status: "error", reason: "invalid_frame" }));
+  }
+  // daemon alias derivation: '<owner>-jobd'. A `to` that already ends with
+  // '-jobd' IS the daemon alias — anything else is an owner alias and gets
+  // the suffix appended ('@Bob' → 'bob-jobd', 'bob-jobd' → unchanged).
+  const owner = normalizeAlias(to);
+  let daemonAlias = owner.endsWith("-jobd") ? owner : `${owner}-jobd`;
+  const baseOwner = owner.endsWith("-jobd") ? owner.slice(0, -5) : owner;
+  try {
+    const info = JSON.parse(readFileSync(join(jobdStateDir(rt.stateDir, baseOwner), "daemon.json"), "utf8")) as {
+      canonical?: string;
+      alias?: string;
+    };
+    if (info.canonical === daemonAlias && typeof info.alias === "string") daemonAlias = info.alias;
+  } catch {
+    // no daemon.json for this owner/cwd — use the canonical name
+  }
+  if (!rt.client.isOnline()) {
+    try {
+      await rt.client.connect();
+    } catch {
+      return textResult("blocked: broker_unavailable", jobDetails({ status: "blocked", reason: "broker_unavailable", to: daemonAlias, target: jobId }));
+    }
+  }
+  const res = await rt.client.control({ to: daemonAlias, target: jobId, action: actionRaw, timeoutMs });
+  const details = jobDetails({
+    status: res.status,
+    to: daemonAlias,
+    target: res.target,
+    ...("reason" in res ? { reason: res.reason } : {}),
+  });
+  switch (res.status) {
+    case "stopped":
+      return textResult(`stopped ${res.target} via @${daemonAlias}`, details);
+    case "paused":
+      return textResult(`paused ${res.target} via @${daemonAlias}`, details);
+    case "resumed":
+      return textResult(`resumed ${res.target} via @${daemonAlias}`, details);
+    case "not_pausable":
+      return textResult(
+        `not_pausable: ${res.target} was not started with pausable:true (SIGSTOP is never applied silently)`,
+        details,
+      );
+    case "not_found":
+      return textResult(
+        `not_found: @${daemonAlias} has no job ${res.target} (already exited, or unknown to that daemon)`,
+        details,
+      );
+    default:
+      return textResult(`error: ${res.reason}`, details);
+  }
+}
+
 // ---------------------------------------------------------------- registration
 
 export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
@@ -1169,6 +1419,59 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
     promptSnippet: "Release claimed files.",
     parameters: MESH_RELEASE_PARAMETERS,
     execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshRelease(getRuntime, params),
+  });
+
+  pi.registerTool({
+    name: "mesh_run",
+    label: "Mesh Run",
+    description:
+      "Start a long-running background job on the LOCAL job daemon (jobd). " +
+      "The job runs in its own detached process group — it survives this " +
+      "session — and the call returns immediately with jobId/pid/logPath. " +
+      "Same trust as the local bash tool (0600 socket, same user); no remote run.",
+    promptSnippet: "Start a supervised background job (survives this session).",
+    promptGuidelines:
+      "Use for long builds/renders/deployments instead of blocking bash. " +
+      "The return is DELIVERY, not completion — poll with mesh_job " +
+      "(action: status | list | stop) or read the log at logPath (no rotation in v1).",
+    parameters: MESH_RUN_PARAMETERS,
+    execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshRun(getRuntime, params),
+  });
+
+  pi.registerTool({
+    name: "mesh_job",
+    label: "Mesh Job",
+    description:
+      "Inspect or stop jobs on the LOCAL job daemon: status (one job), list " +
+      "(your jobs), stop (SIGTERM to the process group, SIGKILL after the " +
+      "grace period).",
+    promptSnippet: "Check or stop background jobs (status | list | stop).",
+    promptGuidelines:
+      "status/list report state (running | exited | stopped | failed | lost). " +
+      "lost = the daemon died before the job finished — v1 does NOT adopt " +
+      "orphans: check the log file, then the pid directly. not_found is " +
+      "honest: that daemon has no such job (it may have exited on its own).",
+    parameters: MESH_JOB_PARAMETERS,
+    execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshJob(getRuntime, params),
+  });
+
+  pi.registerTool({
+    name: "mesh_control",
+    label: "Mesh Control",
+    description:
+      "Stop a job owned by ANOTHER agent over the mesh control plane " +
+      "(stop-only). The target daemon (@<owner>-jobd) executes it directly, " +
+      "without waking that agent's LLM — the control_ack is the proof. `to` " +
+      "accepts the owner alias OR the daemon alias: a value not ending in " +
+      "'-jobd' gets '-jobd' appended ('bob' → 'bob-jobd').",
+    promptSnippet: "Emergency-stop another agent's job via its daemon (stop-only).",
+    promptGuidelines:
+      "Use when a peer's job is doing damage while its agent is busy or away — " +
+      "the stop does NOT queue behind the target's LLM. not_found means that " +
+      "daemon no longer owns the jobId (it may have exited on its own). " +
+      "For YOUR OWN jobs prefer mesh_job action:stop (local socket, no broker).",
+    parameters: MESH_CONTROL_PARAMETERS,
+    execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshControl(getRuntime, params),
   });
 }
 

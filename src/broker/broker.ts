@@ -525,6 +525,10 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
     peer.lastSeenAt = Date.now();
 
     switch (frame.type) {
+      case "control":
+      case "control_ack":
+        routeMsg(peer, frame);
+        break;
       case "msg":
         routeMsg(peer, frame);
         break;
