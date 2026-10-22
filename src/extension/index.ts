@@ -459,6 +459,12 @@ export default function meshExtension(pi: ExtensionAPI): void {
       rt?.markDetached?.();
       rt?.stopHold?.();
       rt?.stopReclaim?.();
+      // C: the headless worker is controller-owned; do not leak it past the
+      // controller session (stop is TERM→KILL, bounded).
+      if (rt?.rpcWorker !== undefined && rt.rpcWorker !== null) {
+        await rt.rpcWorker.stop();
+        rt.rpcWorker = null;
+      }
     } catch {
       // best effort
     }

@@ -2,6 +2,8 @@
 // ledger/reserve/release). Plain JSON Schema parameters (zero-dependency).
 // Honest statuses: delivered ≠ read ≠ answered. Offline → blocked.
 import { computePeerStatus, MeshClient, type SendResult } from "../client/client.js";
+import { RpcWorker } from "../rpc/worker.js";
+import type { RpcWorkerOptions } from "../rpc/protocol.js";
 import type { MeshPriority } from "../protocol/envelope.js";
 import { buildFrame, normalizeAlias } from "../protocol/envelope.js";
 import { sha256 } from "../protocol/frames.js";
@@ -94,6 +96,10 @@ export interface MeshRuntime {
   ledgerFailures: number;
   transcriptFailures: number;
   injectionFailures: number;
+  /** C: optional headless RPC worker factory (tests inject a fake child). */
+  rpcFactory?: (opts: RpcWorkerOptions) => RpcWorker;
+  /** C: the controller-owned headless worker (one per session). */
+  rpcWorker?: RpcWorker | null;
 }
 
 export type GetRuntime = () => MeshRuntime | null;
@@ -1161,6 +1167,20 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
   });
 
   pi.registerTool({
+    name: "mesh_rpc",
+    label: "Mesh RPC Worker",
+    description:
+      "Run and control a headless `pi --mode rpc` worker owned by this session: " +
+      "start/prompt/steer/follow_up/abort/redirect/state/set_steering_mode/stop/status. " +
+      "redirect = abort the current run + wait for settlement + prompt the new instruction " +
+      "(abort_bash is NOT exposed: it does not abort agent tool calls on real pi). " +
+      "Local only; not a remote/mesh proxy.",
+    promptSnippet: "Control a headless RPC worker (redirect, steer, state).",
+    parameters: MESH_RPC_PARAMETERS,
+    execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshRpc(getRuntime, params),
+  });
+
+  pi.registerTool({
     name: "mesh_release",
     label: "Mesh Release",
     description:
@@ -1173,3 +1193,160 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
 }
 
 export { MAX_BODY_BYTES };
+
+
+// ---- C: headless RPC worker tool ----
+
+const MESH_RPC_PARAMETERS: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["action"],
+  properties: {
+    action: {
+      type: "string",
+      enum: ["start", "prompt", "steer", "follow_up", "abort", "redirect", "state", "set_steering_mode", "stop", "status"],
+      description:
+        "start = spawn a headless pi --mode rpc worker; prompt/steer/follow_up; abort (whole turn); redirect = abort the current run, wait for settlement, then prompt the new instruction; state; set_steering_mode; stop; status.",
+    },
+    cwd: { type: "string", description: "start: workdir (default: this session's cwd)." },
+    model: { type: "string", description: "start: optional --model for the worker." },
+    name: { type: "string", description: "start: optional --name for the worker." },
+    message: { type: "string", description: "prompt/steer/follow_up: message body." },
+    streamingBehavior: {
+      type: "string",
+      enum: ["steer", "followUp"],
+      description: "prompt while the worker is streaming: queue as steer or follow-up (pi rejects a plain prompt otherwise).",
+    },
+    mode: { type: "string", enum: ["all", "one-at-a-time"], description: "set_steering_mode: steering mode." },
+    timeoutMs: { type: "integer", minimum: 1_000, maximum: 600_000, description: "Command timeout (default 30000)." },
+  },
+};
+
+function rpcDetails(over: Record<string, unknown>): Record<string, unknown> {
+  return { target: "rpc", ...over };
+}
+
+async function execMeshRpc(getRuntime: GetRuntime, params: Record<string, unknown>): Promise<ToolResult> {
+  const rt = getRuntime();
+  if (rt === null) return textResult("blocked: session_not_started", rpcDetails({ status: "blocked", reason: "session_not_started" }));
+  const action = str(params.action);
+  if (action === undefined) return textResult("error: invalid_frame (action is required)", rpcDetails({ status: "error", reason: "invalid_frame" }));
+  const timeoutMs = typeof params.timeoutMs === "number" && Number.isInteger(params.timeoutMs) ? params.timeoutMs : undefined;
+  const worker = rt.rpcWorker ?? null;
+  const need = (): RpcWorker => {
+    if (worker === null || !worker.alive) throw new Error("rpc_worker_not_running (start one first)");
+    return worker;
+  };
+  try {
+    switch (action) {
+      case "start": {
+        if (worker !== null && worker.alive) {
+          return textResult(`error: rpc_worker_already_running pid=${worker.pid}`, rpcDetails({ status: "error", reason: "already_running", pid: worker.pid }));
+        }
+        const opts: RpcWorkerOptions = { cwd: str(params.cwd) ?? rt.ctx?.cwd ?? process.cwd() };
+        const model = str(params.model);
+        const name = str(params.name);
+        if (model !== undefined) opts.model = model;
+        if (name !== undefined) opts.name = name;
+        const created = rt.rpcFactory !== undefined ? rt.rpcFactory(opts) : new RpcWorker(opts);
+        // Readiness probe: also validates the real CLI flags/command surface.
+        try {
+          await created.getState(Math.min(timeoutMs ?? 3_000, 5_000));
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          await created.stop().catch(() => {});
+          return textResult(
+            `error: rpc worker failed to start — ${reason} (stderr=${JSON.stringify(created.stderrTail.slice(-500))})`,
+            rpcDetails({ status: "error", reason: "start_failed" }),
+          );
+        }
+        rt.rpcWorker = created;
+        return textResult(`rpc worker started pid=${created.pid ?? "?"} cwd=${opts.cwd}`, rpcDetails({ status: "delivered", pid: created.pid, cwd: opts.cwd }));
+      }
+      case "prompt": {
+        const message = str(params.message);
+        if (message === undefined) return textResult("error: invalid_frame (message is required)", rpcDetails({ status: "error", reason: "invalid_frame" }));
+        const streamingBehavior = str(params.streamingBehavior);
+        if (streamingBehavior !== undefined && streamingBehavior !== "steer" && streamingBehavior !== "followUp") {
+          return textResult("error: invalid_frame (streamingBehavior must be steer|followUp)", rpcDetails({ status: "error", reason: "invalid_frame" }));
+        }
+        const data = await need().prompt(message, {
+          timeoutMs,
+          ...(streamingBehavior !== undefined ? { streamingBehavior } : {}),
+        });
+        return textResult(`prompt accepted: ${JSON.stringify(data)}`, rpcDetails({ status: "delivered", data }));
+      }
+      case "steer": {
+        const message = str(params.message);
+        if (message === undefined) return textResult("error: invalid_frame (message is required)", rpcDetails({ status: "error", reason: "invalid_frame" }));
+        const data = await need().steer(message, timeoutMs);
+        return textResult(`steer queued: ${JSON.stringify(data)}`, rpcDetails({ status: "delivered", data }));
+      }
+      case "follow_up": {
+        const message = str(params.message);
+        if (message === undefined) return textResult("error: invalid_frame (message is required)", rpcDetails({ status: "error", reason: "invalid_frame" }));
+        const data = await need().followUp(message, timeoutMs);
+        return textResult(`follow_up queued: ${JSON.stringify(data)}`, rpcDetails({ status: "delivered", data }));
+      }
+      case "abort": {
+        const data = await need().abort(timeoutMs);
+        return textResult(`aborted turn: ${JSON.stringify(data ?? "ok")}`, rpcDetails({ status: "delivered", data }));
+      }
+      case "redirect": {
+        const message = str(params.message);
+        if (message === undefined) return textResult("error: invalid_frame (message is required)", rpcDetails({ status: "error", reason: "invalid_frame" }));
+        const w = need();
+        let aborted: boolean | undefined;
+        const state = await w.getState(timeoutMs ?? 5_000).catch(() => null);
+        if (state?.isStreaming === true) {
+          const settleTimeout = Math.max(timeoutMs ?? 30_000, 10_000);
+          const settled = w.waitForEvent("agent_settled", () => true, settleTimeout).catch(() => null);
+          await w.abort(timeoutMs);
+          const event = await settled;
+          if (event === null) {
+            return textResult("error: redirect_timeout (abort did not settle)", rpcDetails({ status: "error", reason: "redirect_timeout" }));
+          }
+          aborted = event.aborted === true;
+        }
+        const data = await w.prompt(message, { timeoutMs });
+        return textResult(
+          `redirected${aborted === true ? " after aborting the previous turn" : ""}: ${JSON.stringify(data ?? "ok")}`,
+          rpcDetails({ status: "delivered", aborted, data }),
+        );
+      }
+      case "state": {
+        const data = await need().getState(timeoutMs);
+        return textResult(
+          `state pending=${data.pendingMessageCount ?? "?"} steering=${data.steeringMode ?? "?"} streaming=${data.isStreaming === true}`,
+          rpcDetails({ status: "delivered", data }),
+        );
+      }
+      case "set_steering_mode": {
+        const mode = str(params.mode);
+        if (mode !== "all" && mode !== "one-at-a-time") {
+          return textResult("error: invalid_frame (mode must be all|one-at-a-time)", rpcDetails({ status: "error", reason: "invalid_frame" }));
+        }
+        const data = await need().setSteeringMode(mode, timeoutMs);
+        return textResult(`steering mode: ${mode}`, rpcDetails({ status: "delivered", data }));
+      }
+      case "stop": {
+        if (worker === null) return textResult("rpc worker not running", rpcDetails({ status: "not_found" }));
+        await worker.stop();
+        rt.rpcWorker = null;
+        return textResult("rpc worker stopped", rpcDetails({ status: "delivered" }));
+      }
+      case "status": {
+        if (worker === null) return textResult("rpc worker not running", rpcDetails({ status: "not_found" }));
+        return textResult(
+          `rpc worker ${worker.alive ? "running" : "exited"} pid=${worker.pid ?? "?"} stderr=${JSON.stringify(worker.stderrTail.slice(-500))}`,
+          rpcDetails({ status: "delivered", alive: worker.alive, pid: worker.pid }),
+        );
+      }
+      default:
+        return textResult("error: invalid_action", rpcDetails({ status: "error", reason: "invalid_action" }));
+    }
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return textResult(`error: ${reason}`, rpcDetails({ status: "error", reason }));
+  }
+}

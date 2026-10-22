@@ -270,6 +270,29 @@ streams frames live; bodies are NEVER shown, only `bodyHash` (text and
 The one-shot CLI is not a session: apart from interactive `attach`, it
 never emits read receipts.
 
+## Headless RPC worker (`mesh_rpc`)
+
+For critical workers that must be redirectable **while a long bash call is
+running**, run a controller-owned headless `pi --mode rpc` worker:
+
+```
+mesh_rpc({ action: "start", cwd: "/repo", model: "..." })
+mesh_rpc({ action: "prompt", message: "run the integration suite" })
+mesh_rpc({ action: "redirect", message: "use the new cache dir" })  # abort + new prompt
+mesh_rpc({ action: "steer", message: "queue at the next boundary" })
+mesh_rpc({ action: "state" })                      # pending / steering mode
+mesh_rpc({ action: "stop" })                       # TERM→KILL, controller-owned
+```
+
+- `redirect` = `abort` (stops the run, bash included, ~8ms) + wait for
+  settlement + `prompt`; history is preserved, the in-flight turn is not.
+  `abort_bash` is **not** exposed: on real pi it only aborts a direct RPC bash
+  command, not the agent's bash tool (verified by smoke; see the guide).
+- Strict JSONL client (LF framing, id correlation), local-only, one worker per
+  session, stopped on session shutdown. No host-package dependency.
+- Remote workers, pools, auto-restart and UI forwarding are out of scope.
+
+Full guide: `docs/rpc-worker.md`.
 ## Unblocking a stuck agent (force + interrupt)
 
 An agent can get stuck inside a long or hung command (`sleep 600`, an
