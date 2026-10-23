@@ -294,17 +294,25 @@ test("runtime: alias auto-reclaim — falls back, then reclaims when the holder 
   // the runtime may already have reclaimed rc-x by the time we look.
 
   // the holder dies → the runtime must hold rc-x (kept or reclaimed).
-  // Budget: the reclaim tick is 300 ms, but a loaded CI runner can serialize
-  // several rename attempts (each one detaches, re-hellos, and reverts on a
-  // transient alias_taken). Give the loop a generous, scaled budget instead
-  // of a tight one; the assertion itself is unchanged.
+  // Wait for the EVENT, not the alias: rename() sets client.alias
+  // OPTIMISTICALLY before the re-hello ack and reverts it on alias_taken, so
+  // polling the property can observe a rename that never completed (the same
+  // bug class as the identity-parity test — it showed up as "actual
+  // agent-xxxx" after ~3.9 s, i.e. a revert, not a timeout).
+  // `renamed { to: "rc-x" }` only fires on a completed rename.
+  const reclaimed = new Promise<boolean>((resolve) => {
+    rt.client.once("renamed", (info: { to?: string }) => resolve(info.to === "rc-x"));
+  });
   await holder.close();
-  // Budget: the reclaim tick is 300 ms, but node runs test FILES in parallel:
-  // under full-suite contention several rename attempts (each ~3.75 s of
-  // alias_taken backoff) can serialize. A generous CEILING costs nothing —
-  // waitFor returns as soon as the alias is back — and a broken reclaim still
-  // fails, just later. (CI scales it x3 on top.)
-  await waitFor(() => (rt.client.alias === "rc-x" ? true : undefined), 30_000);
+  const budgetMs = 60_000 * (process.env.CI ? 3 : 1);
+  const outcome = await Promise.race([
+    reclaimed,
+    new Promise<"timeout">((resolve) => {
+      const timer = setTimeout(() => resolve("timeout"), budgetMs);
+      timer.unref();
+    }),
+  ]);
+  assert.equal(outcome, true, "the runtime must reclaim the preferred alias");
   assert.equal(rt.client.alias, "rc-x");
   const id = JSON.parse(readFileSync(fx.dirs.stateDir + "/identity-ses-reclaim.json", "utf8"));
   assert.equal(id.alias, "rc-x");
