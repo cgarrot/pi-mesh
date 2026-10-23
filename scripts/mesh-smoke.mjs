@@ -3,7 +3,7 @@
 // Steps: (1) msg→ack(delivered)→auto-reply; (2) offline→queued_offline→mailbox;
 // (3) SIGKILL broker → re-ready <2s → delivered (E2); (4) status includes bob.
 import { fork } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -14,7 +14,7 @@ const BROKER_ENTRY = path.join(ROOT, "dist", "src", "broker", "broker.js");
 const CLIENT_ENTRY = path.join(ROOT, "dist", "src", "client", "client.js");
 
 // Socket endpoint: same resolution as the runtime (named pipe on Windows).
-const { socketPathForDir } = await import(
+const { socketPathForDir, brokerLockPath } = await import(
   pathToFileURL(path.join(ROOT, "dist", "src", "shared", "paths.js")).href,
 );
 
@@ -195,7 +195,14 @@ try {
   try {
     if (broker && broker.exitCode === null) broker.kill("SIGTERM");
   } catch {}
-  await sleep(200);
+  // Step 3 SIGKILLs the broker on purpose; the clients then auto-reconnect,
+  // which spawns a SECOND broker. That one is not in `broker` — without this
+  // the smoke leaked one detached broker per run.
+  try {
+    const pid = Number(readFileSync(brokerLockPath(runtimeDir), "utf8").trim());
+    if (Number.isInteger(pid) && pid > 0) process.kill(pid, "SIGTERM");
+  } catch {}
+  await sleep(300);
   try {
     rmSync(tmp, { recursive: true, force: true });
   } catch {}

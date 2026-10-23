@@ -562,6 +562,22 @@ the package: a protocol guide for agents (reply once per msgId, expired ≠
 lost, reservation etiquette, the launch → wait_all rhythm) — loaded on
 demand like any pi skill.
 
+## Hermetic harnesses: `MESH_NO_AUTO_BROKER`
+
+Connecting to a runtime dir with no broker **auto-spawns** a detached broker
+(that is what makes `pi install` work with no setup). A test harness or an
+embedder that owns its broker may not want that — the spawned daemon outlives
+the test and leaks.
+
+```bash
+MESH_NO_AUTO_BROKER=1   # connect with no broker → broker_unavailable, no spawn
+```
+
+Only the **spawn** is disabled: an already-listening broker still connects, so
+a harness can start its own broker and let clients join it. pi-mesh's own
+smoke and E2E scripts kill the broker they spawned (and the one a reconnect
+re-spawns) in their teardown.
+
 ## Multi-machine
 
 The mesh is loopback-only by default; to connect several machines (a VPS, a

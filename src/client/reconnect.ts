@@ -142,10 +142,26 @@ export async function ensureBroker(runtimeDir: string): Promise<string> {
   const sockPath = brokerSocketPath(runtimeDir);
   const lockPath = brokerLockPath(runtimeDir);
   mkdirSync(runtimeDir, { recursive: true });
+  // Opt-out for hermetic harnesses: connecting to a runtime dir with no
+  // broker must FAIL instead of silently spawning a detached daemon (which
+  // then leaks: a test that closes its peers never kills it). Only the
+  // SPAWN is disabled — an already-listening broker still connects.
+  const noAutoSpawn =
+    process.env.MESH_NO_AUTO_BROKER === "1" || process.env.MESH_NO_AUTO_BROKER === "true";
 
   for (let attempt = 0; attempt < LOCK_RETRY_MAX; attempt += 1) {
     if (await connectProbe(sockPath, ENSURE_BROKER_POLL_MS * ENSURE_BROKER_MAX_POLLS)) {
       return sockPath;
+    }
+    // One short re-probe covers the "another peer is spawning right now"
+    // case without ever creating a broker ourselves.
+    if (noAutoSpawn) {
+      if (await connectProbe(sockPath, ENSURE_BROKER_POLL_MS * ENSURE_BROKER_MAX_POLLS)) {
+        return sockPath;
+      }
+      throw new Error(
+        `broker_unavailable: no broker is listening on ${sockPath} and auto-spawn is disabled (MESH_NO_AUTO_BROKER)`,
+      );
     }
     let lockCreated = false;
     try {
