@@ -80,12 +80,20 @@ export function brokerSocketPathOf(runtimeDir: string): string {
 }
 
 /** Bounded poll — every test wait goes through here (suite stays < 60 s). */
+/**
+ * CI runners are slower and shared: a reactive budget that is generous on a
+ * laptop can flake under load. EVERY `waitFor` budget scales here, so a new
+ * test inherits the margin instead of needing its own constant bump (the
+ * alias-reclaim test bit us twice before this existed).
+ */
+export const CI_TIMEOUT_SCALE = process.env.CI ? 3 : 1;
+
 export async function waitFor<T>(
   fn: () => T | undefined | false,
   timeoutMs = 3000,
   intervalMs = 10,
 ): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + timeoutMs * CI_TIMEOUT_SCALE;
   for (;;) {
     const v = fn();
     if (v !== undefined && v !== false) return v;

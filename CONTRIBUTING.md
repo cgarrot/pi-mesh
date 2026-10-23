@@ -63,6 +63,10 @@ npm run smoke       # E2E without Pi (broker + 2 headless clients)
 
 - Tests run on Node 20 and Node 24 — the suite must pass on both
   (`npx -y node@24 scripts/run-tests.mjs`).
+- **Reactive waits go through `waitFor`** (`test/helpers.ts`): it scales every
+  budget by `CI_TIMEOUT_SCALE` (x3 on CI). Do not hand-roll a fixed sleep or a
+  bespoke `process.env.CI ? …` for a readiness check — a slow shared runner
+  will flake it, and bumping one constant only moves the problem.
 - Windows is a first-class platform (named pipes instead of AF_UNIX) —
   never break it.
 

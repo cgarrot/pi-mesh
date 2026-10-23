@@ -299,8 +299,9 @@ test("runtime: alias auto-reclaim — falls back, then reclaims when the holder 
   // transient alias_taken). Give the loop a generous, scaled budget instead
   // of a tight one; the assertion itself is unchanged.
   await holder.close();
-  const reclaimBudgetMs = process.env.CI ? 45_000 : 15_000;
-  await waitFor(() => (rt.client.alias === "rc-x" ? true : undefined), reclaimBudgetMs);
+  // Budget: the reclaim tick is 300 ms, but a loaded runner can serialize
+  // several rename attempts. The shared waitFor scales this on CI (x3).
+  await waitFor(() => (rt.client.alias === "rc-x" ? true : undefined), 15_000);
   assert.equal(rt.client.alias, "rc-x");
   const id = JSON.parse(readFileSync(fx.dirs.stateDir + "/identity-ses-reclaim.json", "utf8"));
   assert.equal(id.alias, "rc-x");
