@@ -128,6 +128,28 @@ never blocks or fakes the control action. A sender-side record has
   make a remote job control `not_authorized` (the job owner no longer matches
   the live alias).
 
+## Recipient-side authorization (follow-up)
+
+Broker policy and sender gates answer "may this peer send a ctl into this
+room?"; they do not answer "does this target accept being driven by this
+peer?". A follow-up adds a **target-side opt-in allowlist**, asymmetric by
+action class:
+
+- **stop-class** (`job_stop` / `job_pause` / `job_resume` / `run_stop`):
+  unchanged — same-room sender, broker policy, and the jobd owner rule
+  (`job.owner === local mesh alias`). Bounded, observable, reversible.
+- **steer-class** (`run_steer`, and any future action that injects an
+  instruction into a worker): **default-deny**, with a per-session
+  `ctl.allowFrom` allowlist. A refusal is `not_authorized` and names the
+  missing permission. Rationale: a message reaches a session through the
+  visible inbox (renderer, injection guard); a steer injects directly into a
+  headless worker with the controller's trust, with no human in the loop.
+
+The allowlist is **target-side only**; the broker stays a dumb, policy-checked
+router. The allowlist and the jobd owner rule are independent — both must
+pass (the peer is allowed to drive this session **and** the job belongs to
+this alias). Tracking: the follow-up issue.
+
 ## Tools
 
 | tool | action |
