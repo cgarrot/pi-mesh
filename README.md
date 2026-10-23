@@ -815,6 +815,10 @@ Limitations accepted for now (they are documented in code, see
 - Aliases are unique mesh-wide by convention (prefix per machine) — no
   cross-machine collision detection beyond the broker's live check.
 - The broker is a single process — no clustering or failover.
+- Connecting to a runtime dir with no broker **auto-spawns** a detached one
+  (by design). Embedders and test harnesses must either set
+  `MESH_NO_AUTO_BROKER=1` or kill the pid from `broker.lock` in teardown — see
+  "Embedding: a connect may SPAWN a broker".
 
 ## Real end-to-end tests (need a model)
 
@@ -857,6 +861,37 @@ transcript) · `src/cli` · `test/` · `scripts/mesh-smoke.mjs`.
 MIT — see [LICENSE](LICENSE).
 
 ## For other extensions
+
+### Embedding: a connect may SPAWN a broker
+
+**A client that connects to a runtime dir with no broker listening spawns a
+detached broker** (`ensureBroker`, `src/client/reconnect.ts`). That is what
+makes `pi install` work with zero setup — and it is the #1 surprise for a
+third-party harness, because the spawned daemon **outlives your process**.
+
+Two consequences for an embedder:
+
+1. **Tests with a temp runtime dir create a real detached broker** unless you
+   prevent it. Set `MESH_NO_AUTO_BROKER=1`: a connect with nothing listening
+   then fails with `broker_unavailable` instead of spawning (an
+   already-listening broker still connects — only the spawn is disabled).
+2. **If you DO let it spawn, kill it in teardown** — and be aware that a
+   reconnect after a broker crash spawns a *second* one. Killing the child you
+   spawned is not enough; read the pid from `broker.lock`
+   (`brokerLockPath(runtimeDir)`) at exit, or keep a handle to the pid you
+   spawned **plus** one final lock read.
+
+```ts
+// hermetic harness (own the broker, never spawn)
+process.env.MESH_NO_AUTO_BROKER = "1";
+// …or, if you want the convenience spawn, own the teardown:
+//   const pid = Number(readFileSync(brokerLockPath(runtimeDir), "utf8"));
+//   process.kill(pid, "SIGTERM");
+```
+
+The same contract applies to any long-lived host (an editor plugin, a
+dashboard): one session per process is assumed, and the broker it spawns stays
+up by design — that is a feature, not a leak, as long as something owns it.
 
 After connect/reconnect (and rename), mesh publishes the resolved identity:
 
