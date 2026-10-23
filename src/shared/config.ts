@@ -168,6 +168,18 @@ export const CTL_TARGET_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
 /** Lowercase, de-dupe, validate and bound a capability list. Invalid
  *  entries are dropped (a bad MESH_CAPS value must not break the hello). */
+export function normalizeCaps(input: readonly string[] | undefined): string[] {
+  if (input === undefined) return [];
+  const out: string[] = [];
+  for (const raw of input) {
+    const cap = raw.trim().toLowerCase();
+    if (cap.length === 0 || cap.length > MAX_CAP_CHARS || !CAP_REGEX.test(cap)) continue;
+    if (!out.includes(cap)) out.push(cap);
+    if (out.length >= MAX_CAPS) break;
+  }
+  return out;
+}
+
 /** Max entries in the target-side ctl allowlist. */
 export const MAX_CTL_ALLOW_FROM = 32;
 
@@ -188,17 +200,6 @@ export function normalizeCtlAllowFrom(input: unknown): string[] {
   return out;
 }
 
-export function normalizeCaps(input: readonly string[] | undefined): string[] {
-  if (input === undefined) return [];
-  const out: string[] = [];
-  for (const raw of input) {
-    const cap = raw.trim().toLowerCase();
-    if (cap.length === 0 || cap.length > MAX_CAP_CHARS || !CAP_REGEX.test(cap)) continue;
-    if (!out.includes(cap)) out.push(cap);
-    if (out.length >= MAX_CAPS) break;
-  }
-  return out;
-}
 
 // ---- Identity defaults ----
 export const ALIAS_RAND_CHARS = 6;
