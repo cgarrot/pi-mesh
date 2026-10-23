@@ -38,6 +38,9 @@ export interface MeshRuntime {
   runtimeDir: string;
   /** Pi session id — stable across /reload (identity key). */
   sessionId: string;
+  /** Target-side allowlist for steer-class ctl actions (`run_steer`).
+   *  Empty = deny every run_steer (default-deny); stop-class is unaffected. */
+  ctlAllowFrom: string[];
   /** The alias this session CHOSE (config pin, /mesh alias, /mesh join … as).
    *  A conflict fallback may change client.alias, but the preferred alias is
    *  persisted and retried at the next attach and by the reclaim loop — the
@@ -1256,7 +1259,7 @@ function ctlText(res: CtlResult, to: string, action: string, target?: string): s
     case "unsupported":
       return `unsupported @${to} (no local handler for ${action})`;
     case "not_authorized":
-      return `blocked: policy_denied for ${action} → @${to}`;
+      return `blocked: ${res.reason ?? "policy_denied"} for ${action} → @${to}`;
     case "identity_mismatch":
       return `identity_mismatch${t}: the target refused to signal an unproven pid`;
     case "unreachable":

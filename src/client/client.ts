@@ -175,6 +175,11 @@ function mapCtlReply(frame: MeshFrame, target: string | undefined): CtlResult {
   if (status === "timeout") {
     return { status: "timeout", reason: "target-side timeout: the action may still be running", target: targetValue, ctlId };
   }
+  if (status === "not_authorized") {
+    // A target-side allowlist refusal names the missing permission in the
+    // ack body (the broker's policy denial uses an error frame instead).
+    return { status: "not_authorized", reason: frame.body ?? "not_authorized", target: targetValue, ctlId };
+  }
   if (
     status === "not_busy" ||
     status === "still_busy" ||
@@ -2144,6 +2149,7 @@ export class MeshClient extends EventEmitter {
     action?: string;
     settled?: boolean;
     code?: MeshErrorCode;
+    reason?: string;
   }): void {
     if (!this.online || this.socket === null || this.socket.destroyed) return;
     const frame = buildFrame({
@@ -2156,6 +2162,7 @@ export class MeshClient extends EventEmitter {
       ...(ack.action !== undefined ? { action: ack.action } : {}),
       ...(ack.settled !== undefined ? { settled: ack.settled } : {}),
       ...(ack.code !== undefined ? { code: ack.code } : {}),
+      ...(ack.reason !== undefined ? { body: ack.reason } : {}),
     });
     try {
       this.socket.write(encodeFrame(frame, this.config.maxFrameBytes));

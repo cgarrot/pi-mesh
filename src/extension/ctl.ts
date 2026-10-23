@@ -116,7 +116,7 @@ export async function handleCtlFrame(
   if (to === undefined) return;
   const action = frame.action ?? "";
   let acked = false;
-  const ack = (status: CtlAckStatus, extra: { settled?: boolean } = {}): void => {
+  const ack = (status: CtlAckStatus, extra: { settled?: boolean; reason?: string } = {}): void => {
     // One ack per ctl, and one durable hash-only audit line: action, target,
     // status and the body/reason hashes — never the instruction the peer sent.
     if (acked) return;
@@ -144,6 +144,7 @@ export async function handleCtlFrame(
       status,
       action,
       ...(extra.settled !== undefined ? { settled: extra.settled } : {}),
+      ...(extra.reason !== undefined ? { reason: extra.reason } : {}),
     });
   };
 
@@ -187,6 +188,18 @@ export async function handleCtlFrame(
     }
     ack(settled ? "aborted" : "still_busy", { settled });
     return;
+  }
+
+  // Steer-class is target-side default-deny: a message reaches a session
+  // through the visible inbox; a steer injects directly into a headless
+  // worker with the controller's trust. Stop-class stays on broker policy +
+  // the jobd owner rule.
+  if (action === "run_steer") {
+    const allow = rt.ctlAllowFrom ?? [];
+    if (frame.from === undefined || !allow.includes(frame.from)) {
+      ack("not_authorized", { reason: "ctl.allowFrom" });
+      return;
+    }
   }
 
   if (action === "job_stop" || action === "job_pause" || action === "job_resume" || action === "run_stop" || action === "run_steer") {

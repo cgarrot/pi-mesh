@@ -319,7 +319,9 @@ acted** and is never retried.
 
 Job control is dispatched over the local `pi.events` bus to pi-jobd; run
 control to pi-subagents. No package imports and no shell string cross the
-mesh. Full contract: `docs/control-plane.md`.
+mesh. `mesh_run_control`'s `steer` is **target-side default-deny**: allow
+peers with `"ctl": { "allowFrom": ["alice"] }` (or `MESH_CTL_ALLOW_FROM`);
+stop-class is unaffected. Full contract: `docs/control-plane.md`.
 
 ## Unblocking a stuck agent (force + interrupt)
 
