@@ -124,6 +124,8 @@ export interface MeshFrame {
   peers?: MeshPeerInfo[];
   rooms?: string[];
   role?: MeshRole;
+  /** Per-room roles (hello): observer rooms survive a reconnect. */
+  roles?: Record<string, string>;
   mailboxCount?: number;
   queuedAt?: string; // mailbox frames 
   interruptStatus?: string; // ack for force 
@@ -320,6 +322,8 @@ export interface BuildFrameOpts {
   peers?: MeshPeerInfo[];
   rooms?: string[];
   role?: MeshRole;
+  /** Per-room roles (hello): observer rooms survive a reconnect. */
+  roles?: Record<string, string>;
   mailboxCount?: number;
   queuedAt?: string;
   interruptStatus?: string;
@@ -384,6 +388,7 @@ export function buildFrame(opts: BuildFrameOpts): MeshFrame {
   if (opts.peers !== undefined) frame.peers = opts.peers;
   if (opts.rooms !== undefined) frame.rooms = opts.rooms;
   if (opts.role !== undefined) frame.role = opts.role;
+  if (opts.roles !== undefined) frame.roles = { ...opts.roles };
   if (opts.mailboxCount !== undefined) frame.mailboxCount = opts.mailboxCount;
   if (opts.queuedAt !== undefined) frame.queuedAt = opts.queuedAt;
   if (opts.interruptStatus !== undefined) frame.interruptStatus = opts.interruptStatus;
@@ -670,6 +675,18 @@ export function validateFrame(value: unknown, opts: ValidateOpts = {}): Validati
       }
       if (p.proto !== undefined && !isValidProto(p.proto)) {
         return { ok: false, code: "invalid_frame", detail: "bad peer proto" };
+      }
+    }
+  }
+
+  // Per-room roles: a value outside the enum is a fail-closed rejection.
+  // An entry for a room absent from `rooms` is IGNORED (a stale entry must
+  // not wedge a reconnect — the one documented exception to fail-closed).
+  if (value.roles !== undefined) {
+    if (!isRecord(value.roles)) return { ok: false, code: "invalid_frame", detail: "bad roles" };
+    for (const role of Object.values(value.roles)) {
+      if (typeof role !== "string" || !(ROLES as readonly string[]).includes(role)) {
+        return { ok: false, code: "invalid_frame", detail: "bad role value" };
       }
     }
   }

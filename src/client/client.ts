@@ -432,6 +432,15 @@ export class MeshClient extends EventEmitter {
   /** Aliases seen online (welcome + presence join) — send-guard hints.
   *  Best-effort: a missing entry is a WARNING, never a block. */
   private readonly knownPeers = new Set<string>();
+  /** Best-effort peer -> rooms cache (welcome / status_res / presence), used
+   *  to resolve an UNTAGGED direct send to a room shared with the target.
+   *  Staleness is honest: if the target left the cached room the broker
+   *  refuses with not_member and the caller can retry with an explicit room. */
+  private readonly peerRooms = new Map<string, Set<string>>();
+  /** This client's own (room -> role) map. `observer` must SURVIVE a
+   *  reconnect: the hello carries it, otherwise the broker re-admits the peer
+   *  as a member and read-only governance is silently lost. */
+  private readonly roomRoles = new Map<string, MeshRole>();
   /**
   * replyTo msgIds already answered/handled: the FIRST reply to a given
   * message is consumed (pending match) or injected (orphan); later replies
@@ -447,6 +456,7 @@ export class MeshClient extends EventEmitter {
     this.aliasInternal = normalizeAlias(opts.alias ?? defaultAlias());
     this.initialRooms = opts.rooms ?? [...DEFAULT_CONFIG.rooms];
     this.joinedRooms = new Set(this.initialRooms);
+    for (const room of this.initialRooms) this.roomRoles.set(room, "member");
     this.runtimeDir = opts.runtimeDir ?? runtimeDir();
     this.config = { ...DEFAULT_CONFIG, ...opts.config, rooms: this.initialRooms };
     this.noReconnect = opts.noReconnect === true;
@@ -999,6 +1009,13 @@ export class MeshClient extends EventEmitter {
           type: "hello",
           from: this.alias,
           rooms: [...this.joinedRooms],
+          // Per-room roles (additive field): a pure-observer peer must be
+          // re-admitted as observer, not laundered into a writer on reconnect.
+          roles: Object.fromEntries(
+            [...this.joinedRooms]
+              .filter((room) => this.roomRoles.get(room) === "observer")
+              .map((room) => [room, "observer"]),
+          ),
           reservations: this.ownReservations.length > 0 ? [...this.ownReservations] : undefined,
           token: this.config.brokerToken !== undefined ? sha256(this.config.brokerToken) : undefined,
           clientVersion: MESH_VERSION, // M1: peers see each other's version
@@ -1038,8 +1055,11 @@ export class MeshClient extends EventEmitter {
               }
   // send-guard cache: aliases present in the welcome are known online
               this.knownPeers.clear();
+              this.peerRooms.clear();
               for (const p of frame.peers ?? []) {
-                if (p.alias !== undefined && p.alias !== this.alias) this.knownPeers.add(p.alias);
+                if (p.alias === undefined || p.alias === this.alias) continue;
+                this.knownPeers.add(p.alias);
+                if (Array.isArray(p.rooms)) this.peerRooms.set(p.alias, new Set(p.rooms));
               }
               this.debug("handshake: welcome received");
               resolve({
@@ -1291,16 +1311,36 @@ export class MeshClient extends EventEmitter {
         this.emit("frame", frame);
         break;
       }
-      case "presence":
-        if (frame.status === "offline") {
-          this.peerReservations.delete(frame.from ?? "");
-          this.peerActivity.delete(frame.from ?? ""); // gone — forget its state
-          this.knownPeers.delete(frame.from ?? "");
-        } else if (frame.status === "online" && frame.from !== undefined) {
-          this.knownPeers.add(frame.from); // joined — the send guard knows it
+      case "presence": {
+        const alias = frame.from;
+        if (alias !== undefined && alias !== this.alias) {
+          if (frame.status === "offline") {
+            // Presence is per-room: drop only that room, and forget the peer
+            // entirely when nothing is left (a ghost room must never win the
+            // room resolution).
+            const rooms = this.peerRooms.get(alias);
+            if (rooms !== undefined) {
+              if (frame.room !== undefined) rooms.delete(frame.room);
+              else rooms.clear();
+              if (rooms.size === 0) this.peerRooms.delete(alias);
+            }
+            if (this.peerRooms.has(alias) === false) {
+              this.peerReservations.delete(alias);
+              this.peerActivity.delete(alias);
+              this.knownPeers.delete(alias);
+            }
+          } else if (frame.status === "online") {
+            this.knownPeers.add(alias); // joined — the send guard knows it
+            if (frame.room !== undefined) {
+              const rooms = this.peerRooms.get(alias) ?? new Set<string>();
+              rooms.add(frame.room);
+              this.peerRooms.set(alias, rooms);
+            }
+          }
         }
         this.emit("presence", frame);
         break;
+      }
       case "pong":
         break;
       case "error": {
@@ -1406,6 +1446,16 @@ export class MeshClient extends EventEmitter {
 
   // ---- send / reply ----
 
+  /** Pick the room for an untagged send: a room shared with the target wins
+   *  (first in our joined order — deterministic), then the legacy fallback. */
+  private resolveSendRoom(to: string | undefined): string | undefined {
+    if (to !== undefined) {
+      const shared = [...this.joinedRooms].find((room) => this.peerRooms.get(to)?.has(room) === true);
+      if (shared !== undefined) return shared;
+    }
+    return this.joinedRooms.has(DEFAULT_ROOM) ? DEFAULT_ROOM : [...this.joinedRooms][0];
+  }
+
   async send(opts: SendOpts): Promise<SendResult> {
     const broadcast = opts.broadcast === true;
     const cap = !broadcast && opts.to !== undefined ? capTargetName(opts.to.trim()) : undefined;
@@ -1429,12 +1479,15 @@ export class MeshClient extends EventEmitter {
     if (cap !== undefined && this.online && this.brokerProtoValue < 2) {
       return { status: "error", reason: "broker_too_old (restart the broker to enable cap routing)" };
     }
-  // Room resolution: explicit room wins; otherwise prefer "default" when
-  // still joined, else the first joined room (the client may have left
-  // "default" — sending into it would be refused as not_member).
-    const room = opts.room ?? (this.joinedRooms.has(DEFAULT_ROOM)
-      ? DEFAULT_ROOM
-      : [...this.joinedRooms][0]);
+  // Room resolution: explicit room wins. Otherwise, for a DIRECT send, a room
+  // SHARED with the target (multi-room peers are otherwise unreachable: an
+  // untagged send used to resolve to "default" and the broker refused with
+  // not_member). Fallback keeps the old rule (default if joined, else the
+  // first joined room) so a session that left "default" still works.
+  // Tie-break is deterministic: the FIRST shared room in OUR joined order.
+  // Staleness is honest: if the target left the cached room the broker says
+  // not_member and the caller can retry with an explicit room.
+    const room = opts.room ?? this.resolveSendRoom(to);
     if (room === undefined || !isValidRoom(room)) {
       return { status: "error", reason: "not_in_any_room" };
     }
@@ -1900,6 +1953,8 @@ export class MeshClient extends EventEmitter {
     const ack = await this.roundTrip(frame);
     if (ack.type === "error") throw new Error(ack.code ?? "internal");
     this.joinedRooms.add(room);
+    // Persist the role: the next hello must re-declare an observer as one.
+    this.roomRoles.set(room, role);
   }
 
   async leave(room: string): Promise<void> {
@@ -1914,6 +1969,7 @@ export class MeshClient extends EventEmitter {
       throw new Error(ack.code ?? "internal");
     }
     this.joinedRooms.delete(room);
+    this.roomRoles.delete(room);
   }
 
   /**
@@ -1924,6 +1980,7 @@ export class MeshClient extends EventEmitter {
    */
   forgetRoom(room: string): void {
     this.joinedRooms.delete(room);
+    this.roomRoles.delete(room);
   }
 
   /**
