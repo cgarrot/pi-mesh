@@ -20,7 +20,7 @@ interface Harness {
   handlers: Map<string, Handler[]>;
 }
 
-function harness(opts: { busy?: boolean; withAbort?: boolean; withBus?: boolean; failSend?: boolean } = {}): Harness {
+function harness(opts: { busy?: boolean; withAbort?: boolean; withBus?: boolean; failSend?: boolean; ctlAllowFrom?: string[] } = {}): Harness {
   const acks: Array<Record<string, unknown>> = [];
   const messages: Array<{ msg: unknown; opts: unknown }> = [];
   const ledger: Array<Record<string, unknown>> = [];
@@ -52,6 +52,7 @@ function harness(opts: { busy?: boolean; withAbort?: boolean; withBus?: boolean;
     ctx,
     ledger: { append: (entry: Record<string, unknown>) => ledger.push(entry) },
     ledgerFailures: 0,
+    ctlAllowFrom: opts.ctlAllowFrom ?? [],
   } as unknown as MeshRuntime;
   return {
     rt,
@@ -179,6 +180,41 @@ describe("ctl handler: local dispatch (job_*/run_*)", () => {
     const h = harness({ withBus: false });
     await handleCtlFrame(h.rt, ctl({ action: "run_stop", target: "r_1" }), h.pi);
     assert.equal(h.acks[0]!.status, "unsupported");
+  });
+
+  it("run_steer is default-deny: no ctl.allowFrom means not_authorized", async () => {
+    const h = harness();
+    await handleCtlFrame(h.rt, ctl({ action: "run_steer", target: "rpc_1", body: "do the thing" }), h.pi);
+    assert.equal(h.acks[0]!.status, "not_authorized");
+    assert.equal(h.acks[0]!.reason, "ctl.allowFrom");
+  });
+
+  it("run_steer from an allowlisted peer reaches the local handler", async () => {
+    const h = harness({ ctlAllowFrom: ["alice"] });
+    h.handlers.set("mesh-ctl", [
+      (data) => {
+        const req = data as { ctlId: string };
+        const reply = (h.handlers.get(`mesh-ctl:reply:${req.ctlId}`) ?? [])[0];
+        assert.ok(reply);
+        reply({ status: "steered" });
+      },
+    ]);
+    await handleCtlFrame(h.rt, ctl({ action: "run_steer", target: "rpc_1", body: "do the thing" }), h.pi);
+    assert.equal(h.acks[0]!.status, "steered");
+  });
+
+  it("stop-class is not gated by the allowlist (job_stop still works)", async () => {
+    const h = harness({ ctlAllowFrom: [] });
+    h.handlers.set("mesh-ctl", [
+      (data) => {
+        const req = data as { ctlId: string };
+        const reply = (h.handlers.get(`mesh-ctl:reply:${req.ctlId}`) ?? [])[0];
+        assert.ok(reply);
+        reply({ status: "stopped" });
+      },
+    ]);
+    await handleCtlFrame(h.rt, ctl({ action: "job_stop", target: "j_1" }), h.pi);
+    assert.equal(h.acks[0]!.status, "stopped");
   });
 
   it("an out-of-vocabulary local status is clamped to error (never a rejected ack)", async () => {

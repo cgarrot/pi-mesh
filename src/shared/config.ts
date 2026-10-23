@@ -168,6 +168,26 @@ export const CTL_TARGET_REGEX = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 
 /** Lowercase, de-dupe, validate and bound a capability list. Invalid
  *  entries are dropped (a bad MESH_CAPS value must not break the hello). */
+/** Max entries in the target-side ctl allowlist. */
+export const MAX_CTL_ALLOW_FROM = 32;
+
+/** Normalize a target-side ctl allowlist: lowercase, strip '@', validate,
+ *  dedupe, bound. Invalid entries are dropped (a bad value must not open the
+ *  allowlist; it is deny-by-default). */
+export function normalizeCtlAllowFrom(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  const out: string[] = [];
+  for (const raw of input) {
+    if (typeof raw !== "string") continue;
+    let alias = raw.trim().toLowerCase();
+    while (alias.startsWith("@")) alias = alias.slice(1);
+    if (!ALIAS_REGEX.test(alias)) continue;
+    if (!out.includes(alias)) out.push(alias);
+    if (out.length >= MAX_CTL_ALLOW_FROM) break;
+  }
+  return out;
+}
+
 export function normalizeCaps(input: readonly string[] | undefined): string[] {
   if (input === undefined) return [];
   const out: string[] = [];
@@ -226,6 +246,10 @@ export interface MeshConfig {
   /** advertised capabilities (config.json "caps" / $MESH_CAPS, csv) —
   *  routing hints only; authorization still comes from policy. */
   caps?: string[];
+  /** target-side allowlist for steer-class ctl actions (config.json
+  *  "ctl": { "allowFrom": [...] } / $MESH_CTL_ALLOW_FROM csv). Empty =
+  *  deny every run_steer (default-deny); stop-class is unaffected. */
+  ctlAllowFrom?: string[];
   maxFrameBytes: number;
   heartbeatMs: number;
   brokerSilenceMs: number;
@@ -283,6 +307,7 @@ export interface MeshConfig {
 
 export const DEFAULT_CONFIG: MeshConfig = {
   rooms: [DEFAULT_ROOM],
+  ctlAllowFrom: [],
   caps: [],
   maxFrameBytes: DEFAULT_MAX_FRAME_BYTES,
   heartbeatMs: DEFAULT_HEARTBEAT_MS,
@@ -349,6 +374,9 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
         : [...DEFAULT_CONFIG.rooms],
     ...(fileCfg.roomsPinned === true ? { roomsPinned: true } : {}),
     caps: normalizeCaps(Array.isArray(fileCfg.caps) ? fileCfg.caps : undefined),
+    ctlAllowFrom: normalizeCtlAllowFrom(
+      (fileCfg as Partial<MeshConfig> & { ctl?: { allowFrom?: unknown } }).ctl?.allowFrom,
+    ),
     maxFrameBytes: clampFrameBytes(positiveInt(fileCfg.maxFrameBytes, DEFAULT_CONFIG.maxFrameBytes)),
     heartbeatMs: positiveInt(fileCfg.heartbeatMs, DEFAULT_CONFIG.heartbeatMs),
     brokerSilenceMs: positiveInt(fileCfg.brokerSilenceMs, DEFAULT_CONFIG.brokerSilenceMs),
@@ -438,6 +466,10 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
   const envCaps = env.MESH_CAPS;
   if (envCaps !== undefined) {
     cfg.caps = normalizeCaps(envCaps.split(","));
+  }
+  const envCtlAllow = env.MESH_CTL_ALLOW_FROM;
+  if (envCtlAllow !== undefined) {
+    cfg.ctlAllowFrom = normalizeCtlAllowFrom(envCtlAllow.split(","));
   }
   const envFrame = envInt(env, "MESH_MAX_FRAME_BYTES");
   if (envFrame !== undefined) cfg.maxFrameBytes = clampFrameBytes(envFrame);

@@ -149,6 +149,7 @@ export default function meshExtension(pi: ExtensionAPI): void {
       sessionId,
       identity,
       preferredAlias: choice.preferredAlias ?? client.alias,
+      ctlAllowFrom: config.ctlAllowFrom ?? [],
       ...(identityKey !== undefined ? { identityKey } : {}),
       pendingHistory,
       startedAt: Date.now(),

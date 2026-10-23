@@ -128,11 +128,11 @@ never blocks or fakes the control action. A sender-side record has
   make a remote job control `not_authorized` (the job owner no longer matches
   the live alias).
 
-## Recipient-side authorization (follow-up)
+## Recipient-side authorization (implemented)
 
 Broker policy and sender gates answer "may this peer send a ctl into this
 room?"; they do not answer "does this target accept being driven by this
-peer?". A follow-up adds a **target-side opt-in allowlist**, asymmetric by
+peer?". The target answers that with an **opt-in allowlist**, asymmetric by
 action class:
 
 - **stop-class** (`job_stop` / `job_pause` / `job_resume` / `run_stop`):
@@ -145,10 +145,21 @@ action class:
   visible inbox (renderer, injection guard); a steer injects directly into a
   headless worker with the controller's trust, with no human in the loop.
 
-The allowlist is **target-side only**; the broker stays a dumb, policy-checked
-router. The allowlist and the jobd owner rule are independent — both must
-pass (the peer is allowed to drive this session **and** the job belongs to
-this alias). Tracking: the follow-up issue.
+```jsonc
+// <cwd>/.mesh/config.json
+{ "ctl": { "allowFrom": ["alice", "bob"] } }
+```
+
+or `MESH_CTL_ALLOW_FROM=alice,bob` (csv). Empty/absent = **deny every
+`run_steer`**. The allowlist is alias-based: after a rename, the old alias no
+longer matches (deny — the safe direction).
+
+The check runs in `handleCtlFrame` **before** local dispatch; the broker is
+unchanged (target-side only). The refusal carries `reason: "ctl.allowFrom"`
+in the ack, so the sender sees `blocked: ctl.allowFrom for run_steer → @bob`
+instead of a generic policy error. The allowlist and the jobd owner rule are
+independent — both must pass (the peer is allowed to drive this session
+**and** the job belongs to this alias).
 
 ## Tools
 
