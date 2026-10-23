@@ -1005,17 +1005,20 @@ export class MeshClient extends EventEmitter {
       this.helloTimer.unref();
 
       socket.once("connect", () => {
-        const hello = buildFrame({
+        const observerRoles = ((): Record<string, string> | undefined => {
+      const entries = [...this.joinedRooms]
+        .filter((room) => this.roomRoles.get(room) === "observer")
+        .map((room) => [room, "observer"] as const);
+      return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+    })();
+    const hello = buildFrame({
           type: "hello",
           from: this.alias,
           rooms: [...this.joinedRooms],
           // Per-room roles (additive field): a pure-observer peer must be
           // re-admitted as observer, not laundered into a writer on reconnect.
-          roles: Object.fromEntries(
-            [...this.joinedRooms]
-              .filter((room) => this.roomRoles.get(room) === "observer")
-              .map((room) => [room, "observer"]),
-          ),
+          // Omitted entirely when this client has no observer room.
+          ...(observerRoles !== undefined ? { roles: observerRoles } : {}),
           reservations: this.ownReservations.length > 0 ? [...this.ownReservations] : undefined,
           token: this.config.brokerToken !== undefined ? sha256(this.config.brokerToken) : undefined,
           clientVersion: MESH_VERSION, // M1: peers see each other's version
@@ -1199,6 +1202,12 @@ export class MeshClient extends EventEmitter {
         break;
       }
       case "status_res": {
+        // Snapshots refresh the peer-room cache (comfort, not the only source:
+        // welcome seeds it and presence carries the join/leave deltas).
+        for (const p of frame.peers ?? []) {
+          if (p.alias === undefined || p.alias === this.alias) continue;
+          if (Array.isArray(p.rooms)) this.peerRooms.set(p.alias, new Set(p.rooms));
+        }
         const w = this.statusWaiters.get(frame.id);
         if (w) {
           this.statusWaiters.delete(frame.id);
