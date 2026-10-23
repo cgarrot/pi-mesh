@@ -317,7 +317,13 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
       ? new Set<string>(frame.rooms)
       : new Set<string>([DEFAULT_ROOM]);
     for (const roomId of requested) {
-      const role = frame.role ?? "member";
+      // Per-room roles are AUTHORITATIVE when the hello carries them; a room
+      // absent from the map falls back to `role ?? "member"` (old clients).
+      // An entry naming a room outside `rooms` is ignored by construction
+      // (we only read keys we are joining) — a stale entry never wedges a
+      // reconnect.
+      const mapped = frame.roles !== undefined ? frame.roles[roomId] : undefined;
+      const role = mapped === "observer" || mapped === "member" ? mapped : (frame.role ?? "member");
       const res = joinRoom(state, config, peer, roomId, role);
       if (!res.ok) {
         sendError(socket, res.code, frame.id);

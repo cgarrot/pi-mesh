@@ -306,6 +306,19 @@ mesh_send({ "to": "cap:deploy", "priority": "urgent",
 
 Full guide: `docs/capability-routing.md`.
 
+## Rooms, roles and direct sends
+
+- **Untagged direct sends resolve to a room SHARED with the target** (first
+  shared room in your joined order), falling back to `default` when joined and
+  then to your first room. A member of `[mesh, default]` can therefore DM a
+  peer that is only in `mesh` — no explicit `room` needed. With no shared room
+  the broker still refuses honestly (`not_member`).
+- **Roles survive a reconnect.** `join(room, "observer")` is remembered and
+  re-declared in every hello (`roles: { "<room>": "observer" }`), so a
+  read-only peer is never re-admitted as a writer after a crash or a network
+  blip. A room absent from the map falls back to `role ?? "member"` (old
+  clients); an out-of-enum role is rejected as `invalid_frame`.
+
 ## Control plane (`ctl`)
 
 `mesh_abort` / `mesh_redirect` / `mesh_job_control` / `mesh_run_control` let an
