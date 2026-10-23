@@ -625,7 +625,22 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
   const handleCtl = (from: PeerRecord, frame: MeshFrame): void => {
     const to = frame.to;
     if (to === undefined) {
-      sendError(from.socket, "invalid_alias", frame.id);
+      sendError(from.socket, "invalid_frame", frame.id);
+      return;
+    }
+    // Same sender-side gates as routeMsg: an observer must not gain write
+    // capability through a control action, a non-member must not ctl into a
+    // room, and the self-reported room must never escape the sender's
+    // membership (otherwise room-scoped policy rules are bypassable).
+    const room = frame.room ?? DEFAULT_ROOM;
+    if (!from.rooms.has(room)) {
+      state.stats.refused += 1;
+      sendError(from.socket, "not_member", frame.id);
+      return;
+    }
+    if (from.rooms.get(room) === "observer") {
+      state.stats.refused += 1;
+      sendError(from.socket, "observer_readonly", frame.id);
       return;
     }
     const target = state.peers.get(to);
@@ -633,9 +648,14 @@ export function createBroker(options: BrokerOptions): Promise<RunningBroker> {
       sendError(from.socket, "unreachable", frame.id);
       return;
     }
+    if (!target.rooms.has(room)) {
+      state.stats.refused += 1;
+      sendError(from.socket, "not_member", frame.id);
+      return;
+    }
     const force = frame.action === "abort" || frame.action === "redirect";
     const priority = force ? "force" : "normal";
-    const decision = evaluatePolicy(policy, { from: from.alias, to, room: frame.room ?? DEFAULT_ROOM, priority });
+    const decision = evaluatePolicy(policy, { from: from.alias, to, room, priority });
     // A control action cannot be "downgraded": forceDowngrade turns a force
     // MESSAGE into urgent, but an abort/redirect either is authorized or is
     // refused. Requiring allow here closes the downgrade bypass.

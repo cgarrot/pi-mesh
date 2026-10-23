@@ -11,7 +11,7 @@
  * `redirected` means it settled AND the new instruction was injected.
  */
 import { CTL_LOCAL_TIMEOUT_MS, CTL_SETTLE_TIMEOUT_MS } from "../shared/config.js";
-import type { MeshFrame } from "../protocol/envelope.js";
+import { CTL_STATUSES, type MeshFrame } from "../protocol/envelope.js";
 import type { ExtensionAPI, SessionContext } from "./pi-types.js";
 import type { MeshRuntime } from "./tools.js";
 
@@ -202,7 +202,12 @@ export async function handleCtlFrame(
       },
       opts.localTimeoutMs ?? CTL_LOCAL_TIMEOUT_MS,
     );
-    ack(local.status ?? "error", { ...(local.settled !== undefined ? { settled: local.settled } : {}) });
+    // Never forward an out-of-vocabulary status: the broker would reject the
+    // ctl_ack and the sender would burn a full timeout instead of learning
+    // the truth. Clamp to the closed set.
+    const raw = local.status ?? "error";
+    const status = (CTL_STATUSES as readonly string[]).includes(raw) ? raw : "error";
+    ack(status, { ...(local.settled !== undefined ? { settled: local.settled } : {}) });
     return;
   }
 

@@ -181,6 +181,20 @@ describe("ctl handler: local dispatch (job_*/run_*)", () => {
     assert.equal(h.acks[0]!.status, "unsupported");
   });
 
+  it("an out-of-vocabulary local status is clamped to error (never a rejected ack)", async () => {
+    const h = harness();
+    h.handlers.set("mesh-ctl", [
+      (data) => {
+        const req = data as { ctlId: string };
+        const reply = (h.handlers.get(`mesh-ctl:reply:${req.ctlId}`) ?? [])[0];
+        assert.ok(reply);
+        reply({ status: "totally_bogus" });
+      },
+    ]);
+    await handleCtlFrame(h.rt, ctl({ action: "job_stop", target: "j_1" }), h.pi, { localTimeoutMs: 1_000 });
+    assert.equal(h.acks[0]!.status, "error");
+  });
+
   it("a silent local handler times out (timeout, not a false unsupported)", async () => {
     const h = harness();
     // No "mesh-ctl" handler registered.

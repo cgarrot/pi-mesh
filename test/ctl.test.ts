@@ -28,19 +28,29 @@ async function withBroker(
   return { dirs, broker, sock: broker.socketPath };
 }
 
-async function client(t: { after: (fn: () => void) => void }, sock: string, alias: string): Promise<RawClient> {
+async function clientWith(
+  t: { after: (fn: () => void) => void },
+  sock: string,
+  alias: string,
+  rooms: string[],
+  role: "member" | "observer",
+): Promise<RawClient> {
   const raw = await RawClient.connect(sock);
   t.after(() => raw.close());
-  raw.hello(alias, ["default"], "member", [], 2);
+  raw.hello(alias, rooms, role, [], 2);
   await raw.waitFrame((f) => f.type === "welcome");
   return raw;
 }
 
-function ctl(id: string, opts: { to?: string; action?: string; target?: string; body?: string; reason?: boolean } = {}): MeshFrame {
+async function client(t: { after: (fn: () => void) => void }, sock: string, alias: string): Promise<RawClient> {
+  return clientWith(t, sock, alias, ["default"], "member");
+}
+
+function ctl(id: string, opts: { to?: string; action?: string; target?: string; body?: string; reason?: boolean; from?: string } = {}): MeshFrame {
   return buildFrame({
     type: "ctl",
     id,
-    from: "alice",
+    from: opts.from ?? "alice",
     to: opts.to ?? "bob",
     room: "default",
     action: opts.action ?? "abort",
@@ -97,6 +107,33 @@ describe("ctl: routing + ack correlation", () => {
     alice.sendFrame(ctl("m_ctl_denied"));
     const err = await alice.waitFrame((f) => f.type === "error" && f.id === "m_ctl_denied");
     assert.equal(err.code, "policy_denied");
+  });
+
+  it("an observer cannot use a control action (no write through read-only)", async (t) => {
+    const { sock } = await withBroker(t, { policy: { forceAllowedFrom: ["alice"] } });
+    await client(t, sock, "bob");
+    const observer = await clientWith(t, sock, "obs", ["default"], "observer");
+    observer.sendFrame(ctl("m_ctl_obs", { from: "obs", to: "bob" }));
+    const err = await observer.waitFrame((f) => f.type === "error" && f.id === "m_ctl_obs");
+    assert.equal(err.code, "observer_readonly");
+  });
+
+  it("a non-member cannot ctl into a room it did not join", async (t) => {
+    const { sock } = await withBroker(t, { policy: { forceAllowedFrom: ["alice"] } });
+    await client(t, sock, "bob");
+    const outsider = await clientWith(t, sock, "outsider", ["other"], "member");
+    outsider.sendFrame(ctl("m_ctl_nomember", { from: "outsider", to: "bob" }));
+    const err = await outsider.waitFrame((f) => f.type === "error" && f.id === "m_ctl_nomember");
+    assert.equal(err.code, "not_member");
+  });
+
+  it("the target must be in the named room (self-reported room is bounded)", async (t) => {
+    const { sock } = await withBroker(t, { policy: { forceAllowedFrom: ["alice"] } });
+    const alice = await client(t, sock, "alice");
+    await clientWith(t, sock, "elsewhere", ["other"], "member");
+    alice.sendFrame(ctl("m_ctl_target_room", { to: "elsewhere", from: "alice" }));
+    const err = await alice.waitFrame((f) => f.type === "error" && f.id === "m_ctl_target_room");
+    assert.equal(err.code, "not_member");
   });
 
   it("forceDowngrade never downgrades an abort: it is denied", async (t) => {
