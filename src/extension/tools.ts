@@ -1398,22 +1398,15 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
       "queued_offline in its mailbox), never read/answered. awaitReply waits " +
       "for an explicit mesh_reply; otherwise expired after timeoutMs.",
     promptSnippet: "Message another local agent over mesh (delivered ≠ read ≠ answered).",
-    promptGuidelines:
-      "Use mesh_reply(msgId) to answer an inbound [mesh] message. " +
-      "priority=force requires reason and aborts the recipient turn. " +
-      "delivered/queued_offline are NOT completions. " +
-      "LAUNCH sends (awaitReply + block:false) return immediately — each " +
-      "answer then arrives as a [mesh] reply event that wakes the session; " +
-      "call mesh_wait_all only when you must collect the whole batch before " +
-      "continuing. " +
-      "An 'expired' awaitReply is NOT a lost message: late replies are " +
-      "delivered and injected automatically — do not re-send the request, " +
-      "check mesh_history first. " +
-      "RECIPIENTS ANSWER WITH mesh_reply(msgId) — a plain mesh_send back to " +
-      "you does NOT settle the mission (external relay peers often do this); " +
-      "wait_all flags it as '⚠ uncorrelated msg'. " +
-      "replyTo: [aliases] designates who receives the reply instead of you " +
-      "(include yourself to also get the answer, e.g. with awaitReply).",
+    promptGuidelines: [
+      "Use mesh_reply(msgId) to answer an inbound [mesh] message.",
+      "priority=force requires reason and aborts the recipient turn.",
+      "delivered/queued_offline are NOT completions.",
+      "LAUNCH sends (awaitReply + block:false) return immediately — each answer then arrives as a [mesh] reply event that wakes the session; call mesh_wait_all only when you must collect the whole batch before continuing.",
+      "An 'expired' awaitReply is NOT a lost message: late replies are delivered and injected automatically — do not re-send the request, check mesh_history first.",
+      "RECIPIENTS ANSWER WITH mesh_reply(msgId) — a plain mesh_send back to you does NOT settle the mission (external relay peers often do this); wait_all flags it as '⚠ uncorrelated msg'.",
+      "replyTo: [aliases] designates who receives the reply instead of you (include yourself to also get the answer, e.g. with awaitReply).",
+    ],
     parameters: MESH_SEND_PARAMETERS,
     execute: (_toolCallId, params, signal, _onUpdate, _ctx) => execMeshSend(getRuntime, params, signal),
   });
@@ -1426,13 +1419,12 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
       "This is the way to answer inbound [mesh] messages. " +
       "Refused with reply_without_target when the msgId is not in the local inbox.",
     promptSnippet: "Reply to a mesh message by msgId.",
-    promptGuidelines:
-      "Only msgIds seen in inbound [mesh] messages are valid targets. " +
-      "Replies interrupt the recipient (steer). If the result warns " +
-      "'already replied', you already answered this msgId — do not re-answer. " +
-      "By default the reply goes to the original sender — or to the alias(es) " +
-      "the sender designated with replyTo (shown as 'reply goes to @X' on the " +
-      "inbound message). Override with to: (single) or replyAll: true (room).",
+    promptGuidelines: [
+      "Only msgIds seen in inbound [mesh] messages are valid targets.",
+      "Replies interrupt the recipient (steer). If the result warns 'already replied', you already answered this msgId — do not re-answer.",
+      "By default the reply goes to the original sender — or to the alias(es) the sender designated with replyTo (shown as 'reply goes to @X' on the inbound message).",
+      "Override with to: (single) or replyAll: true (room).",
+    ],
     parameters: MESH_REPLY_PARAMETERS,
     execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshReply(getRuntime, params),
   });
@@ -1468,13 +1460,11 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
       "(or timeout), then return the group summary — who answered, who is missing. " +
       "The honest alternative to sleep-while-waiting: no wasted tokens, no polling.",
     promptSnippet: "Wait for all pending mission replies and get the summary.",
-    promptGuidelines:
-      "Only a mesh_reply correlated to the mission msgId settles a mission. " +
-      "A NOT ANSWERED line carrying '⚠ uncorrelated msg from @X' means X DID " +
-      "send you something after the mission went out, but as a plain message " +
-      "(no correlation) — read it with mesh_history BEFORE re-sending the " +
-      "mission; it is often the answer, or a progress note announcing the real " +
-      "reply. Do NOT press-re-send on a ⚠ line without checking mesh_history.",
+    promptGuidelines: [
+      "Only a mesh_reply correlated to the mission msgId settles a mission.",
+      "A NOT ANSWERED line carrying '⚠ uncorrelated msg from @X' means X DID send you something after the mission went out, but as a plain message (no correlation) — read it with mesh_history BEFORE re-sending the mission; it is often the answer, or a progress note announcing the real reply.",
+      "Do NOT press-re-send on a ⚠ line without checking mesh_history.",
+    ],
     parameters: MESH_WAIT_ALL_PARAMETERS,
     execute: (_toolCallId, params, signal, _onUpdate, _ctx) => execMeshWaitAll(getRuntime, params, signal),
   });
@@ -1502,10 +1492,11 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
       "renew. autoReleaseMs bounds a run: the claim self-releases. Peers are " +
       "notified immediately; use mesh_release when done.",
     promptSnippet: "Claim files before editing to avoid concurrent edits.",
-    promptGuidelines:
-      "Reserve before editing a shared file, release when done. " +
-      "mesh_release({}) releases everything. Long run (>4 h)? Re-reserve " +
-      "periodically or set autoReleaseMs.",
+    promptGuidelines: [
+      "Reserve before editing a shared file, release when done.",
+      "mesh_release({}) releases everything.",
+      "Long run (>4 h)? Re-reserve periodically or set autoReleaseMs.",
+    ],
     parameters: MESH_RESERVE_PARAMETERS,
     execute: (_toolCallId, params, _signal, _onUpdate, _ctx) => execMeshReserve(getRuntime, params),
   });

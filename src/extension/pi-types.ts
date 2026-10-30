@@ -122,7 +122,13 @@ export interface ToolDefinition {
   label: string;
   description: string;
   promptSnippet?: string;
-  promptGuidelines?: string;
+  /**
+   * MUST be an array. pi's codemode calls `guidelines.flatMap(...)` directly
+   * (`dist/extensions/codemode/tool.js`), so a bare string throws
+   * "guidelines.flatMap is not a function" and the system prompt renders one
+   * bullet per CHARACTER. See issue #19.
+   */
+  promptGuidelines?: string[];
   /** Plain JSON Schema object — NOT typebox. */
   parameters: JsonSchema;
   execute: ToolExecuteFn;
