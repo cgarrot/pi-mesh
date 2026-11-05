@@ -50,6 +50,18 @@ import { PendingReplies } from "./pending.js";
 import { capTargetName, type MeshTaskPackage } from "../protocol/task-package.js";
 import { backoffMs, ensureBroker } from "./reconnect.js";
 
+/** A consumer callback failed after the transport accepted the client.
+ * This instance is terminal; recovery requires a fresh MeshClient. */
+export class MeshCallbackError extends Error {
+  readonly code = "callback_failed";
+  readonly event = "ready";
+
+  constructor(cause: unknown) {
+    super("callback_failed: ready", { cause });
+    this.name = "MeshCallbackError";
+  }
+}
+
 export interface WelcomeInfo {
   alias: string;
   rooms: string[];
@@ -349,6 +361,7 @@ export class MeshClient extends EventEmitter {
 
   private socket: Socket | null = null;
   private online = false;
+  private callbackFailure: MeshCallbackError | null = null;
   /** B: broker protocol version from the last welcome (absent = legacy 1). */
   private brokerProtoValue = 1;
   private intentionallyClosed = false;
@@ -874,6 +887,7 @@ export class MeshClient extends EventEmitter {
   // ---- connection lifecycle ----
 
   connect(): Promise<WelcomeInfo> {
+    if (this.callbackFailure !== null) return Promise.reject(this.callbackFailure);
     if (this.online && this.socket) {
       return Promise.resolve({
         alias: this.alias,
@@ -920,6 +934,7 @@ export class MeshClient extends EventEmitter {
         this.involuntaryClose = false;
         return welcome;
       } catch (err) {
+        if (err instanceof MeshCallbackError) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         if (!msg.includes("alias_taken")) throw err;
         if (attempt < attempts) {
@@ -943,8 +958,9 @@ export class MeshClient extends EventEmitter {
           // one, not the same two claimants looping: re-arm the fallback.
           this.aliasFallbackDone = false;
           return welcome;
-        } catch {
+        } catch (fallbackError) {
           this.aliasFallbackDone = false;
+          if (fallbackError instanceof MeshCallbackError) throw fallbackError;
           throw err; // surface the original alias_taken
         }
       }
@@ -952,6 +968,7 @@ export class MeshClient extends EventEmitter {
   }
 
   private async doConnect(): Promise<WelcomeInfo> {
+    if (this.callbackFailure !== null) throw this.callbackFailure;
   // explicit broker URL (tcp/tls/unix) → connect there; otherwise the
   // local auto-spawned broker (ensureBroker).
     const endpoint = this.config.brokerUrl !== undefined ? parseEndpoint(this.config.brokerUrl) : null;
@@ -974,12 +991,12 @@ export class MeshClient extends EventEmitter {
       const sockPath = await ensureBroker(this.runtimeDir); // throws broker_unavailable
       socket = net.createConnection(sockPath);
     }
-    if (this.userClosed) {
+    if (this.userClosed || this.callbackFailure !== null) {
       // close() raced this in-flight connect (a session disposed while its
       // initial connect was still handshaking) — never resurrect a closed
       // client: the socket would stay open forever on both sides.
       socket.destroy();
-      throw new Error("shutting_down");
+      throw this.callbackFailure ?? new Error("shutting_down");
     }
     this.socket = socket;
     this.debug(`doConnect: socket created → ${this.config.brokerUrl ?? "local unix"}`);
@@ -1087,8 +1104,51 @@ export class MeshClient extends EventEmitter {
     this.startHeartbeat();
     this.startWatchdog();
     this.flushOutbox();
-    this.emit("ready", welcome);
+    // Only consumer execution belongs to this boundary. Transport errors
+    // still take the existing retry path; callback errors must never do so.
+    try {
+      this.emit("ready", welcome);
+    } catch (cause) {
+      throw this.failReadyCallback(cause, socket);
+    }
     return welcome;
+  }
+
+  private failReadyCallback(cause: unknown, socket: Socket): MeshCallbackError {
+    const error = new MeshCallbackError(cause);
+    this.callbackFailure = error;
+    this.intentionallyClosed = true;
+    this.userClosed = true;
+    this.online = false;
+    if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    if (this.helloTimer !== null) clearTimeout(this.helloTimer);
+    this.helloTimer = null;
+    this.stopHeartbeat();
+    this.stopWatchdog();
+    // Keep the accepted socket in scope even if a listener called close().
+    socket.destroy();
+    this.socket?.destroy();
+    this.socket = null;
+    this.outbox.length = 0;
+    this.pending.cancelAll(error.code);
+    for (const waiters of [this.ackWaiters, this.statusWaiters, this.leaseWaiters, this.ctlWaiters]) {
+      for (const [id, waiter] of waiters) {
+        clearTimeout(waiter.timer);
+        waiter.resolve(buildFrame({ type: "error", code: "shutting_down", id }));
+      }
+      waiters.clear();
+    }
+    // Not EventEmitter's special `error` event. Isolate each reporter so a
+    // faulty diagnostic listener cannot prevent adapter teardown or cleanup.
+    for (const listener of this.rawListeners("callback_error")) {
+      try {
+        listener.call(this, error);
+      } catch {
+        // Cleanup already completed; preserve the original callback cause.
+      }
+    }
+    return error;
   }
 
   /** Post-handshake wiring: frames dispatched, close → reconnect w/ backoff. */
@@ -1098,6 +1158,7 @@ export class MeshClient extends EventEmitter {
   }
 
   private onSocketClosed(closedSocket?: Socket): void {
+    if (this.callbackFailure !== null) return;
     this.debug(`onSocketClosed: online=${this.online} stale=${closedSocket !== undefined && this.socket !== closedSocket}`);
   // An explicit connect is in flight — it owns the socket lifecycle.
     if (this.connecting) {
@@ -1137,7 +1198,8 @@ export class MeshClient extends EventEmitter {
     const delay = backoffMs(this.reconnectAttempt);
     this.reconnectAttempt += 1;
     this.reconnectTimer = setTimeout(() => {
-      this.connect().catch(() => {
+      this.connect().catch((err: unknown) => {
+        if (err instanceof MeshCallbackError) return;
   // ensureBroker/connect failed → onSocketClosed not called (no socket);
   // schedule next attempt via the same backoff path.
         this.onSocketClosed();
@@ -1152,6 +1214,7 @@ export class MeshClient extends EventEmitter {
   }
 
   private onFrame(frame: MeshFrame): void {
+    if (this.callbackFailure !== null) return;
     this.ring(frame);
     switch (frame.type) {
       case "lease": {
@@ -1446,6 +1509,7 @@ export class MeshClient extends EventEmitter {
   }
 
   private writeOrQueue(frame: MeshFrame): void {
+    if (this.callbackFailure !== null) return;
     if (this.online && this.socket && !this.socket.destroyed) {
       this.socket.write(encodeFrame(frame, this.config.maxFrameBytes));
     } else if (this.outbox.length < OUTBOX_FLUSH_CAP) {
@@ -2004,14 +2068,15 @@ export class MeshClient extends EventEmitter {
     | { ok: true; alias: string; unchanged?: boolean }
     | { ok: false; reason: string }
   > {
+    if (this.callbackFailure !== null) return { ok: false, reason: this.callbackFailure.code };
     const target = normalizeAlias(newAlias);
     if (!isValidAlias(target)) return { ok: false, reason: "invalid_alias" };
     if (target === this.aliasInternal) return { ok: true, alias: target, unchanged: true };
     if (!this.online) {
       try {
         await this.connect();
-      } catch {
-        return { ok: false, reason: "broker_unavailable" };
+      } catch (err) {
+        return { ok: false, reason: err instanceof MeshCallbackError ? err.code : "broker_unavailable" };
       }
     }
     const oldAlias = this.aliasInternal;
@@ -2055,6 +2120,7 @@ export class MeshClient extends EventEmitter {
         lastErr = undefined;
         break;
       } catch (err) {
+        if (err instanceof MeshCallbackError) return { ok: false, reason: err.code };
         lastErr = err;
         const msg = err instanceof Error ? err.message : String(err);
         if (!msg.includes("alias_taken") || attempt >= ALIAS_RETRY_ATTEMPTS) break;
