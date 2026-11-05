@@ -394,6 +394,7 @@ export class MeshClient extends EventEmitter {
    *  LAUNCH answers skip session injection (the verdict carries that
    *  batch). */
   private waitAllInFlight = 0;
+  private readonly cancelWaitAll = new Set<() => void>();
   /** Memory-only ring buffer of last frames (bodies included) for mesh_history. */
   readonly transcript: MeshFrame[] = [];
   /** Own file reservations — declared at hello, updated via reserve/release. */
@@ -631,9 +632,12 @@ export class MeshClient extends EventEmitter {
     this.waitAllInFlight += 1; // answers arriving now are carried by the verdict
     return new Promise((resolve) => {
       let settled = false;
+      let pollTimer: NodeJS.Timeout | null = null;
       const done = (status: "complete" | "timeout" | "cancelled"): void => {
         if (settled) return;
         settled = true;
+        if (pollTimer !== null) clearTimeout(pollTimer);
+        this.cancelWaitAll.delete(onAbort);
         this.waitAllInFlight -= 1;
         if (signal !== undefined) signal.removeEventListener("abort", onAbort);
         if (status !== "cancelled") {
@@ -657,6 +661,11 @@ export class MeshClient extends EventEmitter {
         resolve(this.summarize(start, status, targetList));
       };
       const onAbort = (): void => done("cancelled");
+      this.cancelWaitAll.add(onAbort);
+      if (this.callbackFailure !== null) {
+        done("cancelled");
+        return;
+      }
       if (signal !== undefined) {
         if (signal.aborted) {
           done("cancelled");
@@ -665,6 +674,7 @@ export class MeshClient extends EventEmitter {
         signal.addEventListener("abort", onAbort, { once: true });
       }
       const tick = (): void => {
+        if (settled) return;
         const missing = targetList.filter((id) => this.awaitedMissions.get(id)?.answered !== true);
         if (missing.length === 0) {
           done("complete");
@@ -674,8 +684,8 @@ export class MeshClient extends EventEmitter {
           done("timeout");
           return;
         }
-        const t = setTimeout(tick, 200);
-        t.unref();
+        pollTimer = setTimeout(tick, 200);
+        pollTimer.unref();
       };
       tick();
     });
@@ -1132,6 +1142,13 @@ export class MeshClient extends EventEmitter {
     this.socket = null;
     this.outbox.length = 0;
     this.pending.cancelAll(error.code);
+    for (const mission of this.awaitedMissions.values()) {
+      if (mission.status !== "waiting") continue;
+      mission.status = "failed";
+      mission.response = error.code;
+    }
+    this.awaitTargets.clear();
+    for (const cancel of this.cancelWaitAll) cancel();
     for (const waiters of [this.ackWaiters, this.statusWaiters, this.leaseWaiters, this.ctlWaiters]) {
       for (const [id, waiter] of waiters) {
         clearTimeout(waiter.timer);
@@ -1143,7 +1160,9 @@ export class MeshClient extends EventEmitter {
     // faulty diagnostic listener cannot prevent adapter teardown or cleanup.
     for (const listener of this.rawListeners("callback_error")) {
       try {
-        listener.call(this, error);
+        void Promise.resolve(listener.call(this, error)).catch(() => {
+          // Async reporters are isolated too, without delaying teardown.
+        });
       } catch {
         // Cleanup already completed; preserve the original callback cause.
       }
@@ -2133,7 +2152,8 @@ export class MeshClient extends EventEmitter {
       this.intentionallyClosed = true;
       try {
         await this.connect();
-      } catch {
+      } catch (err) {
+        if (err instanceof MeshCallbackError) return { ok: false, reason: err.code };
   // broker down entirely — nothing more we can do
       }
       const detail = lastErr instanceof Error ? lastErr.message : String(lastErr);
