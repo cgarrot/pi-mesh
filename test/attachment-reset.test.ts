@@ -5,7 +5,7 @@ import { writeFileSync } from "node:fs";
 import path from "node:path";
 import meshExtension from "../src/extension/index.js";
 import { MeshClient } from "../src/client/client.js";
-import type { InboundMessage, SendMessageOptions, SessionContext, SessionHookHandler } from "../src/extension/pi-types.js";
+import type { InboundMessage, SendMessageOptions, SessionContext, SessionHookHandler, ToolDefinition } from "../src/extension/pi-types.js";
 import { makeTempDirs, sleep, startTestBroker, waitFor } from "./helpers.js";
 
 async function setup(t: TestContext) {
@@ -18,6 +18,10 @@ async function setup(t: TestContext) {
   process.env.MESH_STATE_DIR = dirs.stateDir;
   const observer = new MeshClient({ alias: "observer", runtimeDir: dirs.runtimeDir, config });
   const hooks = new Map<string, SessionHookHandler[]>();
+  const tools = new Map<string, ToolDefinition>();
+  const entries: string[] = [];
+  let entriesAfterFailure = 0;
+  let invalidated = false;
   let command: (args: string, ctx: SessionContext) => Promise<void>;
   const sent: { message: InboundMessage; options?: SendMessageOptions }[] = [];
   let paints = 0;
@@ -33,13 +37,16 @@ async function setup(t: TestContext) {
   const pi = {
     events,
     on: (event: string, fn: SessionHookHandler) => { hooks.set(event, [...hooks.get(event) ?? [], fn]); },
-    registerTool: () => {},
+    registerTool: (tool: ToolDefinition) => { tools.set(tool.name, tool); },
     registerCommand: (_name: string, spec: { handler: typeof command }) => { command = spec.handler; },
     sendMessage: (message: InboundMessage, options?: SendMessageOptions) => {
-      if (throwReady && message.customType === "mesh-context") { failures += 1; throw new Error("ready context unavailable"); }
+      if (throwReady && message.customType === "mesh-context") { failures += 1; invalidated = true; throw new Error("ready context unavailable"); }
       sent.push({ message, options });
     },
-    appendEntry: () => {},
+    appendEntry: (type: string) => {
+      entries.push(type);
+      if (invalidated) { entriesAfterFailure += 1; throw new Error("stale Pi entry interface"); }
+    },
   };
   meshExtension(pi as never);
   const fire = async (event: string, payload = {}) => {
@@ -67,8 +74,39 @@ async function setup(t: TestContext) {
     await waitFor(() => failures > 0 && observer.isOnline());
     throwReady = false;
   };
-  return { sent, hooks, ctx, observer, fire, fail, events, reset: () => command("reset", ctx), paints: () => paints, alias: () => alias };
+  return {
+    sent, hooks, ctx, observer, fire, fail, events, entries,
+    tool: (name: string, params: Record<string, unknown>, signal?: AbortSignal) => tools.get(name)!.execute("test-tool", params, signal, undefined, ctx),
+    entriesAfterFailure: () => entriesAfterFailure,
+    reset: () => { invalidated = false; return command("reset", ctx); },
+    paints: () => paints, alias: () => alias,
+  };
 }
+
+test("registered wait-all cancels after real ready failure without calling stale Pi verdict interface", async (t) => {
+  const f = await setup(t);
+  await f.tool("mesh_send", { to: "observer", message: "unanswered mission", awaitReply: true, block: false });
+  let result: Awaited<ReturnType<typeof f.tool>> | undefined;
+  const waiting = f.tool("mesh_wait_all", { timeoutMs: 60_000 }).then((value) => { result = value; });
+  await f.fail();
+  await waitFor(() => result !== undefined, 1500);
+  await waiting;
+  assert.equal(result!.details?.status, "cancelled");
+  assert.equal(f.entriesAfterFailure(), 0, "cancelled tool returns without touching invalid Pi interfaces");
+});
+
+test("registered wait-all preserves healthy verdict rendering but skips a replaced attachment", async (t) => {
+  const f = await setup(t);
+  await f.tool("mesh_wait_all", { timeoutMs: 100 });
+  assert.equal(f.entries.filter((type) => type === "mesh-verdict").length, 1);
+  await f.tool("mesh_send", { to: "observer", message: "old attachment mission", awaitReply: true, block: false });
+  const controller = new AbortController();
+  const waiting = f.tool("mesh_wait_all", { timeoutMs: 60_000 }, controller.signal);
+  await f.reset();
+  controller.abort();
+  assert.equal((await waiting).details?.status, "cancelled");
+  assert.equal(f.entries.filter((type) => type === "mesh-verdict").length, 1, "old tool completion cannot render in the replacement");
+});
 
 test("public reset restores HUD and aborted-batch recovery after terminal callback failure", async (t) => {
   const f = await setup(t);
