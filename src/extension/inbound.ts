@@ -2,6 +2,7 @@
 // normal → deliverAs followUp ; urgent → steer ; force → abort (when busy) + steer.
 // remind frames re-inject as reminder text. presence frames NEVER inject a turn
 // (they are handled via pi.appendEntry in index.ts).
+import { AttachmentLifetime } from "./attachment-lifetime.js";
 import type { MeshFrame, MeshPriority } from "../protocol/envelope.js";
 import { taskPackageSummary } from "../protocol/task-package.js";
 import { INJECTION_RETRY_MS, INTERRUPT_IDLE_MAX_MS, INTERRUPT_REABORT_AFTER_MS, INTERRUPT_REABORT_MAX } from "../shared/config.js";
@@ -29,6 +30,9 @@ export interface InterruptReport {
 }
 
 export interface InjectOpts extends FormatOpts {
+  lifetime?: AttachmentLifetime;
+  /** Receipt only after the host actually accepts the message, not on enqueue. */
+  onDelivered?: () => void;
   replyChain?: boolean;
   /** Called once the interrupt handling concludes (delivery done). */
   onInterruptReport?: (report: InterruptReport) => void;
@@ -219,22 +223,27 @@ export function deliverWhenIdle(
   pi: Pick<ExtensionAPI, "sendMessage">,
   ctx: SessionContext,
   frame: MeshFrame,
-  opts: FormatOpts = {},
+  opts: InjectOpts = {},
   pollMs: number = FORCE_IDLE_POLL_MS,
   maxMs: number = FORCE_IDLE_MAX_MS,
 ): void {
   const message = buildInboundMessage(frame, opts);
   const deadline = Date.now() + maxMs;
-  let sent = false;
+  const task = opts.lifetime?.fork() ?? new AttachmentLifetime();
   const trySend = (): void => {
-    if (sent) return;
-    if ((typeof ctx.isIdle === "function" && ctx.isIdle()) || Date.now() >= deadline) {
-      sent = true;
-      pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
-      return;
+    if (!task.active) return;
+    try {
+      if ((typeof ctx.isIdle === "function" && ctx.isIdle()) || Date.now() >= deadline) {
+        if (!task.active) return;
+        pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+        if (task.active) opts.onDelivered?.();
+        task.stop();
+        return;
+      }
+      task.after(pollMs, trySend);
+    } catch {
+      task.stop(); // the host stopped accepting work; no receipt or retry
     }
-    const t = setTimeout(trySend, pollMs);
-    t.unref();
   };
   trySend();
 }
@@ -252,6 +261,8 @@ export function injectInbound(
   opts: InjectOpts = {},
 ): InjectedInbound {
   const priority: MeshPriority = frame.priority ?? "normal";
+  const active = (): boolean => opts.lifetime?.active !== false;
+  if (!active()) return { message: buildInboundMessage(frame, opts), deliverAs: mapReplyDelivery(frame), aborted: false };
   if (
     frame.type === "msg" &&
     frame.interrupt === true &&
@@ -273,6 +284,7 @@ export function injectInbound(
         : mapReplyDelivery(frame);
   if (isReceipt) {
     pi.sendMessage(buildInboundMessage(frame, opts), { triggerTurn: false, deliverAs: "followUp" });
+    opts.onDelivered?.();
     return { message: buildInboundMessage(frame, opts), deliverAs, aborted: false };
   }
   let aborted = false;
@@ -284,6 +296,7 @@ export function injectInbound(
     typeof ctx.isIdle === "function" &&
     !ctx.isIdle()
   ) {
+    if (!active()) return { message: buildInboundMessage(frame, opts), deliverAs, aborted };
     ctx.abort();
     aborted = true;
   // Defer the send until the aborted run settles: the host may purge its
@@ -293,6 +306,7 @@ export function injectInbound(
     return { message: buildInboundMessage(frame, opts), deliverAs: "steer", aborted };
   }
   pi.sendMessage(buildInboundMessage(frame, opts), { triggerTurn: true, deliverAs });
+  opts.onDelivered?.();
   return { message: buildInboundMessage(frame, opts), deliverAs, aborted };
 }
 
@@ -432,89 +446,71 @@ function deliverInterrupted(
   opts: InjectOpts,
 ): InjectedInbound {
   const message = buildInboundMessage(frame, opts);
+  const task = opts.lifetime?.fork() ?? new AttachmentLifetime();
   const report = (outcome: InterruptOutcome, aborts: number, settledMs: number): void => {
-    try {
-      opts.onInterruptReport?.({ outcome, aborts, settledMs });
-    } catch {
-      // reporting is best-effort — delivery already happened
-    }
-  };
-  const deliver = (): void => {
-    pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
-  };
-
-  // "Never throws" holds for the ASYNC path too: aborts and deliveries run
-  // inside timer callbacks the caller's guarded() can never catch — a host
-  // tearing down mid-poll must degrade to the next tick, not crash pi.
-  const safeAbort = (): boolean => {
-    try {
-      c.abort();
-      return true;
-    } catch {
-      return false; // stale host — keep polling, the deadline bounds us
-    }
+    if (!task.active) return;
+    try { opts.onInterruptReport?.({ outcome, aborts, settledMs }); } catch { /* best effort */ }
   };
   const safeDeliver = (): void => {
+    if (!task.active) return;
     try {
-      deliver();
-    } catch {
-      // stale ctx — nothing more we can do; the report still fires
-    }
+      pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+      if (task.active) opts.onDelivered?.();
+    } catch { /* host refused delivery; never claim read */ }
   };
+  const result = (aborted: boolean): InjectedInbound => ({ message, deliverAs: "steer", aborted });
+  if (!task.active) return result(false);
   const canAbort = ctx !== null && typeof ctx.abort === "function" && typeof ctx.isIdle === "function";
   if (!canAbort) {
-    // No abort surface on this host (mode-dependent): the message still
-    // goes out as a steer, queued behind whatever is running — said as is.
     safeDeliver();
     report("abort_unavailable", 0, 0);
-    return { message, deliverAs: "steer", aborted: false };
+    task.stop();
+    return result(false);
   }
   const c = ctx as SessionContext & { abort(): void; isIdle(): boolean };
-
-  // first abort — guarded by a fresh !isIdle check (tiny settle race)
+  const safeAbort = (): boolean => {
+    if (!task.active) return false;
+    try { c.abort(); return true; } catch { return false; }
+  };
   let aborts = 0;
   if (c.isIdle()) {
     safeDeliver();
     report("already_idle", 0, 0);
-    return { message, deliverAs: "steer", aborted: false };
+    task.stop();
+    return result(false);
   }
   if (safeAbort()) aborts += 1;
 
-  // bounded re-aborts (swallowed aborts happen at end-of-turn races)
   const timings = opts.interruptTimings ?? {};
   const pollMs = timings.pollMs ?? FORCE_IDLE_POLL_MS;
   const maxMs = timings.maxMs ?? INTERRUPT_IDLE_MAX_MS;
   const reabortAfterMs = timings.reabortAfterMs ?? INTERRUPT_REABORT_AFTER_MS;
   const reabortMax = timings.reabortMax ?? INTERRUPT_REABORT_MAX;
-  const reabortTimers: NodeJS.Timeout[] = [];
   for (let i = 1; i <= reabortMax; i += 1) {
-    const t = setTimeout(() => {
-      if (!c.isIdle()) {
-        if (safeAbort()) aborts += 1;
-      }
-    }, reabortAfterMs * i);
-    t.unref();
-    reabortTimers.push(t);
+    task.after(reabortAfterMs * i, () => {
+      try {
+        if (!c.isIdle() && safeAbort()) aborts += 1;
+      } catch { task.stop(); }
+    });
   }
-
   const start = Date.now();
-  let finished = false;
   const finish = (): void => {
-    if (finished) return;
-    finished = true;
-    clearInterval(poll);
-    clearTimeout(cap);
-    for (const t of reabortTimers) clearTimeout(t);
-    safeDeliver();
-    report(c.isIdle() ? "aborted" : "still_busy", aborts, Date.now() - start);
+    if (!task.active) return;
+    try {
+      const idle = c.isIdle();
+      safeDeliver();
+      report(idle ? "aborted" : "still_busy", aborts, Date.now() - start);
+    } finally { task.stop(); }
   };
-  const poll = setInterval(() => {
-    if (c.isIdle() || Date.now() - start >= maxMs) finish();
-  }, pollMs);
-  poll.unref();
-  // safety cap: never run past the deadline even if isIdle keeps flipping
-  const cap = setTimeout(finish, maxMs + pollMs);
-  cap.unref();
-
-  return { message, deliverAs: "steer", aborted: true };
+  const poll = (): void => {
+    try {
+      if (c.isIdle() || Date.now() - start >= maxMs) finish();
+      else task.after(pollMs, poll);
+    } catch { task.stop(); }
+  };
+  task.after(pollMs, poll);
+  task.after(maxMs + pollMs, () => {
+    try { finish(); } catch { task.stop(); }
+  });
+  return result(true);
 }

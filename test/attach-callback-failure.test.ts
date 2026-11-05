@@ -1,3 +1,5 @@
+import { EventEmitter } from "node:events";
+import { handleCtlFrame } from "../src/extension/ctl.js";
 import test, { type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { MeshCallbackError, MeshClient } from "../src/client/client.js";
@@ -11,11 +13,17 @@ import { makeTempDirs, sleep, startTestBroker, waitFor } from "./helpers.js";
 
 async function setup(t: TestContext) {
   const dirs = makeTempDirs("adapter-callback-");
-  const broker = await startTestBroker(dirs.runtimeDir, { stateDir: dirs.stateDir });
+  const broker = await startTestBroker(dirs.runtimeDir, { stateDir: dirs.stateDir, policy: { forceAllowedFrom: ["sender"] } });
   const client = new MeshClient({
     alias: "subject", runtimeDir: dirs.runtimeDir,
     config: { brokerUrl: `unix://${broker.socketPath}`, debug: false, inboundBatchMs: 30, inboundBatchMaxHoldMs: 100, inboundBroadcasts: "deferred" },
   });
+  let sender: MeshClient | undefined;
+  const sendForce = async (interrupt: boolean) => {
+    sender = new MeshClient({ alias: "sender", runtimeDir: dirs.runtimeDir, config: { brokerUrl: `unix://${broker.socketPath}`, debug: false } });
+    await sender.connect();
+    return sender.send({ to: client.alias, message: "force work", priority: "force", reason: "test", interrupt });
+  };
   const calls: string[] = [];
   let stale = false;
   let busyChecks = 0;
@@ -33,9 +41,12 @@ async function setup(t: TestContext) {
     },
   };
   const hooks = new Map<string, SessionHookHandler>();
+  const messages: { content: string }[] = [];
+  const events = new EventEmitter();
   const pi = {
+    events,
     on: (event: string, hook: SessionHookHandler) => { hooks.set(event, hook); },
-    sendMessage: () => touch("sendMessage"),
+    sendMessage: (message: { content: string }) => { touch("sendMessage"); messages.push(message); },
     appendEntry: () => touch("appendEntry"),
   };
   const rt = {
@@ -46,7 +57,8 @@ async function setup(t: TestContext) {
   } as unknown as MeshRuntime;
   const hud = new MeshHud({ getRuntime: () => rt });
   hud.attach(ctx);
-  attachClientListeners(pi as never, rt, () => hud, ctx, client, () => {});
+  let currentHud = hud;
+  attachClientListeners(pi as never, rt, () => currentHud, ctx, client, () => {});
   const reads: string[] = [];
   client.sendRead = (id: string) => { reads.push(id); };
   t.after(async () => {
@@ -58,12 +70,13 @@ async function setup(t: TestContext) {
     rt.batcher?.flushNow();
     hud.detach();
     await client.close();
+    await sender?.close();
     await broker.close();
     dirs.cleanup();
   });
   await client.connect();
   const frame = buildFrame({ type: "msg", from: "sender", to: "subject", room: "default", body: "work" });
-  return { client, rt, hud, hooks, ctx, calls, reads, frame, poison: () => { stale = true; }, busyChecks: () => busyChecks };
+  return { client, rt, hud, hooks, ctx, calls, reads, frame, pi, messages, sendForce, setHud: (next: MeshHud) => { currentHud = next; }, poison: () => { stale = true; }, busyChecks: () => busyChecks };
 }
 
 test("terminal ready failure discards queued adapter work without stale Pi calls or read receipts", async (t) => {
@@ -124,9 +137,12 @@ test("normal adapter batching still injects and acknowledges read on explicit fl
   const f = await setup(t);
   f.client.emit("inbound", f.frame);
   assert.deepEqual(f.reads, []);
+  const before = f.messages.length;
   f.rt.batcher!.flushNow();
   assert.deepEqual(f.reads, [f.frame.id]);
-  assert.ok(f.calls.includes("sendMessage"));
+  assert.equal(f.messages.length, before + 1);
+  assert.match(f.messages[before]!.content, /mesh batch/);
+  assert.ok(f.messages[before]!.content.includes(f.frame.body!));
 });
 
 test("one failed adapter cleanup hook cannot leave other teardown work active", async (t) => {
@@ -165,4 +181,73 @@ test("late failure of a replaced client does not tear down the replacement runti
   assert.equal(f.rt.injectionGuard.pending, true);
   assert.equal(f.rt.resendBatch, resend);
   assert.equal(stops, 0);
+});
+
+for (const interrupt of [false, true]) {
+  test(`pending force delivery is cancelled on callback failure (interrupt=${interrupt})`, async (t) => {
+    const f = await setup(t);
+    let idle = false;
+    f.ctx.isIdle = () => { f.calls.push("force-isIdle"); return idle; };
+    f.ctx.abort = () => { f.calls.push("force-abort"); };
+    assert.equal((await f.sendForce(interrupt)).status, "delivered");
+    await waitFor(() => f.calls.includes("force-abort"));
+    assert.deepEqual(f.reads, [], "pending delivery is not yet read");
+    f.client.once("ready", () => { throw new Error("terminal ready"); });
+    assert.deepEqual(await f.client.rename("renamed"), { ok: false, reason: "callback_failed" });
+    const before = [...f.calls];
+    const receipts = [...f.reads];
+    await sleep(interrupt ? 1700 : 200); // includes the interrupt re-abort deadline
+    idle = true;
+    await sleep(100);
+    assert.deepEqual(f.calls, before, "no poll, abort or injection after teardown");
+    assert.deepEqual(f.reads, receipts);
+  });
+}
+
+test("late failure suspends only the captured HUD, not a distinct runtime's live HUD", async (t) => {
+  const f = await setup(t);
+  const next = new MeshClient({ alias: "next" });
+  t.after(() => next.close());
+  const nextRt = { ...f.rt, client: next };
+  let paints = 0;
+  const nextHud = new MeshHud({ getRuntime: () => nextRt });
+  nextHud.attach({ ...f.ctx, ui: { ...f.ctx.ui, setWidget: () => { paints += 1; }, setStatus: () => {} } });
+  t.after(() => nextHud.detach());
+  f.setHud(nextHud);
+  f.client.emit("callback_error", new MeshCallbackError(new Error("old failure")));
+  const before = paints;
+  nextHud.refresh();
+  assert.equal(paints, before + 1);
+});
+
+test("in-flight redirect stops before stale context polling or injection", async (t) => {
+  const f = await setup(t);
+  let idle = false;
+  f.ctx.isIdle = () => { f.calls.push("ctl-isIdle"); return idle; };
+  f.ctx.abort = () => { f.calls.push("ctl-abort"); };
+  const pending = handleCtlFrame(f.rt, buildFrame({ type: "ctl", from: "sender", to: f.client.alias, action: "redirect", body: "redirect" }), f.pi, { settleTimeoutMs: 500 });
+  assert.ok(f.calls.includes("ctl-abort"));
+  f.client.emit("callback_error", new MeshCallbackError(new Error("terminal")));
+  const before = [...f.calls];
+  idle = true;
+  await pending;
+  assert.deepEqual(f.calls, before);
+});
+
+test("in-flight local control detaches its reply listener and never acks via replacement", async (t) => {
+  const f = await setup(t);
+  const frame = buildFrame({ type: "ctl", from: "sender", to: f.client.alias, action: "job_stop", target: "job-1" });
+  const pending = handleCtlFrame(f.rt, frame, f.pi, { localTimeoutMs: 500 });
+  const channel = `mesh-ctl:reply:${frame.id}`;
+  assert.equal(f.pi.events.listenerCount(channel), 1);
+  f.rt.markDetached!();
+  const next = new MeshClient({ alias: "next" });
+  t.after(() => next.close());
+  let acknowledgements = 0;
+  next.sendCtlAck = () => { acknowledgements += 1; };
+  f.rt.client = next;
+  f.pi.events.emit(channel, { status: "stopped" });
+  await pending;
+  assert.equal(acknowledgements, 0);
+  assert.equal(f.pi.events.listenerCount(channel), 0);
 });

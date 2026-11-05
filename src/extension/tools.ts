@@ -30,6 +30,9 @@ import type { MeshTranscript } from "./transcript.js";
 /** Shared per-session runtime, built at session_start (index.ts). */
 export interface MeshRuntime {
   client: MeshClient;
+  attachment?: import("./attachment-lifetime.js").AttachmentLifetime;
+  /** Reinstall client/session hooks when /mesh reset creates a fresh attachment. */
+  onAttach?: (lifetime: import("./attachment-lifetime.js").AttachmentLifetime) => void;
   ledger: MeshLedger;
   transcript: MeshTranscript;
   guards: MeshGuards;

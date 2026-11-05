@@ -54,6 +54,7 @@ describe("rate-limited inbound hold", () => {
     });
     await me.connect();
     const rt = {
+      client: me,
       ctx: { isIdle: () => true },
       rateLimitedUntil: Date.now() + 60_000, // provider is rejecting turns
     } as never;
@@ -84,7 +85,7 @@ describe("rate-limited inbound hold", () => {
       config: { inboundBatchMs: 0 },
     });
     await me.connect();
-    attachClientListeners(pi as never, { ctx: { isIdle: () => true } } as never, () => null, { isIdle: () => true } as never, me, () => {}, 0);
+    attachClientListeners(pi as never, { client: me, ctx: { isIdle: () => true } } as never, () => null, { isIdle: () => true } as never, me, () => {}, 0);
     await sender.send({ to: "rl-me2", message: "free" });
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(sent.length, 1, "normal delivery when not rate-limited");
