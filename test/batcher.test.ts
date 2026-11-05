@@ -119,3 +119,29 @@ describe("InboundBatcher (D40)", () => {
     assert.equal(flushes, 1, "urgent must not wait for max-hold when the agent turns busy");
   });
 });
+
+describe("InboundBatcher discard", () => {
+  it("cancels the pending short window without consulting the session or flushing", async () => {
+    let busyChecks = 0;
+    let flushes = 0;
+    const b = new InboundBatcher(20, 60, () => { busyChecks += 1; return true; }, () => { flushes += 1; });
+    b.push(msg());
+    b.discard();
+    b.discard();
+    assert.equal(b.pending, 0);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(busyChecks, 0);
+    assert.equal(flushes, 0);
+  });
+
+  it("normal flush still works after a discarded batch", () => {
+    const batches: MeshFrame[][] = [];
+    const b = new InboundBatcher(100, 200, () => false, (frames) => batches.push(frames));
+    b.push(msg());
+    b.discard();
+    const next = reply();
+    b.push(next);
+    b.flushNow();
+    assert.deepEqual(batches, [[next]]);
+  });
+});
