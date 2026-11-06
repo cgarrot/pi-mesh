@@ -30,6 +30,9 @@ import type { MeshTranscript } from "./transcript.js";
 /** Shared per-session runtime, built at session_start (index.ts). */
 export interface MeshRuntime {
   client: MeshClient;
+  attachment?: import("./attachment-lifetime.js").AttachmentLifetime;
+  /** Reinstall client/session hooks when /mesh reset creates a fresh attachment. */
+  onAttach?: (lifetime: import("./attachment-lifetime.js").AttachmentLifetime) => void;
   ledger: MeshLedger;
   transcript: MeshTranscript;
   guards: MeshGuards;
@@ -930,7 +933,9 @@ async function execMeshWaitAll(
     MAX_AWAIT_REPLY_TIMEOUT_MS,
     Math.max(MIN_AWAIT_REPLY_TIMEOUT_MS, typeof params.timeoutMs === "number" ? params.timeoutMs : 300_000),
   );
-  const res = await rt.client.waitAll(timeoutMs, signal);
+  const client = rt.client;
+  const attachment = rt.attachment;
+  const res = await client.waitAll(timeoutMs, signal);
   const head = `wait_all: ${res.answered}/${res.total} answered${res.status === "timeout" ? " (TIMEOUT)" : res.status === "cancelled" ? " (CANCELLED — ESC)" : ""} after ${formatElapsed(res.elapsedMs)}`;
   const lines = [head];
   for (const a of res.answers) {
@@ -938,8 +943,8 @@ async function execMeshWaitAll(
     lines.push(`  ✓ @${a.to}: ${body.slice(0, 140)}`);
   }
   for (const m of res.missing) {
-    const act = rt.client.activityOf(m.to)?.state;
-    const busyMs = rt.client.busyForMs(m.to);
+    const act = client.activityOf(m.to)?.state;
+    const busyMs = client.busyForMs(m.to);
     // ⚔ FIRST: the target DID talk to us since the mission went out, but
     // uncorrelated (a plain msg / a reply to another msgId — measured:
     // external relays answer missions via fresh sends). The answer may be
@@ -958,8 +963,9 @@ async function execMeshWaitAll(
     lines.push(`  ✗ @${m.to}: NOT ANSWERED (${m.msgId.slice(0, 18)})${uncorrelated}`);
   }
   if (res.total === 0) lines.push("  (no awaited missions — send with awaitReply: true first)");
-  // display the colored verdict entry (agent colors + agent-color backgrounds)
-  if (rt.appendEntry !== undefined) {
+  // Returning a cancelled result is safe; rendering through a stopped or
+  // replaced attachment is not. Keep completion bound to its originating client.
+  if (getRuntime() === rt && rt.client === client && rt.attachment === attachment && attachment?.active !== false && rt.appendEntry !== undefined) {
     try {
       rt.appendEntry("mesh-verdict", {
         head,

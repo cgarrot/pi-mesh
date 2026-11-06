@@ -251,13 +251,17 @@ async function cmdReset(
   ctx: SessionContext,
   pi: ExtensionAPI,
   getHud: () => MeshHud | null,
+  isCurrent: () => boolean,
 ): Promise<void> {
   // like /new (fresh alias, default rooms, no reservations) but stays in
   // this pi session, like /reload does for identity preservation.
-  const oldAlias = rt.client.alias;
+  const oldClient = rt.client;
+  const oldAlias = oldClient.alias;
+  const hud = getHud();
   rt.markDetached?.();
   // 1. leave the mesh cleanly (alias/rooms/reservations purged at the broker)
-  await rt.client.close().catch(() => {});
+  await oldClient.close().catch(() => {});
+  if (!isCurrent() || rt.client !== oldClient) return;
   // 2. factory-reset the persisted identity for this session (or SLOT)
   rt.identity.reset(rt.sessionId, rt.identityKey);
   // 3. spawn a fresh client in-place (same runtime object, re-attached)
@@ -269,18 +273,22 @@ async function cmdReset(
     config,
   });
   rt.client = fresh;
+  rt.ctx = ctx;
+  hud?.attach(ctx);
   rt.preferredAlias = config.alias !== undefined && config.alias !== "" ? config.alias : fresh.alias;
   attachClientListeners(pi, rt, getHud, ctx, fresh, (r) => {
     saveIdentityOf(r.identity, r);
   });
   try {
     await fresh.connect();
+    if (!isCurrent() || rt.client !== fresh) return;
     updateSessionName(pi, rt);
     notify(
       ctx,
       `mesh: identity reset — was @${oldAlias}, now @${fresh.alias} (rooms: ${fresh.rooms.join(",") || "default"})`,
     );
   } catch {
+    if (!isCurrent() || rt.client !== fresh || rt.attachment?.active === false) return;
     notify(ctx, "mesh: reset — broker unavailable, tools answer blocked");
   }
 }
@@ -492,8 +500,8 @@ export function registerCommands(
           await cmdNew(rt, ctx, rest.includes("--history") || rest.includes("history"));
           break;
         case "reset":
-          await cmdReset(rt, ctx, pi, getHud);
-          onChanged?.();
+          await cmdReset(rt, ctx, pi, getHud, () => getRuntime() === rt);
+          if (getRuntime() === rt && rt.attachment?.active !== false) onChanged?.();
           break;
         case "help":
         case undefined:
