@@ -17,7 +17,6 @@
 //
 // Migration: a legacy single-file <stateDir>/identity.json (v0.1.3-v0.1.7)
 // is read once and moved to the per-session file when its sessionId matches.
-import { isDerivedProjectRoomName } from "./project-room.js";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { nowIso } from "../protocol/frames.js";
@@ -49,6 +48,10 @@ export interface PersistedIdentity {
    */
   preferredAlias?: string;
   rooms: string[];
+  /** The derived project room recorded at save time (roomMode). Dropped on
+   *  load so a moved/renamed project leaves no ghost — an exact name is used
+   *  instead of a `proj.*` pattern so hand-typed rooms survive. */
+  projectRoom?: string;
   reservations: FileReservation[];
   updatedAt: string;
 }
@@ -67,6 +70,9 @@ export function identityFromClient(
     alias: string;
     rooms: readonly string[];
     reservations: readonly FileReservation[];
+    /** Present on a MeshClient (roomMode); optional so a bare stub in tests
+     *  keeps working. */
+    projectRoomName?: string;
   },
   preferredAlias?: string,
 ): PersistedIdentity {
@@ -77,11 +83,13 @@ export function identityFromClient(
     sessionId,
     alias: client.alias,
     ...(preferred !== undefined ? { preferredAlias: preferred } : {}),
-    // A derived project room is recomputed from the state dir on every start:
-    // persisting it would turn a moved/renamed project into a permanent ghost
-    // room (chooseInitialIdentity prefers the persisted list). Derived rooms
-    // are therefore excluded; user-named rooms are untouched.
-    rooms: client.rooms.filter((room) => !isDerivedProjectRoomName(room)),
+    // Rooms are persisted verbatim, including a derived project room. The
+    // derived NAME is recorded alongside so a later start can drop exactly
+    // that room (a moved/renamed project must not leave a ghost) without ever
+    // touching a room the user joined by hand — matching on a `proj.*` pattern
+    // would also discard hand-typed rooms and other projects' rooms.
+    rooms: [...client.rooms],
+    ...(client.projectRoomName !== undefined ? { projectRoom: client.projectRoomName } : {}),
     reservations: client.reservations.map((r) => ({ ...r })),
     updatedAt: nowIso(),
   };

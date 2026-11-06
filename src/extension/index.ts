@@ -17,7 +17,7 @@ import { handleCtlFrame } from "./ctl.js";
 import { renderLiveEntry, renderMeshInbound, renderVerdictEntry } from "./renderer.js";
 import type { PersistedIdentity } from "../shared/identity-store.js";
 import { chooseInitialIdentity, identityFromClient, MeshIdentity, saveIdentityOf } from "../shared/identity-store.js";
-import { resolveRoomScope } from "../shared/project-room.js";
+import { dropRecordedProjectRoom, resolveRoomScope } from "../shared/project-room.js";
 import { MeshLedger } from "./ledger.js";
 import type { ExtensionAPI } from "./pi-types.js";
 import { findConflict } from "../shared/reservations.js";
@@ -134,9 +134,14 @@ export default function meshExtension(pi: ExtensionAPI): void {
     // project room and keeps DEFAULT_ROOM, so cross-project directed messages
     // still resolve to a shared room while an untargeted broadcast stays
     // inside the project (issue #20).
+    // A previous start recorded the exact derived room it invented; drop that
+    // one (a moved project would otherwise keep a ghost) and keep everything
+    // the user actually asked for.
+    const roomsForScope = dropRecordedProjectRoom(choice.rooms, persisted?.projectRoom);
     const scope = resolveRoomScope({
       roomMode: config.roomMode,
-      rooms: choice.rooms,
+      rooms: roomsForScope,
+      persistedRooms: persisted !== null && persisted.rooms.length > 0,
       stateDir: sDir,
       ...(config.projectRoomName !== undefined ? { projectRoomName: config.projectRoomName } : {}),
       configuredRooms: config.rooms,
@@ -151,6 +156,20 @@ export default function meshExtension(pi: ExtensionAPI): void {
       runtimeDir: rDir,
       config,
     });
+    // A documented option that silently does nothing is worse than one that
+    // refuses: say it out loud, once, at session start (debug is disk-only and
+    // safe, the notify is guarded and best-effort).
+    if (scope.degraded !== undefined) {
+      const why =
+        scope.degraded === "pinned"
+          ? "roomMode ignored: a rooms pin ($MESH_ROOMS / roomsPinned) owns membership — add the project room to the pin to scope broadcasts"
+          : "roomMode ignored: maxRoomsPerPeer is already reached";
+      try {
+        ctx.ui?.notify?.(`pi-mesh: ${why}`, { level: "warning" });
+      } catch {
+        // a stale ctx must never break session_start
+      }
+    }
     const ledger = new MeshLedger(sDir, config.ledgerMaxBytes);
     const transcript = new MeshTranscript(sDir, config.transcript, config.transcriptRetentionDays);
     const guards = new MeshGuards();
@@ -162,6 +181,12 @@ export default function meshExtension(pi: ExtensionAPI): void {
       ctx,
       stateDir: sDir,
       runtimeDir: rDir,
+      roomScope: {
+        mode: config.roomMode,
+        ...(scope.projectRoom !== undefined ? { projectRoom: scope.projectRoom } : {}),
+        broadcastRoom: scope.broadcastRoom,
+        ...(scope.degraded !== undefined ? { degraded: scope.degraded } : {}),
+      },
       sessionId,
       identity,
       preferredAlias: choice.preferredAlias ?? client.alias,

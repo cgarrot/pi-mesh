@@ -6,6 +6,7 @@ import { say } from "../out.js";
 import { EXIT_OK } from "../codes.js";
 import { loadConfig } from "../../shared/config.js";
 import { brokerSocketPath, configPath, ledgerPath, policyPath, runtimeDir, stateDir } from "../../shared/paths.js";
+import { deriveProjectRoom } from "../../shared/project-room.js";
 
 export const CONFIG_USAGE = "usage: mesh config show";
 
@@ -38,6 +39,8 @@ export async function cmdConfigShow(): Promise<number> {
     ["watchdog", cfg.watchdog ? "on" : "off"],
     ["tls", `cert=${cfg.tlsCert ?? "-"} key=${cfg.tlsKey ?? "-"} ca=${cfg.tlsCa ?? "-"} insecure=${cfg.tlsInsecure === true ? "YES" : "no"}`],
     ["maxRoomsPerPeer", String(cfg.maxRoomsPerPeer)],
+    ["roomMode", cfg.roomMode],
+    ["projectRoom", cfg.projectRoomName ?? `derived (${deriveProjectRoom(stateDir())})`],
     ["inboundBatchMaxHoldMs", String(cfg.inboundBatchMaxHoldMs)],
     ["contextVerbosity", cfg.contextVerbosity ?? "compact"],
     ["inboundBroadcasts", cfg.inboundBroadcasts ?? "immediate"],

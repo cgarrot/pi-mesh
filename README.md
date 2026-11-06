@@ -319,6 +319,46 @@ Full guide: `docs/capability-routing.md`.
   blip. A room absent from the map falls back to `role ?? "member"` (old
   clients); an out-of-enum role is rejected as `invalid_frame`.
 
+### Project scope: where an untargeted broadcast goes (`roomMode`)
+
+A mesh on a shared broker puts **every project on the machine into one room**,
+so an untargeted `broadcast` used to reach agents working on unrelated
+projects. `roomMode` adds a room derived from the project:
+
+```json
+{ "roomMode": "both" }   // "default" | "project" | "both"  — default: "both"
+```
+
+| `roomMode` | rooms joined | untargeted broadcast goes to |
+|---|---|---|
+| `"default"` | as before | `default` (whole machine) — the escape hatch |
+| `"project"` | + `proj.<name>.<hash>`, **no** `default` | the project room |
+| `"both"` (default) | + project room **and** `default` | the project room |
+
+- **Membership is ADDED, never replaced, in `both`.** The broker refuses a
+  directed message unless sender and target share a room (`not_member`), so
+  scoping by project *instead of* `default` would silently break cross-project
+  DMs. In `both`, `mesh_send({ to })` works exactly as before.
+- **`room: "default"` is still the loud, explicit mode** in every mode.
+- `mesh_status` prints where a broadcast would land, and `mesh_send` echoes
+  `in room proj.…` — a scope is never inferred.
+- The derived name comes from the **state dir** (`$MESH_STATE_DIR` or
+  `<cwd>/.mesh`, canonicalised), so a session started in a subdirectory stays
+  in the same project room. Override it with `projectRoomName` /
+  `$MESH_PROJECT_ROOM`.
+- **`roomMode: "project"` is expert mode**: it drops `default`, so directed
+  messages to other projects fail honestly with `not_member`.
+- **A `rooms` pin wins over `roomMode`.** `$MESH_ROOMS` / `"roomsPinned": true`
+  is a launcher placing an agent in a room *for good*; `roomMode` then does
+  nothing and says so (left out of `mesh_status`'s scope line and announced at
+  session start). To scope broadcasts under a pin, put the project room in the
+  pin itself.
+- **Multi-machine**: the name is derived from the path, so the same project at
+  a different path on another machine gets a different room and fan-outs stop
+  crossing machines. Set `projectRoomName` to a shared value when that matters.
+- `/mesh leave default` is respected: leaving it is not undone by the next
+  start in `both` mode.
+
 ## Control plane (`ctl`)
 
 `mesh_abort` / `mesh_redirect` / `mesh_job_control` / `mesh_run_control` let an
@@ -385,6 +425,7 @@ Precedence: defaults < config file < environment.
 ```jsonc
 { "alias": "alice", "rooms": ["default"], "transcript": false,
   "identityKey": "aso12", "roomsPinned": false,
+  "roomMode": "both", "projectRoomName": "proj.alice.4f2a91",
   "mailboxCap": 100, "mailboxTtlMs": 3600000, "ledgerMaxBytes": 5242880,
   "activityIdleMs": 120000, "activityStuckMs": 900000,
   "reservationTtlMs": 21600000,

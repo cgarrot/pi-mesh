@@ -1480,6 +1480,12 @@ export class MeshClient extends EventEmitter {
     return this.joinedRooms.has(DEFAULT_ROOM) ? DEFAULT_ROOM : [...this.joinedRooms][0];
   }
 
+  /** The derived project room this client was built with, if any (persisted
+   *  so a later start can drop exactly this room instead of guessing). */
+  get projectRoomName(): string | undefined {
+    return this.projectRoom;
+  }
+
   /** Room an untargeted broadcast would use — surfaced so a caller is never
    *  silently scoped (mesh_status, mesh_send result). */
   get broadcastRoom(): string | undefined {

@@ -35,6 +35,9 @@ export interface MeshRuntime {
   guards: MeshGuards;
   ctx: SessionContext | null;
   stateDir: string;
+  /** Resolved roomMode scope (index.ts). Surfaced by mesh_status so a scope
+   *  that could not apply (pin / room cap) is visible, never a silent no-op. */
+  roomScope?: { mode: string; projectRoom?: string; broadcastRoom: string; degraded?: string };
   runtimeDir: string;
   /** Pi session id — stable across /reload (identity key). */
   sessionId: string;
@@ -725,8 +728,19 @@ async function execMeshStatus(
   const localVersion = MESH_VERSION;
   // missions FIRST: the summary line needs them (likely-done inference)
   const missions = rt.client.missionStatus();
+  // Scope must be visible, never inferred: an agent that cannot see where an
+  // untargeted broadcast lands will believe it reached everyone (issue #20).
+  const broadcastRoom = rt.client.broadcastRoom;
+  const scopeInfo = rt.roomScope;
+  const scope =
+    broadcastRoom === undefined
+      ? "scope: unknown"
+      : `scope: mode=${scopeInfo?.mode ?? "?"} broadcast → room ${broadcastRoom}${
+          broadcastRoom === DEFAULT_ROOM ? " (whole machine)" : " (project)"
+        }${scopeInfo?.degraded !== undefined ? ` ⚠ roomMode NOT applied (${scopeInfo.degraded})` : ""}`;
   const lines = [
     `mesh status — alias @${rt.client.alias}${room !== undefined ? ` room=${room}` : ""} (my rooms: ${rt.client.rooms.join(",") || "none"})`,
+    scope,
     `peers (${peers.length}):`,
     ...peers.map((p) => {
       const v = p.clientVersion !== undefined && p.clientVersion !== "" ? ` v${p.clientVersion}` : " v?";
@@ -1407,6 +1421,7 @@ export function registerTools(pi: ExtensionAPI, getRuntime: GetRuntime): void {
       "for an explicit mesh_reply; otherwise expired after timeoutMs.",
     promptSnippet: "Message another local agent over mesh (delivered ≠ read ≠ answered).",
     promptGuidelines: [
+      "An untargeted broadcast goes to YOUR PROJECT room only (roomMode) — pass room: \"default\" to reach the whole machine; mesh_status shows where a broadcast lands.",
       "Use mesh_reply(msgId) to answer an inbound [mesh] message.",
       "priority=force requires reason and aborts the recipient turn.",
       "delivered/queued_offline are NOT completions.",

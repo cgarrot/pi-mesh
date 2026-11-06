@@ -17,6 +17,7 @@
 //   - Deterministic: the same state dir always yields the same room, or two
 //     sessions of the same project silently stop seeing each other.
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { basename, dirname } from "node:path";
 
 import { DEFAULT_MAX_ROOMS_PER_PEER, DEFAULT_ROOM, type RoomMode } from "./config.js";
@@ -56,6 +57,27 @@ export function projectRootOf(stateDir: string): string {
 }
 
 /**
+ * Canonicalise the state dir before hashing it.
+ *
+ * Without this, two sessions of the SAME project reached through different
+ * spellings (`/var/...` vs `/private/var/...` on macOS, a symlinked $PWD, a
+ * trailing slash) derive DIFFERENT rooms and stop seeing each other — silently,
+ * which is the worst failure mode for this feature. `stateDir()` does no
+ * canonicalisation of its own.
+ *
+ * Falls back to the raw string when the path does not exist (pure tests,
+ * not-yet-created dirs): determinism matters more than canonicality, and a
+ * nonexistent path cannot be spelled two ways in practice.
+ */
+export function canonicalStateDir(stateDir: string): string {
+  try {
+    return realpathSync(stateDir);
+  } catch {
+    return stateDir.replace(/[\\/]+$/, "") || stateDir;
+  }
+}
+
+/**
  * `proj.<slug>.<hex6>` — readable in mesh_status, collision-resistant across
  * different projects sharing a basename, and always ROOM_REGEX-valid.
  *
@@ -63,7 +85,7 @@ export function projectRootOf(stateDir: string): string {
  * cwd, so starting a session from a subdirectory keeps the same room.
  */
 export function deriveProjectRoom(stateDir: string): string {
-  const root = projectRootOf(stateDir);
+  const root = projectRootOf(canonicalStateDir(stateDir));
   const digest = createHash("sha256").update(root).digest("hex").slice(0, PROJECT_ROOM_HASH_CHARS);
   return `${PROJECT_ROOM_PREFIX}${slugifyProjectName(basename(root) || root)}.${digest}`;
 }
@@ -83,6 +105,18 @@ export function isDerivedProjectRoomName(room: string): boolean {
   return DERIVED_PROJECT_ROOM_REGEX.test(room);
 }
 
+/**
+ * True only for a room this project derived at an EARLIER path/name — the
+ * ghost a move leaves behind. Deliberately scoped to our own slug so a room
+ * somebody typed by hand (`proj.other.ab12cd`, or another project's derived
+ * name they joined on purpose) is never dropped.
+ */
+export function isStaleOwnProjectRoom(room: string, projectRoom: string): boolean {
+  if (room === projectRoom) return false;
+  const slug = projectRoom.slice(PROJECT_ROOM_PREFIX.length, projectRoom.lastIndexOf("."));
+  return room.startsWith(`${PROJECT_ROOM_PREFIX}${slug}.`);
+}
+
 export interface RoomScope {
   /** Rooms to join, in order. */
   rooms: string[];
@@ -90,8 +124,8 @@ export interface RoomScope {
   projectRoom?: string;
   /** Where an untargeted broadcast goes. */
   broadcastRoom: string;
-  /** Set when the project room could not be added (honest degradation). */
-  degraded?: "room_cap";
+  /** Why roomMode could not fully apply — surfaced, never a silent no-op. */
+  degraded?: "room_cap" | "pinned";
 }
 
 /**
@@ -112,6 +146,10 @@ export function resolveRoomScope(args: {
   projectRoomName?: string;
   configuredRooms?: readonly string[];
   maxRoomsPerPeer?: number;
+  /** The incoming list came from disk and was non-empty — an explicit
+   *  `/mesh leave default` must survive a restart. Without this, "both"
+   *  resurrects `default` on every start and silently undoes the leave. */
+  persistedRooms?: boolean;
   /** config.json "roomsPinned" / $MESH_ROOMS: an explicit pin is a launcher
    *  placing the agent in a room FOR GOOD. It wins over everything, including
    *  roomMode — adding a derived room on top of a pin would break the
@@ -122,20 +160,34 @@ export function resolveRoomScope(args: {
   const mode = args.roomMode ?? "both";
   const base = args.rooms.filter((room) => typeof room === "string" && room.trim() !== "");
 
+  // Legacy rule, also used when roomMode cannot apply: default if joined,
+  // else the first joined room. Never a project room.
+  const legacyBroadcastRoom = (list: readonly string[]): string =>
+    list.includes(DEFAULT_ROOM) ? DEFAULT_ROOM : (list[0] ?? DEFAULT_ROOM);
+
   if (mode === "default" || args.pinned === true) {
-    return { rooms: base.length > 0 ? base : [DEFAULT_ROOM], broadcastRoom: DEFAULT_ROOM };
+    const rooms = base.length > 0 ? base : [DEFAULT_ROOM];
+    return {
+      rooms,
+      broadcastRoom: legacyBroadcastRoom(rooms),
+      // A pin disables roomMode by design; say so instead of a silent no-op.
+      ...(args.pinned === true && mode !== "default" ? { degraded: "pinned" as const } : {}),
+    };
   }
 
   const projectRoom = args.projectRoomName ?? deriveProjectRoom(args.stateDir);
-  // Drop a stale derived room, but never a user-named one.
-  const cleaned = base.filter((room) => !isDerivedProjectRoomName(room) || room === projectRoom);
+  // Drop the ghost OUR project left at an earlier path — never a room the
+  // user joined by hand (another project's derived name, or a custom one).
+  const cleaned = base.filter((room) => !isStaleOwnProjectRoom(room, projectRoom));
   const rooms: string[] = [...cleaned];
 
   const configured = args.configuredRooms ?? [];
   const defaultIsConfigured = configured.includes(DEFAULT_ROOM);
+  // An explicit leave outranks the "both" membership guarantee.
+  const leftDefault = args.persistedRooms === true && !base.includes(DEFAULT_ROOM);
 
   if (mode === "both") {
-    if (!rooms.includes(DEFAULT_ROOM)) rooms.push(DEFAULT_ROOM);
+    if (!rooms.includes(DEFAULT_ROOM) && !leftDefault) rooms.push(DEFAULT_ROOM);
   } else if (!defaultIsConfigured) {
     // "project": strict isolation — default only survives if the user asked
     // for it explicitly in config.json rooms.
@@ -157,10 +209,25 @@ export function resolveRoomScope(args: {
     }
     return {
       rooms: trimmed.slice(0, Math.max(1, cap)),
-      broadcastRoom: trimmed.includes(DEFAULT_ROOM) ? DEFAULT_ROOM : (trimmed[0] ?? DEFAULT_ROOM),
+      broadcastRoom: legacyBroadcastRoom(trimmed),
       degraded: "room_cap",
     };
   }
 
   return { rooms, projectRoom, broadcastRoom: projectRoom };
+}
+
+/**
+ * Remove the derived room a PREVIOUS start recorded from the persisted list.
+ *
+ * Matching on the recorded NAME (not a `proj.*` pattern) is what makes this
+ * safe: a hand-typed room and another project's derived room both survive,
+ * while the ghost of a moved or renamed project is dropped exactly.
+ */
+export function dropRecordedProjectRoom(
+  rooms: readonly string[],
+  recordedProjectRoom: string | undefined,
+): string[] {
+  if (recordedProjectRoom === undefined) return [...rooms];
+  return rooms.filter((room) => room !== recordedProjectRoom);
 }
