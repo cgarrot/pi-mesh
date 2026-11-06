@@ -17,6 +17,7 @@
 //
 // Migration: a legacy single-file <stateDir>/identity.json (v0.1.3-v0.1.7)
 // is read once and moved to the per-session file when its sessionId matches.
+import { isDerivedProjectRoomName } from "./project-room.js";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { nowIso } from "../protocol/frames.js";
@@ -76,7 +77,11 @@ export function identityFromClient(
     sessionId,
     alias: client.alias,
     ...(preferred !== undefined ? { preferredAlias: preferred } : {}),
-    rooms: [...client.rooms],
+    // A derived project room is recomputed from the state dir on every start:
+    // persisting it would turn a moved/renamed project into a permanent ghost
+    // room (chooseInitialIdentity prefers the persisted list). Derived rooms
+    // are therefore excluded; user-named rooms are untouched.
+    rooms: client.rooms.filter((room) => !isDerivedProjectRoomName(room)),
     reservations: client.reservations.map((r) => ({ ...r })),
     updatedAt: nowIso(),
   };

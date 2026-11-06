@@ -180,6 +180,28 @@ export function normalizeCaps(input: readonly string[] | undefined): string[] {
   return out;
 }
 
+/**
+ * Parse a RoomMode. Unknown values fall back to the default instead of
+ * crashing a session over a typo — but they are never silently reinterpreted
+ * as another valid mode (`"projectt"` must not become `"project"`).
+ */
+export function normalizeRoomMode(raw: unknown): RoomMode {
+  if (typeof raw !== "string") return DEFAULT_ROOM_MODE;
+  const value = raw.trim().toLowerCase();
+  return (ROOM_MODES as readonly string[]).includes(value) ? (value as RoomMode) : DEFAULT_ROOM_MODE;
+}
+
+/**
+ * A user-supplied project room name must already satisfy ROOM_REGEX — a bad
+ * override is dropped (the derived name is used) rather than repaired into
+ * something the user did not ask for.
+ */
+export function normalizeProjectRoomName(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const name = raw.trim().toLowerCase();
+  return ROOM_REGEX.test(name) ? name : undefined;
+}
+
 /** Max entries in the target-side ctl allowlist. */
 export const MAX_CTL_ALLOW_FROM = 32;
 
@@ -200,6 +222,29 @@ export function normalizeCtlAllowFrom(input: unknown): string[] {
   return out;
 }
 
+
+// ---- Room scope (roomMode) ----
+/**
+ * Which rooms an agent joins, and where an untargeted broadcast goes.
+ *
+ *   "default"  configured rooms only — the pre-roomMode behaviour, and the
+ *              escape hatch for anyone relying on machine-wide broadcasts.
+ *   "project"  adds the derived project room and does NOT force "default":
+ *              strict isolation.
+ *   "both"     adds the derived project room AND keeps "default", so
+ *              cross-project DMs still resolve to a shared room while an
+ *              untargeted broadcast stays inside the project (issue #20).
+ *
+ * A derived room must never REPLACE membership: the broker refuses a directed
+ * message unless sender and target share a room (broker.ts, `not_member`), so
+ * partitioning agents by project would silently break cross-project talk.
+ */
+export type RoomMode = "default" | "project" | "both";
+
+export const ROOM_MODES: readonly RoomMode[] = ["default", "project", "both"];
+
+/** Quiet by default, loud on demand (`room: "default"` still reaches everyone). */
+export const DEFAULT_ROOM_MODE: RoomMode = "both";
 
 // ---- Identity defaults ----
 export const ALIAS_RAND_CHARS = 6;
@@ -240,6 +285,14 @@ export interface MeshConfig {
   *  a launcher can place an agent in a room for good. Without a pin the
   *  persisted (live) membership wins, so /mesh join|leave survive reloads. */
   roomsPinned?: boolean;
+  /** Room scope — see RoomMode. Default "both": a project room is added and
+   *  "default" is kept, so an untargeted broadcast stays inside the project
+   *  without breaking cross-project directed messages. */
+  roomMode: RoomMode;
+  /** Override the DERIVED project room name (config.json "projectRoomName" /
+   *  $MESH_PROJECT_ROOM). Useful when a project moves, is cloned to a
+   *  different path on another machine, or when the derivation collides. */
+  projectRoomName?: string;
   /** Named agent-slot identity (config.json "identityKey" / $MESH_IDENTITY_KEY):
    *  alias+rooms+reservations persist per SLOT instead of per pi session, so
    *  a restarted/new session keeps the agent's name and rooms. */
@@ -308,6 +361,7 @@ export interface MeshConfig {
 
 export const DEFAULT_CONFIG: MeshConfig = {
   rooms: [DEFAULT_ROOM],
+  roomMode: DEFAULT_ROOM_MODE,
   ctlAllowFrom: [],
   caps: [],
   maxFrameBytes: DEFAULT_MAX_FRAME_BYTES,
@@ -374,6 +428,10 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
         ? [...fileCfg.rooms]
         : [...DEFAULT_CONFIG.rooms],
     ...(fileCfg.roomsPinned === true ? { roomsPinned: true } : {}),
+    roomMode: normalizeRoomMode(fileCfg.roomMode),
+    ...(normalizeProjectRoomName(fileCfg.projectRoomName) !== undefined
+      ? { projectRoomName: normalizeProjectRoomName(fileCfg.projectRoomName) }
+      : {}),
     caps: normalizeCaps(Array.isArray(fileCfg.caps) ? fileCfg.caps : undefined),
     ctlAllowFrom: normalizeCtlAllowFrom(
       (fileCfg as Partial<MeshConfig> & { ctl?: { allowFrom?: unknown } }).ctl?.allowFrom,
@@ -463,6 +521,16 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
     // $MESH_ROOMS is a per-process PIN (a launcher placing an agent in a
     // room) — it must not be silently overridden by a stale identity file.
     cfg.roomsPinned = true;
+  }
+  const envRoomMode = env.MESH_ROOM_MODE;
+  if (envRoomMode !== undefined && envRoomMode.trim() !== "") {
+    const mode = normalizeRoomMode(envRoomMode.trim().toLowerCase());
+    cfg.roomMode = mode;
+  }
+  const envProjectRoom = env.MESH_PROJECT_ROOM;
+  if (envProjectRoom !== undefined && envProjectRoom.trim() !== "") {
+    const name = normalizeProjectRoomName(envProjectRoom.trim().toLowerCase());
+    if (name !== undefined) cfg.projectRoomName = name;
   }
   const envCaps = env.MESH_CAPS;
   if (envCaps !== undefined) {

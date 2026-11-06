@@ -115,21 +115,29 @@ function str(v: unknown): string | undefined {
   return typeof v === "string" && v.trim() !== "" ? v : undefined;
 }
 
+/** Broadcast scope, spelled out so a fan-out is never silently scoped: an
+ *  untargeted broadcast lands in the project room unless roomMode is
+ *  "default" or the caller asked for `room: "default"`. */
+function scopeText(res: SendResult): string {
+  if (res.status !== "delivered" && res.status !== "queued_offline") return "";
+  return res.room !== undefined ? ` in room ${res.room}` : "";
+}
+
 function resultText(res: SendResult): string {
   switch (res.status) {
     case "delivered": {
       const routed = res.routedTo !== undefined ? ` → @${res.routedTo}` : "";
       if (res.deliveredCount !== undefined && res.totalCount !== undefined) {
-        return `delivered ${res.msgId}${routed} (${res.deliveredCount}/${res.totalCount} online)`;
+        return `delivered ${res.msgId}${routed} (${res.deliveredCount}/${res.totalCount} online)${scopeText(res)}`;
       }
-      return `delivered ${res.msgId}${routed}`;
+      return `delivered ${res.msgId}${routed}${scopeText(res)}`;
     }
     case "queued_offline": {
       const routed = res.routedTo !== undefined ? ` → @${res.routedTo}` : "";
       if (res.deliveredCount !== undefined && res.totalCount !== undefined) {
-        return `queued_offline ${res.msgId}${routed} (${res.totalCount} targets offline)`;
+        return `queued_offline ${res.msgId}${routed} (${res.totalCount} targets offline)${scopeText(res)}`;
       }
-      return `queued_offline ${res.msgId}${routed}`;
+      return `queued_offline ${res.msgId}${routed}${scopeText(res)}`;
     }
     case "reply":
       return `reply ${res.msgId}: ${res.response}`;

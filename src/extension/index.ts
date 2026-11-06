@@ -17,6 +17,7 @@ import { handleCtlFrame } from "./ctl.js";
 import { renderLiveEntry, renderMeshInbound, renderVerdictEntry } from "./renderer.js";
 import type { PersistedIdentity } from "../shared/identity-store.js";
 import { chooseInitialIdentity, identityFromClient, MeshIdentity, saveIdentityOf } from "../shared/identity-store.js";
+import { resolveRoomScope } from "../shared/project-room.js";
 import { MeshLedger } from "./ledger.js";
 import type { ExtensionAPI } from "./pi-types.js";
 import { findConflict } from "../shared/reservations.js";
@@ -128,9 +129,24 @@ export default function meshExtension(pi: ExtensionAPI): void {
   // Alias precedence: explicit config pin → persisted PREFERRED alias (this is
   // what makes a conflict fallback self-heal) → persisted alias → random.
     const choice = chooseInitialIdentity(config, persisted);
+    // roomMode: compose the effective room set. "default" reproduces the
+    // pre-roomMode behaviour exactly; "both" (the default) ADDS the derived
+    // project room and keeps DEFAULT_ROOM, so cross-project directed messages
+    // still resolve to a shared room while an untargeted broadcast stays
+    // inside the project (issue #20).
+    const scope = resolveRoomScope({
+      roomMode: config.roomMode,
+      rooms: choice.rooms,
+      stateDir: sDir,
+      ...(config.projectRoomName !== undefined ? { projectRoomName: config.projectRoomName } : {}),
+      configuredRooms: config.rooms,
+      maxRoomsPerPeer: config.maxRoomsPerPeer,
+      pinned: config.roomsPinned === true,
+    });
     const client = new MeshClient({
       alias: choice.alias,
-      rooms: choice.rooms,
+      rooms: scope.rooms,
+      ...(scope.projectRoom !== undefined ? { projectRoom: scope.projectRoom } : {}),
       initialReservations: persisted?.reservations,
       runtimeDir: rDir,
       config,

@@ -211,8 +211,8 @@ export interface ControlOpts {
 }
 
 export type SendResult =
-  | { status: "delivered"; msgId: string; deliveredCount?: number; totalCount?: number; routedTo?: string }
-  | { status: "queued_offline"; msgId: string; deliveredCount?: number; totalCount?: number; routedTo?: string }
+  | { status: "delivered"; msgId: string; deliveredCount?: number; totalCount?: number; routedTo?: string; room?: string }
+  | { status: "queued_offline"; msgId: string; deliveredCount?: number; totalCount?: number; routedTo?: string; room?: string }
   | { status: "reply"; msgId: string; response: string; outputHash: string }
   | { status: "expired" | "blocked" | "error"; msgId?: string; reason: string };
 
@@ -264,6 +264,10 @@ export interface MeshClientOpts {
   initialReservations?: FileReservation[];
   runtimeDir?: string;
   config?: Partial<MeshConfig>;
+  /** Derived project room (see shared/project-room.ts). When set, an
+   *  untargeted BROADCAST goes here instead of DEFAULT_ROOM, so a project's
+   *  fan-out stays inside the project. Directed sends are unaffected. */
+  projectRoom?: string;
   onFrame?: (f: MeshFrame) => void;
   /** Disable auto-reconnect (ephemeral CLI clients). */
   noReconnect?: boolean;
@@ -340,6 +344,10 @@ export class MeshClient extends EventEmitter {
   /** Current alias — mutable via rename (in-flight alias change). */
   private aliasInternal: string;
   private readonly initialRooms: string[];
+  /** Where an untargeted broadcast goes; DEFAULT_ROOM unless a project room
+   *  is configured. Kept separate from joinedRooms so a caller that forgets
+   *  the opt does not silently scope anything. */
+  private readonly projectRoom: string | undefined;
   /** All rooms this client is (or will be) a member of — re-declared at hello. */
   private readonly joinedRooms: Set<string>;
   private readonly runtimeDir: string;
@@ -455,6 +463,7 @@ export class MeshClient extends EventEmitter {
     super();
     this.aliasInternal = normalizeAlias(opts.alias ?? defaultAlias());
     this.initialRooms = opts.rooms ?? [...DEFAULT_CONFIG.rooms];
+    this.projectRoom = opts.projectRoom;
     this.joinedRooms = new Set(this.initialRooms);
     for (const room of this.initialRooms) this.roomRoles.set(room, "member");
     this.runtimeDir = opts.runtimeDir ?? runtimeDir();
@@ -1462,7 +1471,19 @@ export class MeshClient extends EventEmitter {
       const shared = [...this.joinedRooms].find((room) => this.peerRooms.get(to)?.has(room) === true);
       if (shared !== undefined) return shared;
     }
+    // Untargeted (broadcast): the project room when one is configured, so a
+    // project's fan-out does not cross unrelated projects (issue #20). An
+    // explicit `room: "default"` still reaches the whole machine.
+    if (this.projectRoom !== undefined && this.joinedRooms.has(this.projectRoom)) {
+      return this.projectRoom;
+    }
     return this.joinedRooms.has(DEFAULT_ROOM) ? DEFAULT_ROOM : [...this.joinedRooms][0];
+  }
+
+  /** Room an untargeted broadcast would use — surfaced so a caller is never
+   *  silently scoped (mesh_status, mesh_send result). */
+  get broadcastRoom(): string | undefined {
+    return this.resolveSendRoom(undefined);
   }
 
   async send(opts: SendOpts): Promise<SendResult> {
@@ -1603,6 +1624,9 @@ export class MeshClient extends EventEmitter {
           deliveredCount: ack.deliveredCount,
           totalCount: ack.totalCount,
           routedTo: ack.routedTo,
+          // The room a fan-out landed in — `routedTo` is the resolved ALIAS
+          // for `cap:` routing, so overloading it would be a lie.
+          ...(broadcast ? { room } : {}),
         };
       }
       if (ack.status === "queued_offline") {
@@ -1612,6 +1636,9 @@ export class MeshClient extends EventEmitter {
           deliveredCount: ack.deliveredCount,
           totalCount: ack.totalCount,
           routedTo: ack.routedTo,
+          // The room a fan-out landed in — `routedTo` is the resolved ALIAS
+          // for `cap:` routing, so overloading it would be a lie.
+          ...(broadcast ? { room } : {}),
         };
       }
   // an unknown/unexpected ack status (e.g. dropped_offline on a msg)
