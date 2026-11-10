@@ -31,7 +31,10 @@ export const MAILBOX_PURGE_INTERVAL_MS = 60_000;
 
 // ---- Rooms ----
 export const DEFAULT_MAX_ROOMS_PER_PEER = 16;
-export const MAX_PEERS_PER_ROOM = 64;
+/** Room membership cap (D: machine-wide hello room saturation). Configurable
+ *  via maxPeersPerRoom — a swarm of 100+ live sessions on one machine must not
+ *  lock late joiners out of "default" with an opaque invalid_room.) */
+export const DEFAULT_MAX_PEERS_PER_ROOM = 256;
 export const DEFAULT_ROOM = "default";
 
 // ---- Rate limits ----
@@ -310,6 +313,8 @@ export interface MeshConfig {
   mailboxCap: number;
   mailboxTtlMs: number;
   maxRoomsPerPeer: number;
+  /** max peers per room before joinRoom refuses with invalid_room. */
+  maxPeersPerRoom: number;
   transcript: boolean;
   transcriptRetentionDays: number;
   ledgerMaxBytes: number;
@@ -370,6 +375,7 @@ export const DEFAULT_CONFIG: MeshConfig = {
   mailboxCap: DEFAULT_MAILBOX_CAP,
   mailboxTtlMs: DEFAULT_MAILBOX_TTL_MS,
   maxRoomsPerPeer: DEFAULT_MAX_ROOMS_PER_PEER,
+  maxPeersPerRoom: DEFAULT_MAX_PEERS_PER_ROOM,
   transcript: false,
   transcriptRetentionDays: DEFAULT_TRANSCRIPT_RETENTION_DAYS,
   ledgerMaxBytes: DEFAULT_LEDGER_MAX_BYTES,
@@ -442,6 +448,7 @@ export function loadConfig(stateDir?: string, env: NodeJS.ProcessEnv = process.e
     mailboxCap: positiveInt(fileCfg.mailboxCap, DEFAULT_CONFIG.mailboxCap),
     mailboxTtlMs: positiveInt(fileCfg.mailboxTtlMs, DEFAULT_CONFIG.mailboxTtlMs),
     maxRoomsPerPeer: positiveInt(fileCfg.maxRoomsPerPeer, DEFAULT_CONFIG.maxRoomsPerPeer),
+    maxPeersPerRoom: positiveInt(fileCfg.maxPeersPerRoom, DEFAULT_CONFIG.maxPeersPerRoom),
     transcript: fileCfg.transcript === true,
     transcriptRetentionDays: positiveInt(
       fileCfg.transcriptRetentionDays,

@@ -1,10 +1,6 @@
 // broker/rooms.ts — membership, roles, presence broadcasts.
 import { buildFrame, isValidRoom, type FileReservation, type MeshErrorCode, type MeshRole } from "../protocol/envelope.js";
-import {
-  DEFAULT_ROOM,
-  MAX_PEERS_PER_ROOM,
-  type MeshConfig,
-} from "../shared/config.js";
+import { DEFAULT_ROOM, type MeshConfig } from "../shared/config.js";
 import type { BrokerState, PeerRecord } from "./state.js";
 
 export type RoomResult = { ok: true } | { ok: false; code: MeshErrorCode };
@@ -28,7 +24,7 @@ export function joinRoom(
     members = new Set();
     state.rooms.set(roomId, members);
   }
-  if (!members.has(peer.alias) && members.size >= MAX_PEERS_PER_ROOM) {
+  if (!members.has(peer.alias) && members.size >= config.maxPeersPerRoom) {
     return { ok: false, code: "invalid_room" };
   }
   members.add(peer.alias);
