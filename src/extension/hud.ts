@@ -147,15 +147,18 @@ export class MeshHud {
   /** session_shutdown: clear BOTH widget and status. */
   detach(): void {
     const ctx = this.ctx;
-    this.ctx = null;
-    if (this.statusTimer !== null) {
-      clearTimeout(this.statusTimer);
-      this.statusTimer = null;
-    }
+    this.suspend();
     if (ctx !== null) {
       ctx.ui.setWidget(HUD_WIDGET_ID, undefined);
       ctx.ui.setStatus(HUD_STATUS_ID, undefined);
     }
+  }
+
+  /** Terminal callback failure: forget stale UI without calling it to clear. */
+  suspend(): void {
+    this.ctx = null;
+    if (this.statusTimer !== null) clearTimeout(this.statusTimer);
+    this.statusTimer = null;
   }
 
   setConnecting(on: boolean): void {

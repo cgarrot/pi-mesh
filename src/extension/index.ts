@@ -13,7 +13,6 @@ import { startAliasReclaim } from "./reclaim.js";
 import { batchDetails, buildBatchMessage } from "./batcher.js";
 import { InjectionGuard } from "./injection-guard.js";
 import { injectInbound } from "./inbound.js";
-import { handleCtlFrame } from "./ctl.js";
 import { renderLiveEntry, renderMeshInbound, renderVerdictEntry } from "./renderer.js";
 import type { PersistedIdentity } from "../shared/identity-store.js";
 import { chooseInitialIdentity, identityFromClient, MeshIdentity, saveIdentityOf } from "../shared/identity-store.js";
@@ -100,6 +99,7 @@ export default function meshExtension(pi: ExtensionAPI): void {
   const getHudRef = (): MeshHud | null => hud;
 
   pi.on("session_start", (_event, ctx) => {
+    runtime?.markDetached?.();
     const sDir = stateDir(); // <cwd>/.mesh or $MESH_STATE_DIR
     const rDir = runtimeDir();
     const config = loadConfig(sDir);
@@ -203,21 +203,18 @@ export default function meshExtension(pi: ExtensionAPI): void {
       interruptCount: 0,
     };
     const rt = runtime;
-    // Control plane (C): a ctl frame addressed to THIS session is handled by
-    // the local turn (abort/redirect) or dispatched to a local extension
-    // (job_*/run_*) over the event bus. The ack goes back over the mesh.
-    client.on("frame", (frame: MeshFrame) => {
-      if (frame.type !== "ctl" || frame.to !== client.alias) return;
-      void handleCtlFrame(rt, frame, pi).catch(() => {
-        // never let a ctl handler take the session down
-      });
-    });
+    rt.onAttach = (lifetime) => {
+    const client = rt.client;
+    const ctx = rt.ctx!;
+    const live = (): boolean => lifetime.active && runtime === rt;
     // Shared with other extensions (pi-jobd) so a job's owner is the MESH
     // alias, not the OS user. Renames keep it current.
     process.env.PI_MESH_ALIAS = client.alias;
-    client.on("renamed", (info: { to?: string }) => {
-      if (info.to !== undefined) process.env.PI_MESH_ALIAS = info.to;
-    });
+    const renamed = (info: { to?: string }): void => {
+      if (live() && info.to !== undefined) process.env.PI_MESH_ALIAS = info.to;
+    };
+    client.on("renamed", renamed);
+    lifetime.onStop(() => client.off("renamed", renamed));
 
     // ---- injection guard (D47) ---------------------------------------------
     // pi's TUI abort path (ESC → restoreQueuedMessagesToEditor →
@@ -230,9 +227,11 @@ export default function meshExtension(pi: ExtensionAPI): void {
     const injectionGuard = new InjectionGuard();
     rt.injectionGuard = injectionGuard;
     rt.noteBatchSent = (frames, deliverAs, busyAtSend) => {
+      if (!live()) return;
       injectionGuard.note(frames, deliverAs, busyAtSend);
     };
     rt.resendBatch = (frames, _originalDeliverAs, tries) => {
+      if (!live()) return;
       const batch = buildBatchMessage(frames);
       rt.redeliveredBatches += 1;
       const marker = tries > 1 ? " [mesh re-delivery]" : "";
@@ -303,8 +302,6 @@ export default function meshExtension(pi: ExtensionAPI): void {
       }
     };
 
-    attachClientListeners(pi, rt, getHudRef, ctx, client, saveIdentity);
-
   // Pi parity (OpenCode parity): reclaim the PREFERRED alias as soon as its
   // holder disconnects — a conflict fallback recovers the chosen name without
   // a reload. Gated on idle + no pending mission (a rename detaches the
@@ -314,6 +311,7 @@ export default function meshExtension(pi: ExtensionAPI): void {
       preferredAlias: () => rt.preferredAlias,
       isBusy: () => rt.ctx?.isIdle?.() === false,
       onReclaimed: (alias) => {
+        if (!live()) return;
         saveIdentity(rt);
         updateSessionName(pi, rt);
         try {
@@ -333,13 +331,15 @@ export default function meshExtension(pi: ExtensionAPI): void {
     const ERROR_COOLDOWN_MS = 30_000;
     const RATE_LIMIT_HOLD_MS = 60_000;
     const BLOCKED_HOLD_MS = 30 * 60_000; // quota/auth: long hold, no ping-pong
-    let holdTimer: NodeJS.Timeout | null = null;
+    let cancelHold: (() => void) | null = null;
     const startHold = (state: "rate_limited" | "blocked"): void => {
+      if (!live()) return;
       const holdMs = state === "rate_limited" ? RATE_LIMIT_HOLD_MS : BLOCKED_HOLD_MS;
       rt.rateLimitedUntil = Date.now() + holdMs;
-      if (holdTimer !== null) clearTimeout(holdTimer);
-      holdTimer = setTimeout(() => {
-        holdTimer = null;
+      cancelHold?.();
+      cancelHold = lifetime.after(holdMs, () => {
+        cancelHold = null;
+        if (!live()) return;
         rt.rateLimitedUntil = undefined;
       // D41: after a reload the old holdTimer can fire on a CLOSED client;
       // session_shutdown's stopHold() clears this timer, and this try/catch
@@ -350,26 +350,24 @@ export default function meshExtension(pi: ExtensionAPI): void {
         } catch {
           // delivery is best effort — never break the timer
         }
-      }, holdMs);
-      holdTimer.unref();
+      });
     };
   // D41: cleared at session_shutdown — a surviving timer would fire after
   // the session (and its client) are gone.
     rt.stopHold = () => {
-      if (holdTimer !== null) {
-        clearTimeout(holdTimer);
-        holdTimer = null;
-      }
+      cancelHold?.();
+      cancelHold = null;
       rt.rateLimitedUntil = undefined;
     };
     const announce = (state: "busy" | "idle" | "rate_limited" | "blocked"): void => {
-      if (announcedActivity === state) return;
+      if (!live() || announcedActivity === state) return;
       announcedActivity = state;
       client.sendActivity(state);
     };
     announce("idle"); // present and waiting from the start
-    pi.on("tool_call", (_event, _ctx) => announce("busy"));
+    pi.on("tool_call", (_event, _ctx) => { if (live()) announce("busy"); });
     pi.on("agent_settled", (_event, _ctx) => {
+      if (!live()) return;
       // failure states stick for a cooldown — an agent whose provider is
       // rejecting turns must stay flagged so senders stop reminding; it
       // flips back to idle once a settle happens WITHOUT a fresh error.
@@ -388,6 +386,7 @@ export default function meshExtension(pi: ExtensionAPI): void {
     // them. Quota/budget limits (FreeUsageLimitError…) are PERMANENT:
     // long hold + blocked; 429/5xx are transient: short hold + rate_limited.
     pi.on("turn_end", (event, _ctx) => {
+      if (!live()) return;
       const msg = (event as { message?: { stopReason?: string; errorMessage?: string }; toolResults?: unknown[] }).message;
       // M1 watchdog runs FIRST — independent of provider-error detection.
       runWatchdog(msg, (event as { toolResults?: unknown[] }).toolResults ?? []);
@@ -397,11 +396,11 @@ export default function meshExtension(pi: ExtensionAPI): void {
       const stop = msg?.stopReason;
       const guardDecision = injectionGuard.onTurnEnd(stop);
       if (guardDecision === "resend") {
-        const t = setTimeout(() => {
+        lifetime.after(250, () => {
+          if (!live()) return;
           const entry = injectionGuard.takeForResend();
           if (entry !== null) rt.resendBatch?.(entry.frames, entry.deliverAs, entry.tries);
-        }, 250);
-        t.unref();
+        });
       }
       if (msg === undefined || msg.stopReason !== "error") return;
       const state = providerErrorStateFromMessage(msg.errorMessage ?? "");
@@ -413,10 +412,9 @@ export default function meshExtension(pi: ExtensionAPI): void {
     // a model/provider switch means a human intervened (e.g. the quota is
     // exhausted) — lift the hold and deliver the backlog right away.
     pi.on("model_select", (_event, _ctx) => {
-      if (holdTimer !== null) {
-        clearTimeout(holdTimer);
-        holdTimer = null;
-      }
+      if (!live()) return;
+      cancelHold?.();
+      cancelHold = null;
       rt.rateLimitedUntil = undefined;
       announce("idle");
       try {
@@ -427,12 +425,15 @@ export default function meshExtension(pi: ExtensionAPI): void {
     });
     // status-code fallback (fires on responses that DO carry a status)
     pi.on("after_provider_response", (event, _ctx) => {
+      if (!live()) return;
       const state = providerErrorState((event as { status?: number }).status ?? 0);
       if (state === undefined) return;
       lastErrorAt = Date.now();
       announce(state);
       startHold(state);
     });
+
+    };
 
   // reservation enforcement: block edit/write on paths another agent
   // has reserved. Runs FIRST (before any other tool handling); the block
@@ -466,6 +467,7 @@ export default function meshExtension(pi: ExtensionAPI): void {
     hud = new MeshHud({ getRuntime });
     hud.setConnecting(true);
     hud.attach(ctx);
+    attachClientListeners(pi, rt, getHudRef, ctx, client, saveIdentity);
 
   // NON-blocking connect: failures leave tools answering `blocked`.
     client.connect().catch(() => {});

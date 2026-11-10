@@ -67,7 +67,7 @@ describe("live inbound entries (D43/B9)", () => {
     idle.value = false;
     attachClientListeners(
       pi as never,
-      { ctx: { isIdle: () => idle.value } } as never,
+      { client: me, ctx: { isIdle: () => idle.value } } as never,
       () => null,
       { isIdle: () => idle.value } as never,
       me,
@@ -102,7 +102,7 @@ describe("live inbound entries (D43/B9)", () => {
     idle.value = false; // busy → live entries
     attachClientListeners(
       pi as never,
-      { ctx: { isIdle: () => idle.value } } as never,
+      { client: me, ctx: { isIdle: () => idle.value } } as never,
       () => null,
       { isIdle: () => idle.value } as never,
       me,

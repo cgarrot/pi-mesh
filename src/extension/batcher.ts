@@ -151,6 +151,15 @@ export class InboundBatcher {
     this.onFlush(batch);
   }
 
+  /** Terminal callback failure: drop queued work without injecting it. */
+  discard(): void {
+    if (this.timer !== null) clearTimeout(this.timer);
+    if (this.maxTimer !== null) clearTimeout(this.maxTimer);
+    this.timer = null;
+    this.maxTimer = null;
+    this.frames = [];
+  }
+
   get pending(): number {
     return this.frames.length;
   }

@@ -13,6 +13,7 @@
 import { CTL_LOCAL_TIMEOUT_MS, CTL_SETTLE_TIMEOUT_MS } from "../shared/config.js";
 import { CTL_STATUSES, type MeshFrame } from "../protocol/envelope.js";
 import type { ExtensionAPI, SessionContext } from "./pi-types.js";
+import type { AttachmentLifetime } from "./attachment-lifetime.js";
 import type { MeshRuntime } from "./tools.js";
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -62,7 +63,9 @@ function requestLocalControl(
   pi: Pick<ExtensionAPI, "events">,
   payload: Record<string, unknown>,
   timeoutMs: number,
+  lifetime?: AttachmentLifetime,
 ): Promise<LocalCtlReply> {
+  if (lifetime?.active === false) return Promise.resolve({ status: "error", reason: "detached" });
   const events = pi.events;
   if (events === undefined || typeof events.on !== "function") {
     return Promise.resolve({ status: "unsupported", reason: "host has no event bus" });
@@ -71,11 +74,13 @@ function requestLocalControl(
   const channel = `mesh-ctl:reply:${requestId}`;
   return new Promise<LocalCtlReply>((resolve) => {
     let done = false;
+    let removeStop = () => {};
     const settle = (reply: LocalCtlReply): void => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      events.off?.(channel, handler);
+      try { events.off?.(channel, handler); } catch { /* best effort */ }
+      removeStop();
       resolve(reply);
     };
     const handler = (data: unknown): void => {
@@ -90,6 +95,8 @@ function requestLocalControl(
     // Ref'd on purpose: while a ctl is in flight, the host must not exit
     // before the local handler answers (the bound is small and explicit).
     events.on!(channel, handler);
+    removeStop = lifetime?.onStop(() => settle({ status: "error", reason: "detached" })) ?? (() => {});
+    if (done) return;
     try {
       events.emit("mesh-ctl", payload);
     } catch {
@@ -110,6 +117,10 @@ export async function handleCtlFrame(
   pi: Pick<ExtensionAPI, "sendMessage" | "events">,
   opts: CtlHandlerOpts = {},
 ): Promise<void> {
+  const client = rt.client;
+  const lifetime = rt.attachment;
+  const active = (): boolean => rt.client === client && lifetime?.active !== false;
+  if (!active()) return;
   const settleTimeoutMs = opts.settleTimeoutMs ?? CTL_SETTLE_TIMEOUT_MS;
   const replyTo = frame.id;
   const to = frame.from;
@@ -119,7 +130,7 @@ export async function handleCtlFrame(
   const ack = (status: CtlAckStatus, extra: { settled?: boolean; reason?: string } = {}): void => {
     // One ack per ctl, and one durable hash-only audit line: action, target,
     // status and the body/reason hashes — never the instruction the peer sent.
-    if (acked) return;
+    if (acked || !active()) return;
     acked = true;
     {
       try {
@@ -127,7 +138,7 @@ export async function handleCtlFrame(
           event: "ctl",
           id: frame.id,
           from: frame.from,
-          to: rt.client.alias,
+          to: client.alias,
           code: status,
           action,
           ...(frame.target !== undefined ? { target: frame.target } : {}),
@@ -138,7 +149,7 @@ export async function handleCtlFrame(
         rt.ledgerFailures += 1;
       }
     }
-    rt.client.sendCtlAck({
+    client.sendCtlAck({
       replyTo,
       to,
       status,
@@ -155,6 +166,7 @@ export async function handleCtlFrame(
       return;
     }
     const wasBusy = !ctx.isIdle();
+    if (!active()) return;
     if (!wasBusy) {
       // Nothing to abort: a redirect still delivers its instruction; a bare
       // abort says not_busy.
@@ -173,8 +185,14 @@ export async function handleCtlFrame(
       return;
     }
     const deadline = Date.now() + settleTimeoutMs;
-    while (Date.now() < deadline && !ctx.isIdle()) await sleep(50);
+    while (active() && Date.now() < deadline && !ctx.isIdle()) {
+      if (lifetime !== undefined) {
+        if (!await lifetime.wait(50)) return;
+      } else await sleep(50);
+    }
+    if (!active()) return;
     const settled = ctx.isIdle();
+    if (!active()) return;
     if (action === "redirect") {
       if (settled) {
         if (injectRedirect(pi, frame)) ack("redirected", { settled: true });
@@ -211,9 +229,10 @@ export async function handleCtlFrame(
         target: frame.target,
         message: frame.body,
         from: frame.from,
-        to: rt.client.alias,
+        to: client.alias,
       },
       opts.localTimeoutMs ?? CTL_LOCAL_TIMEOUT_MS,
+      lifetime,
     );
     // Never forward an out-of-vocabulary status: the broker would reject the
     // ctl_ack and the sender would burn a full timeout instead of learning

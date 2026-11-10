@@ -1,6 +1,8 @@
 // extension/attach.ts — client→session wiring, shared by session_start and
 // /mesh reset: both need a fully-wired MeshClient, and reset must be
 // able to REPLACE the client in-place without a pi reload.
+import { AttachmentLifetime } from "./attachment-lifetime.js";
+import { handleCtlFrame } from "./ctl.js";
 import { readFileSync } from "node:fs";
 import type { WelcomeInfo } from "../client/client.js";
 import type { MeshFrame } from "../protocol/envelope.js";
@@ -140,6 +142,10 @@ export function attachClientListeners(
   // pi.* then throws "extension ctx is stale" as an uncaughtException and
   // kills pi. `detached` flips at session_shutdown; every pi/ctx touch in
   // client handlers goes through guarded try/catch as belt-and-braces.
+  rt.attachment?.stop();
+  const lifetime = new AttachmentLifetime(() => rt.client === client);
+  rt.attachment = lifetime;
+  const attachedHud = getHud();
   let detached = false;
   const guarded = (fn: () => void): void => {
     if (detached) return;
@@ -148,6 +154,14 @@ export function attachClientListeners(
     } catch {
       // stale ctx / shutting down — the event belongs to the old session
     }
+  };
+
+  // Retain only our registrations: terminal teardown must not remove other
+  // consumers' diagnostic or lifecycle listeners from the shared emitter.
+  const removeListeners: (() => void)[] = [];
+  const onClient = <Args extends unknown[]>(event: string, listener: (...args: Args) => void): void => {
+    client.on(event, listener);
+    removeListeners.push(() => { client.off(event, listener); });
   };
 
   const deps = {
@@ -160,6 +174,7 @@ export function attachClientListeners(
   };
   /** D34: read receipt = the frame actually reached this session. */
   const readFrame = (frame: MeshFrame): void => {
+    if (detached) return;
     sendReadReceipt(frame, (msgId, from) => client.sendRead(msgId, from));
   };
   // batch inbound messages over a short window → ONE injection (one
@@ -168,8 +183,9 @@ export function attachClientListeners(
   const batcher = new InboundBatcher(
     client.inboundBatchMs,
     client.inboundBatchMaxHoldMs,
-    () => rt.ctx?.isIdle?.() === false, // busy = a turn is running (e.g. sleep)
+    () => !detached && rt.ctx?.isIdle?.() === false, // busy = a turn is running (e.g. sleep)
     (frames: MeshFrame[]) => {
+    if (detached) return;
     const batch = buildBatchMessage(frames, (f) =>
       formatOptsFor(f, client.contextVerbosity === "full", client.homeRoom),
     );
@@ -216,8 +232,9 @@ export function attachClientListeners(
   // delivery guarantee while the provider is rate-limited/blocked.
   const heldFrames: { frame: MeshFrame; matchedReply: boolean }[] = [];
   const deliver = (frame: MeshFrame, matchedReply: boolean): void => {
+    if (detached) return;
     handleInboundSideEffects(frame, deps);
-    getHud()?.noteInbound(frame); // preview: transient memory only, never persisted
+    attachedHud?.noteInbound(frame); // preview: transient memory only, never persisted
     if (classifyInbound(frame, client.alias, client.inboundBroadcasts, matchedReply) === "deferred") {
       deferredInbox.push(frame);
       return;
@@ -229,12 +246,15 @@ export function attachClientListeners(
       batcher.flushNow(); // deliver any pending batch first (ordering)
       const injectOpts: InjectOpts = {
         ...opts,
+        lifetime,
+        onDelivered: () => readFrame(frame),
         replyChain: (frame as unknown as { __replyChain?: boolean }).__replyChain === true,
       };
       // force+interrupt: wire the honest report (receipt + local notify +
       // memory-only counters) before injection runs its repeater path
       if (frame.interrupt === true) {
         injectOpts.onInterruptReport = (report) => {
+          if (detached) return;
           rt.interruptCount = (rt.interruptCount ?? 0) + 1;
           rt.lastInterruptAt = new Date().toISOString();
           rt.lastInterruptOutcome = report.outcome;
@@ -258,8 +278,6 @@ export function attachClientListeners(
       }
       guarded(() => {
         injectInbound(pi, rt.ctx, frame, injectOpts);
-        // the session accepted it; "read" means reached the session, not "model saw it".
-        readFrame(frame);
       });
       return;
     }
@@ -294,7 +312,7 @@ export function attachClientListeners(
     const frames = heldFrames.splice(0);
     for (const { frame, matchedReply } of frames) deliver(frame, matchedReply);
   };
-  client.on("inbound", (frame: MeshFrame, meta?: { matchedReply?: boolean }) => {
+  onClient("inbound", (frame: MeshFrame, meta?: { matchedReply?: boolean }) => {
     if (detached) return; // old session's client after reload/switch — D41
     if (rt === null) return; // session shutting down
     if (rt.rateLimitedUntil !== undefined && rt.rateLimitedUntil > Date.now()) {
@@ -306,7 +324,7 @@ export function attachClientListeners(
   rt.batcher = batcher;
 
   // presence → appendEntry ONLY, no turn
-  client.on("presence", (frame: MeshFrame) => {
+  onClient("presence", (frame: MeshFrame) => {
     if (detached) return; // D41: stale ctx after reload/switch — never throw
     guarded(() => {
       pi.appendEntry("mesh", {
@@ -317,15 +335,15 @@ export function attachClientListeners(
         ts: frame.ts,
       });
     });
-    getHud()?.scheduleStatusRefresh(); // debounced ≤1/s trailing (hello floods)
+    attachedHud?.scheduleStatusRefresh(); // debounced ≤1/s trailing (hello floods)
   });
 
-  client.on("ready", (welcome: WelcomeInfo) => {
+  onClient("ready", (welcome: WelcomeInfo) => {
     if (detached) return; // D41
     guarded(() => exposeAlias(pi, client.alias, client.rooms));
     guarded(() => updateSessionName(pi, rt));
-    getHud()?.setConnecting(false);
-    getHud()?.fetchStatus(); // fire-and-forget, never blocks session_start
+    attachedHud?.setConnecting(false);
+    attachedHud?.fetchStatus(); // fire-and-forget, never blocks session_start
   // persist identity as soon as we are connected (covers the very
   // first connect AND every reconnect/rename/reset). Disk-only — safe.
     saveIdentity(rt);
@@ -339,6 +357,13 @@ export function attachClientListeners(
   // M2: the FULL block goes out ONCE per session; reconnects (and
   // renames) send a one-line diff instead — measured in cs-room: the
   // master received the ~500-token block 5×, pure context duplication.
+    // Restore this hook on every fresh attachment, including /mesh reset.
+    rt.onCompactionDetected = () => {
+      if (!lifetime.active) return;
+      fullContextSent = false;
+      hintTracker.reset();
+      client.sendActivity("idle"); // harmless; keeps presence fresh
+    };
     const othersNow = welcome.peers.filter((p) => p.alias !== client.alias).map((p) => p.alias);
     if (fullContextSent) {
       pi.sendMessage(
@@ -354,13 +379,6 @@ export function attachClientListeners(
     }
     fullContextSent = true;
     lastPeersOnline = new Set(othersNow);
-  // watchdog hook: a compaction wipes the context — re-teach everything
-  // (full block + reply hints) exactly when it was lost.
-    rt.onCompactionDetected = () => {
-      fullContextSent = false;
-      hintTracker.reset();
-      client.sendActivity("idle"); // harmless; keeps presence fresh
-    };
     const roomList = (welcome.rooms.length > 0 ? welcome.rooms.join(",") : "default");
     const myRooms = new Set(roomList.split(","));
     const others = welcome.peers.filter((p) => p.alias !== client.alias);
@@ -409,7 +427,7 @@ export function attachClientListeners(
       );
     });
   });
-  client.on("renamed", () => {
+  onClient("renamed", () => {
     // a successful rename (user /mesh alias, /mesh join … as …, or the
     // reclaim loop) becomes the name to keep — persist it with the identity.
     rt.preferredAlias = client.alias;
@@ -417,7 +435,7 @@ export function attachClientListeners(
     guarded(() => updateSessionName(pi, rt));
     saveIdentity(rt); // disk-only
   });
-  client.on("alias_fallback", ({ from, to }: { from: string; to: string }) => {
+  onClient("alias_fallback", ({ from, to }: { from: string; to: string }) => {
   // Another live peer holds our persisted alias (e.g. crashed session) —
   // we took a random one. The CHOSEN alias is KEPT as preferredAlias, so the
   // next attach retries it and the reclaim loop takes it back as soon as the
@@ -428,14 +446,14 @@ export function attachClientListeners(
       ctx.ui.notify(`mesh: alias @${from} taken — now connected as @${to}${retry}`, { level: "warning" });
     });
   });
-  client.on("closed", () => getHud()?.onClosed());
-  client.on("expired", ({ msgId }: { msgId: string }) => getHud()?.noteExpired(msgId));
+  onClient("closed", () => attachedHud?.onClosed());
+  onClient("expired", ({ msgId }: { msgId: string }) => attachedHud?.noteExpired(msgId));
 
   // async drop receipt: the broker dropped one of OUR messages from the
   // recipient's offline mailbox (TTL expiry or cap eviction). The client
   // already settled any live awaitReply mission; the session must LEARN
   // the message will never arrive so a re-send decision is possible.
-  client.on("dropped_offline", (frame: MeshFrame) => {
+  onClient("dropped_offline", (frame: MeshFrame) => {
     if (detached) return; // D41: stale ctx after reload/switch — never throw
     const target = frame.to ?? "?";
     guarded(() => {
@@ -464,11 +482,51 @@ export function attachClientListeners(
     }
   });
 
+  onClient("frame", (frame: MeshFrame) => {
+    if (!lifetime.active || frame.type !== "ctl" || frame.to !== client.alias) return;
+    void handleCtlFrame(rt, frame, pi).catch(() => {});
+  });
+
+  onClient("callback_error", () => lifetime.stop());
+  lifetime.onStop(() => {
+    // Shared by terminal callback failure, shutdown and replacement. Set the
+    // guard BEFORE clearing the inbox: its changed hook touches Pi.
+    detached = true;
+    for (const remove of removeListeners) remove();
+    removeListeners.length = 0;
+    batcher.discard();
+    heldFrames.length = 0;
+    deferredInbox.clear();
+    // /mesh reset reuses rt with a new client. An old attachment owns only
+    // its local queues, never the replacement's timers, guard or HUD.
+    if (rt.client !== client) return;
+    rt.injectionGuard?.clear();
+    rt.noteBatchSent = undefined;
+    rt.resendBatch = undefined;
+    rt.onCompactionDetected = undefined;
+    if (rt.reserveTimers !== undefined) {
+      for (const timer of rt.reserveTimers.values()) clearTimeout(timer);
+      rt.reserveTimers.clear();
+    }
+    // These hooks cancel adapter-owned timers. One failed cleanup must not
+    // leave the other queues alive; none should try to notify a stale Pi ctx.
+    for (const stop of [() => rt.stopHold?.(), () => rt.stopReclaim?.(), () => attachedHud?.suspend()]) {
+      try {
+        stop();
+      } catch {
+        // Best effort; the detached guard already prevents further delivery.
+      }
+    }
+  });
+
   // D41: flip the guard — called from session_shutdown before client.close().
   // Frames still in flight on the old socket are then dropped silently
   // instead of reaching the stale pi/ctx.
   rt.markDetached = () => {
-    deferredInbox.clear();
-    detached = true;
+    // Normal shutdown/reset still clears the live inbox footer. Terminal
+    // failure calls stop directly and must not touch the invalid UI.
+    if (lifetime.active) deferredInbox.clear();
+    lifetime.stop();
   };
+  rt.onAttach?.(lifetime);
 }
