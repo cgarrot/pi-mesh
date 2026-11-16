@@ -2,7 +2,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { visibleWidth } from "@mariozechner/pi-tui";
-import { colorizeAliases, renderLiveEntry, renderMeshInbound, renderVerdictEntry } from "../src/extension/renderer.js";
+import { colorizeAliases, memoRender, renderLiveEntry, renderMeshInbound, renderVerdictEntry } from "../src/extension/renderer.js";
 
 import { agentColor } from "../src/extension/colors.js";
 
@@ -225,5 +225,52 @@ describe("verdict width safety — every line fits the terminal (issue #1)", () 
       lines.filter((l) => l.includes("\x1b[48;5;")).length >= 2,
       "the answer spans multiple full-width colored lines",
     );
+  });
+});
+
+describe("memoRender", () => {
+  it("builds once per width and returns the cached lines on later frames", () => {
+    let builds = 0;
+    const c = memoRender((width) => {
+      builds += 1;
+      return [`w=${width}`];
+    });
+    const first = c.render(80);
+    assert.deepEqual(first, ["w=80"]);
+    assert.equal(c.render(80), first); // same array, no rebuild
+    assert.equal(c.render(80), first);
+    assert.equal(builds, 1);
+  });
+
+  it("rebuilds when the width changes (terminal resize)", () => {
+    let builds = 0;
+    const c = memoRender((width) => {
+      builds += 1;
+      return [`w=${width}`];
+    });
+    assert.deepEqual(c.render(80), ["w=80"]);
+    assert.deepEqual(c.render(120), ["w=120"]);
+    assert.deepEqual(c.render(80), ["w=80"]);
+    assert.equal(builds, 3);
+  });
+
+  it("invalidate() forces the next render to rebuild (theme change)", () => {
+    let builds = 0;
+    const c = memoRender(() => {
+      builds += 1;
+      return [`build ${builds}`];
+    });
+    assert.deepEqual(c.render(80), ["build 1"]);
+    c.invalidate();
+    assert.deepEqual(c.render(80), ["build 2"]);
+    assert.equal(builds, 2);
+  });
+
+  it("caches real mesh output identically to an uncached render", () => {
+    const content = "[mesh] @agent-4 (room cs-room, normal) hello\n↩ reply with the mesh_reply tool using msgId \"m_x\"";
+    const details = { kind: "mesh-inbound", from: "agent-4" } as const;
+    const c = memoRender((width) => renderMeshInbound(content, details, width, theme as never));
+    assert.deepEqual(c.render(60), renderMeshInbound(content, details, 60, theme as never));
+    assert.deepEqual(c.render(60), renderMeshInbound(content, details, 60, theme as never));
   });
 });

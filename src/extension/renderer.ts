@@ -18,6 +18,35 @@ export interface RenderTheme {
   fgAnsi?(color: ThemeColor): string;
 }
 
+/** A rendered component that keeps the lines it last built for a given width.
+ *
+ *  Pi calls render(width) on EVERY component of the conversation on every
+ *  frame — each keystroke in the editor, each spinner tick. Mesh entries
+ *  never change after creation, but rebuilding them (wrap + visibleWidth +
+ *  per-line padding) is not cheap: with ~200 mesh entries in a long session
+ *  this dominated every frame (~110 ms per keystroke on a slow vCPU). The
+ *  cache is keyed on width only — the inputs are immutable — and pi's
+ *  invalidate() (theme change) drops it so the next frame rebuilds. */
+export function memoRender(build: (width: number) => string[]): {
+  render(width: number): string[];
+  invalidate(): void;
+} {
+  let cachedWidth: number | undefined;
+  let cachedLines: string[] = [];
+  return {
+    render(width: number): string[] {
+      if (width !== cachedWidth) {
+        cachedLines = build(width);
+        cachedWidth = width;
+      }
+      return cachedLines;
+    },
+    invalidate(): void {
+      cachedWidth = undefined;
+    },
+  };
+}
+
 /** Colorize every @alias in a line with its OWN agent color. */
 export function colorizeAliases(line: string, theme: RenderTheme): string {
   return line.replace(ALIAS_RE, (m) => theme.fg(agentColor(m.slice(1)), m));

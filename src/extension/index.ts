@@ -14,7 +14,7 @@ import { batchDetails, buildBatchMessage } from "./batcher.js";
 import { InjectionGuard } from "./injection-guard.js";
 import { injectInbound } from "./inbound.js";
 import { handleCtlFrame } from "./ctl.js";
-import { renderLiveEntry, renderMeshInbound, renderVerdictEntry } from "./renderer.js";
+import { memoRender, renderLiveEntry, renderMeshInbound, renderVerdictEntry } from "./renderer.js";
 import type { PersistedIdentity } from "../shared/identity-store.js";
 import { chooseInitialIdentity, identityFromClient, MeshIdentity, saveIdentityOf } from "../shared/identity-store.js";
 import { dropRecordedProjectRoom, resolveRoomScope } from "../shared/project-room.js";
@@ -41,15 +41,13 @@ export default function meshExtension(pi: ExtensionAPI): void {
   if (typeof pi.registerEntryRenderer === "function") {
     pi.registerEntryRenderer<{ from?: string; room?: string; body?: string; at?: string }>(
       "mesh-live",
-      (entry, _options, theme) => ({
-        render: (width: number) =>
-          renderLiveEntry(entry.data, width, {
-            fg: (color, text) => theme.fg(color, text),
-            bg: (color, text) => theme.bg?.(color, text) ?? text,
-            bold: (text) => theme.bold?.(text) ?? text,
-          }),
-        invalidate: () => {},
-      }),
+      (entry, _options, theme) => memoRender((width: number) =>
+        renderLiveEntry(entry.data, width, {
+          fg: (color, text) => theme.fg(color, text),
+          bg: (color, text) => theme.bg?.(color, text) ?? text,
+          bold: (text) => theme.bold?.(text) ?? text,
+        }),
+      ),
     );
   }
   // mesh-verdict: the colored mesh_wait_all result (display only — the
@@ -57,16 +55,14 @@ export default function meshExtension(pi: ExtensionAPI): void {
   if (typeof pi.registerEntryRenderer === "function") {
     pi.registerEntryRenderer<{ head?: string; answers?: { to: string; response: string }[]; missing?: { to: string; msgId: string }[] }>(
       "mesh-verdict",
-      (entry, _options, theme) => ({
-        render: (width: number) =>
-          renderVerdictEntry(entry.data, width, {
-            fg: (color, text) => theme.fg(color, text),
-            bg: (color, text) => theme.bg?.(color, text) ?? text,
-            bold: (text) => theme.bold?.(text) ?? text,
-            fgAnsi: (color) => (theme as unknown as { getFgAnsi(c: string): string }).getFgAnsi(color),
-          }),
-        invalidate: () => {},
-      }),
+      (entry, _options, theme) => memoRender((width: number) =>
+        renderVerdictEntry(entry.data, width, {
+          fg: (color, text) => theme.fg(color, text),
+          bg: (color, text) => theme.bg?.(color, text) ?? text,
+          bold: (text) => theme.bold?.(text) ?? text,
+          fgAnsi: (color) => (theme as unknown as { getFgAnsi(c: string): string }).getFgAnsi(color),
+        }),
+      ),
     );
   }
   // colored rendering of mesh messages (simple + batches).
@@ -76,15 +72,13 @@ export default function meshExtension(pi: ExtensionAPI): void {
       (message, _options, theme) => {
         const content = typeof message.content === "string" ? message.content : "";
         const details = message.details;
-        return {
-          render: (width: number) =>
-            renderMeshInbound(content, details, width, {
-              fg: (color, text) => theme.fg(color, text),
-              bg: (color, text) => theme.bg?.(color, text) ?? text,
-              bold: (text) => theme.bold?.(text) ?? text,
-            }),
-          invalidate: () => {},
-        };
+        return memoRender((width: number) =>
+          renderMeshInbound(content, details, width, {
+            fg: (color, text) => theme.fg(color, text),
+            bg: (color, text) => theme.bg?.(color, text) ?? text,
+            bold: (text) => theme.bold?.(text) ?? text,
+          }),
+        );
       },
     );
   }
