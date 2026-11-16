@@ -961,3 +961,6 @@ Thanks to everyone who has made pi-mesh better:
   verdict renderer regression tests (#1)
 - [avifenesh](https://github.com/avifenesh) — deferred broadcast policy (#7),
   `mesh:alias` extension bridge (#7)
+- [banahaker](https://github.com/banahaker) — per-width render memoization for
+  the mesh entry/message renderers (#22), fixing keystroke latency on long
+  sessions
